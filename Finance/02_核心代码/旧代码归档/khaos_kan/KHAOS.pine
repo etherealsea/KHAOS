@@ -1,0 +1,176 @@
+//@version=6
+indicator("KHAOS Physics Oscillator [Redux]", "KHAOS", overlay = false, precision=2)
+
+// =============================================================================
+// 1. 核心参数 (Parameters)
+// =============================================================================
+float alpha       = input.float(0.2, "Reaction Sensitivity (Alpha) / 反应灵敏度", minval=0.01, maxval=1.0, step=0.05, group="Physics Core / 物理核心")
+int   norm_len    = input.int(20, "Normalization Length / 归一化周期", minval=10, group="Physics Core / 物理核心")
+int   hurst_len   = input.int(20, "Hurst/Momentum Lookback / Hurst 周期", minval=5, group="Physics Core / 物理核心")
+
+int   chaos_len   = input.int(14, "Chaos Lookback / 混沌周期", minval=2, group="Regime Analysis / 状态分析")
+float chaos_thres = input.float(60.0, "Chaos Threshold / 混沌阈值", minval=0, maxval=100, group="Regime Analysis / 状态分析")
+float thres_squeeze = input.float(5.0, "Squeeze Threshold / 挤压阈值", minval=1.0, group="Regime Analysis / 状态分析")
+float thres_extreme = input.float(20.0, "Extreme Threshold / 极端阈值", minval=10.0, group="Regime Analysis / 状态分析")
+
+// =============================================================================
+// 2. 物理引擎状态 (Physics Engine State)
+// =============================================================================
+// 使用 var 关键字持久化物理状态
+// 3-State EKF (CA Model): Position, Velocity, Acceleration
+// 引入 Hurst 阻尼 (Damping)
+var float x_p = na  // Position (Price)
+var float x_v = 0.0 // Velocity
+var float x_a = 0.0 // Acceleration
+var bool  is_initialized = false
+
+// =============================================================================
+// 3. 辅助函数 (Helper Functions)
+// =============================================================================
+// 安全的 ATR 计算，防止除以零
+safe_atr(int length) =>
+    float val = ta.atr(length)
+    if na(val) or val == 0.0
+        val := nz(close, 0.0) * 0.01 // Fallback to 1% of price if ATR invalid
+    // Double check to ensure non-zero
+    if val == 0.0
+        val := 0.0000001
+    val
+
+// Hurst Proxy (Slope/Momentum Based)
+// 模拟 Python 代码: hurst = 0.5 + np.tanh(ret * 10) * 0.3
+calc_hurst_proxy(int length) =>
+    // 计算归一化动量 (Normalized Momentum)
+    float prev_close = nz(close[length], close)
+    float ret = 0.0
+    if prev_close != 0
+        ret := (close - prev_close) / prev_close
+    
+    // Tanh 近似: (exp(2x)-1)/(exp(2x)+1)
+    // 放大系数 10.0 对应 Python 代码
+    float x = ret * 10.0
+    // 限制 x 防止 exp 溢出
+    x := math.max(math.min(x, 10.0), -10.0)
+    float exp2x = math.exp(2.0 * x)
+    float tanh_val = (exp2x - 1.0) / (exp2x + 1.0)
+    
+    // 映射到 [0.2, 0.8] 区间 (0.5 +/- 0.3)
+    float hurst = 0.5 + tanh_val * 0.3
+    hurst
+
+// =============================================================================
+// 4. 主逻辑循环 (Main Logic Loop)
+// =============================================================================
+
+// 4.1 自愈式初始化 (Self-Healing Initialization)
+bool need_reset = not is_initialized or na(x_p) or na(x_v) or na(x_a)
+if need_reset and not na(close)
+    x_p := close
+    x_v := 0.0
+    x_a := 0.0
+    is_initialized := true
+
+// 4.2 物理状态更新 (Physics Update)
+float current_atr = safe_atr(10)
+float current_hurst = calc_hurst_proxy(hurst_len)
+
+if is_initialized
+    // A. 计算阻尼系数 (Damping Factor rho)
+    // Python Logic: rho = 0.5 + 0.5 * (1.0 / (1.0 + np.exp(-10 * (hurst - 0.5))))
+    // 当 Hurst > 0.5 (趋势), rho -> 1.0 (无阻尼)
+    // 当 Hurst < 0.5 (震荡), rho -> 0.5 (强阻尼)
+    float h_diff = current_hurst - 0.5
+    float sigmoid_input = -10.0 * h_diff
+    sigmoid_input := math.max(math.min(sigmoid_input, 20.0), -20.0) // 溢出保护
+    float sigmoid = 1.0 / (1.0 + math.exp(sigmoid_input))
+    float rho = 0.5 + 0.5 * sigmoid
+
+    // B. 状态预测 (Prediction) - Constant Acceleration with Damping
+    float dt = 1.0
+    // 位置预测: p + v*dt + 0.5*a*dt^2
+    float p_pred = x_p + x_v * dt + 0.5 * x_a * dt * dt
+    // 速度预测: (v + a*dt) * rho
+    float v_pred = (x_v + x_a * dt) * rho
+    // 加速度预测: a * rho (同样衰减加速度，防止发散)
+    float a_pred = x_a * rho
+
+    // C. 观测 (Observation)
+    float observation = close
+    float residual = observation - p_pred
+    
+    if na(residual)
+        is_initialized := false
+    else
+        // D. 动态卡尔曼增益 (Dynamic Kalman Gain)
+        float snr_ratio = math.abs(residual) / current_atr
+        float adaptive_alpha = alpha * (1.0 / (1.0 + snr_ratio))
+        adaptive_alpha := math.max(0.01, math.min(adaptive_alpha, 0.9))
+
+        // E. 状态修正 (Correction)
+        // 使用近似增益分布: K_p=alpha, K_v=beta, K_a=gamma
+        // 这里简化为统一增益缩放，但阶数不同
+        x_p := p_pred + adaptive_alpha * residual
+        x_v := v_pred + adaptive_alpha * (residual / dt)
+        x_a := a_pred + adaptive_alpha * (residual / (0.5 * dt * dt)) * 0.5
+
+// =============================================================================
+// 5. 指标构建 (Indicator Construction)
+// =============================================================================
+
+// 5.1 残差模型 (Residual Model)
+// 使用滤波后的位置与价格的偏差 (Residual)
+// 这是 "Filtered Content" (x_p) 与 "Reality" (Close) 的对应关系
+float deviation = close - x_p
+
+// 5.2 鲁棒归一化 (Robust Normalization)
+float norm_base = safe_atr(norm_len)
+float khaos_raw = (deviation / norm_base) * 100.0
+
+// 5.3 平滑与信号 (Smoothing & Signal)
+float khaos_clamped = math.max(math.min(khaos_raw, 100.0), -100.0)
+float khaos_smooth = ta.ema(khaos_clamped, 3)
+float khaos_signal = ta.ema(khaos_smooth, 5)
+
+// =============================================================================
+// 6. 状态判定 (Regime Detection)
+// =============================================================================
+
+// 6.1 混沌度 (Chaos / Choppiness)
+float range_len = ta.highest(high, chaos_len) - ta.lowest(low, chaos_len)
+float ci = 0.0
+float sum_tr = math.sum(ta.tr, chaos_len)
+if range_len > 0
+    ci := 100.0 * math.log10(sum_tr / range_len) / math.log10(chaos_len)
+
+bool is_chaos_state = ci > chaos_thres
+bool is_squeeze_state = math.abs(khaos_smooth) < thres_squeeze and is_chaos_state
+
+// 6.2 衰竭信号 (Exhaustion Signals)
+bool is_overbought = khaos_smooth > thres_extreme
+bool is_oversold   = khaos_smooth < -thres_extreme
+
+bool sig_top_exhaustion = is_overbought and (khaos_smooth < khaos_signal)
+bool sig_bot_exhaustion = is_oversold   and (khaos_smooth > khaos_signal)
+
+// =============================================================================
+// 7. 绘图 (Plotting)
+// =============================================================================
+
+color color_regime = color.new(color.gray, 85)
+if is_squeeze_state
+    color_regime := color.new(color.yellow, 50)
+else if not is_chaos_state
+    color_regime := khaos_smooth > 0 ? color.new(#00E676, 60) : color.new(#FF1744, 60)
+
+plot(nz(khaos_smooth, 0.0), "Regime Cloud", color=color_regime, style=plot.style_columns, linewidth=1)
+
+color color_line = is_squeeze_state ? color.yellow : #B0BEC5
+plot(nz(khaos_smooth, 0.0), "KHAOS Trajectory", color=color_line, linewidth=2)
+plot(nz(khaos_signal, 0.0), "Signal Line", color=color.new(#78909C, 50), linewidth=1)
+
+plot(sig_top_exhaustion ? khaos_smooth : na, "Top Exhaustion", color=#FF9100, linewidth=4, style=plot.style_linebr)
+plot(sig_bot_exhaustion ? khaos_smooth : na, "Bottom Exhaustion", color=#D500F9, linewidth=4, style=plot.style_linebr)
+
+hline(thres_extreme,  "Extreme High", color=color.new(color.red, 70), linestyle=hline.style_dotted)
+hline(-thres_extreme, "Extreme Low",  color=color.new(color.green, 70), linestyle=hline.style_dotted)
+hline(0, "Zero Line", color=color.new(color.gray, 50))

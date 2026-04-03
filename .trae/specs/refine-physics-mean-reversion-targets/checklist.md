@@ -1,0 +1,7 @@
+- [x] 训练侧与 Pine 侧的局部主窗口已围绕 20 统一
+- [x] 均值回归目标已升级为“物理增强的即将回调/反转强度”定义
+- [x] 新的训练设计已保留 Hurst、MLE、Entropy、Volatility、EKF、EMA20 偏差等完整物理候选信息供 PI-KAN 自主学习
+- [x] `data_loader.py`、`loss.py`、`train.py` 与 `symbolic_extractor.py` 已与新目标语义对齐
+- [x] Pine 中的超买/超卖逻辑已从“简单偏离阈值”升级为“即将进入有效回调/反转窗口”的映射
+- [x] 提取结果能够解释回归核与爆发核的职责分工
+- [x] 训练验证与 Pine 映射验证已通过

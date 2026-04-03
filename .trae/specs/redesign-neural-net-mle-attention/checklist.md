@@ -1,0 +1,7 @@
+- [ ] `physics.py` 中成功实现 `calculate_lyapunov_proxy` 函数且可通过 PyTorch 反向传播求导。
+- [ ] `PhysicsLayer` 的输出特征张量中包含了正确的 MLE 特征切片，特征维度匹配更新后的设计。
+- [ ] `attention.py` 成功实现了包含门控残差连接的多头自注意力模块。
+- [ ] `kan.py` 中的 `KHAOS_KAN` 能够接受 `(Batch, Seq_Len, Features)` 形状的张量输入，并在通过注意力层后正确降维到 KAN 线性层所需的 `(Batch, Hidden_Dim)`。
+- [ ] `loss.py` 中的 `PhysicsLoss` 成功解析了 MLE 状态，并将其加入到最终的 Loss 计算中（包含 P6 正则项）。
+- [ ] 运行 `train.py` 时无维度不匹配（Dimension Mismatch）错误。
+- [ ] 模型能够在一批数据上成功完成前向传播和梯度回传（Loss 下降）。

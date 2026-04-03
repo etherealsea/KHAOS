@@ -1,0 +1,3 @@
+- [x] `kan.py` 中 `regularization_loss` 计算的 `epsilon` 已被修改为 `1e-4`。
+- [x] `revin.py` 的统计量计算逻辑已转换为使用 FP32 执行。
+- [x] `train.py` 中增加了对 `bfloat16` 的支持判断，以及健壮的梯度检查与裁剪逻辑。

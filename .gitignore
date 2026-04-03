@@ -1,0 +1,40 @@
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# Logs and temporary outputs
+*.log
+logs/
+train_log.txt
+
+# Model weights and serialized caches
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.pkl
+
+# Large raw and processed datasets
+Finance/01_数据中心/01_原始数据/
+Finance/01_数据中心/03_研究数据/
+Finance/02_核心代码/旧代码归档/data_legacy/raw/
+Finance/02_核心代码/旧代码归档/data_legacy/cache/
+
+# Generated experiment outputs
+Finance/03_实验与验证/结果/
+
+# OS noise
+Thumbs.db
+Desktop.ini

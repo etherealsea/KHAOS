@@ -1,0 +1,8 @@
+- [x] Task 1.1: 搜索到 KAN, PINNs, Financial Phase Transition, Econophysics 等领域的文献。
+- [x] Task 1.2: 筛选出不少于 15 篇核心文献（包含至少 2 篇外文）。
+- [x] Task 2.1: 确认选取 *KAN: Kolmogorov-Arnold Networks* (Liu et al., 2024) 作为翻译文献。
+- [x] Task 2.2: 翻译摘要、引言、核心方法论部分，确保翻译量达到 3500+ 汉字。
+- [x] Task 2.3: 生成 `Finance/04_项目文档/01_学术论文/reports/外文翻译_KAN_Kolmogorov-Arnold_Networks.docx`。
+- [x] Task 3.1: 梳理文献脉络（绪论：研究背景、意义；现状：经济物理学、传统深度学习、PI-KAN/PINNs；总结：研究问题与创新）。
+- [x] Task 3.2: 撰写文献综述正文，确保引用格式规范。
+- [x] Task 3.3: 生成 `Finance/04_项目文档/01_学术论文/reports/文献综述_基于PI-KAN的金融时序相变探测研究.docx`。

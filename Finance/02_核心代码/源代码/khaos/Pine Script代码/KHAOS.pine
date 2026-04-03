@@ -1,0 +1,153 @@
+//@version=6
+indicator("KHAOS iter9 Dual Kernel", "KHAOS i9", overlay = false, precision = 4)
+
+string group_core = "Iter9 Core / 双核核心"
+string group_thresholds = "Signal Thresholds / 信号阈值"
+string group_display = "Display / 可视化"
+
+int lookback = input.int(20, "Lookback Period / 计算周期", minval = 10, group = group_core)
+int anchor_len = input.int(3, "Attention Anchor Length / 锚点周期", minval = 1, group = group_core)
+float alpha = input.float(0.2, "EKF Sensitivity / EKF 灵敏度", minval = 0.01, maxval = 1.0, step = 0.05, group = group_core)
+
+float thres_hurst = input.float(-0.90, "Hurst Threshold / 趋势基准", step = 0.01, group = group_thresholds)
+float thres_mle = input.float(0.17, "MLE Threshold / 混沌突变", step = 0.01, group = group_thresholds)
+float thres_entropy = input.float(0.54, "Entropy Threshold / 熵突变", step = 0.01, group = group_thresholds)
+float thres_vol = input.float(-0.49, "Volatility Threshold / 波动率突变", step = 0.01, group = group_thresholds)
+float thres_res = input.float(1.00, "Residual Threshold / 冲击回归阈值", step = 0.01, group = group_thresholds)
+float thres_div = input.float(1.00, "EMA Divergence Threshold / 偏离阈值", step = 0.01, group = group_thresholds)
+float neutral_gap = input.float(0.08, "Neutral Gap / 中性方向差", step = 0.01, minval = 0.0, group = group_thresholds)
+
+bool show_state_bg = input.bool(true, "Show State Background / 显示状态背景", group = group_display)
+
+f_zscore(series float src, simple int len) =>
+    float mean = ta.sma(nz(src[1]), len)
+    float std = ta.stdev(nz(src[1]), len)
+    std == 0 ? 0.0 : (src - mean) / std
+
+float log_close = math.log(math.max(close, 0.00001))
+float log_prev = nz(math.log(math.max(close[1], 0.00001)), log_close)
+float ret = log_close - log_prev
+float vol = math.abs(ret)
+float ema20 = ta.ema(close, 20)
+float ema_div = (close - nz(ema20)) / (nz(ema20) + 0.00001)
+float h_high = ta.highest(high, lookback)
+float h_low = ta.lowest(low, lookback)
+float h_range = h_high - h_low
+float h_std = ta.stdev(close, lookback)
+float rs_ratio = 0.0
+if nz(h_std) > 0
+    rs_ratio := h_range / h_std
+float hurst_base = nz(h_std) > 0 ? math.log10(rs_ratio + 1.0) / math.log10(lookback) : 0.0
+float hurst = math.max(0.0, math.min(1.0, nz(hurst_base)))
+
+var float x_p = na
+var float x_v = 0.0
+var bool is_init = false
+
+if not is_init or na(x_p)
+    x_p := log_close
+    x_v := 0.0
+    is_init := true
+
+float current_atr = ta.atr(lookback) / math.max(close, 0.00001)
+if current_atr == 0
+    current_atr := 0.001
+
+float p_pred = 0.0
+float v_pred = 0.0
+float ekf_res = 0.0
+
+if is_init
+    float h_diff = hurst - 0.5
+    float sigmoid_in = -10.0 * h_diff
+    sigmoid_in := math.max(math.min(sigmoid_in, 20.0), -20.0)
+    float rho = 0.5 + 0.5 * (1.0 / (1.0 + math.exp(sigmoid_in)))
+    p_pred := x_p + x_v
+    v_pred := x_v * rho
+    ekf_res := log_close - p_pred
+    float snr = math.abs(ekf_res) / current_atr
+    float k = alpha * (1.0 / (1.0 + snr))
+    k := math.max(0.01, math.min(k, 0.9))
+    x_p := p_pred + k * ekf_res
+    x_v := v_pred + k * ekf_res
+
+float ekf_velocity = x_v * 100.0
+float smooth_res = ta.wma(nz(ekf_res * 100.0), 2)
+float abs_ret = math.abs(ret) + 0.000001
+float abs_prev_ret = nz(math.abs(ret[1]) + 0.000001, abs_ret)
+float local_div = math.max(0.0, math.log(abs_ret / abs_prev_ret))
+float mle = ta.ema(nz(local_div), lookback)
+float rng = ta.highest(high, lookback) - ta.lowest(low, lookback)
+float sum_tr = math.sum(ta.tr, lookback)
+float entropy = 0.0
+if nz(rng) > 0 and nz(sum_tr) > 0
+    entropy := math.log10(sum_tr / rng) / math.log10(lookback)
+entropy := ta.ema(nz(entropy), 2)
+
+float z_hurst = f_zscore(nz(hurst), lookback)
+float z_vol = f_zscore(nz(vol), lookback)
+float z_ekf_vel = f_zscore(nz(ekf_velocity), lookback)
+float z_ekf_res = f_zscore(nz(smooth_res), lookback)
+float z_ema_div = f_zscore(nz(ema_div), lookback)
+float z_mle = f_zscore(nz(mle), lookback)
+float z_entropy = f_zscore(nz(entropy), lookback)
+
+bool is_trending = z_hurst > thres_hurst
+float breakout_impulse = math.max(0.0, z_vol - thres_vol) + math.max(0.0, z_mle - thres_mle) + math.max(0.0, z_entropy - thres_entropy)
+float breakout_trend_support = math.max(0.0, z_hurst - thres_hurst)
+float directional_dislocation = z_ekf_res + z_ema_div
+float reversion_alignment = math.abs(directional_dislocation) / (math.abs(z_ekf_res) + math.abs(z_ema_div) + 0.00001)
+float reversion_setup = reversion_alignment * math.max(0.0, math.abs(z_ekf_res) - thres_res) * math.max(0.0, math.abs(z_ema_div) - thres_div)
+float breakout_false_start = math.max(0.0, reversion_setup - 0.25)
+
+float breakout_raw = is_trending ? breakout_impulse + 0.65 * math.abs(z_ekf_vel) + 0.35 * math.abs(z_ema_div) + 0.25 * breakout_trend_support - 0.55 * breakout_false_start : 0.0
+float breakout_score_raw = math.max(0.0, breakout_raw)
+bool raw_breakout = breakout_score_raw > 0
+
+float continuation_pressure = breakout_impulse + breakout_trend_support
+float bullish_reversion_score = ema_div < 0 and directional_dislocation < 0 ? reversion_setup + math.max(0.0, z_ekf_vel) - 0.50 * continuation_pressure : 0.0
+float bearish_reversion_score = ema_div > 0 and directional_dislocation > 0 ? reversion_setup + math.max(0.0, -z_ekf_vel) - 0.50 * continuation_pressure : 0.0
+bool raw_reversion = bullish_reversion_score > 0 or bearish_reversion_score > 0
+
+bool has_breakout_anchor = nz(ta.barssince(raw_breakout and is_trending), 9999) <= anchor_len
+bool has_reversion_anchor = nz(ta.barssince(raw_reversion), 9999) <= anchor_len
+
+float reversion_direction_gap = math.abs(bullish_reversion_score - bearish_reversion_score)
+bool reversion_direction_ready = reversion_direction_gap > neutral_gap
+
+float breakout_score = has_breakout_anchor ? breakout_score_raw : 0.0
+float reversion_score = has_reversion_anchor and reversion_direction_ready ? math.max(bullish_reversion_score, bearish_reversion_score) : 0.0
+
+bool reversion_bull = reversion_score > 0 and bullish_reversion_score > bearish_reversion_score
+bool reversion_bear = reversion_score > 0 and bearish_reversion_score > bullish_reversion_score
+
+var int current_phase = 0
+// 1 = Breakout (Directionless), 2 = Reversion Bull, -2 = Reversion Bear, 0 = Neutral
+if breakout_score > 0 and breakout_score >= reversion_score
+    current_phase := 1
+else if reversion_score > 0 and reversion_direction_ready
+    current_phase := reversion_bull ? 2 : reversion_bear ? -2 : 0
+else
+    current_phase := 0
+
+bool neutral_filter = current_phase == 0
+
+color breakout_color = color.new(#FFA726, 0) // Orange for Breakout (Directionless)
+color reversion_bull_color = color.new(#29B6F6, 0) // Blue for Bull Reversion (Buy)
+color reversion_bear_color = color.new(#AB47BC, 0) // Purple for Bear Reversion (Sell)
+color neutral_color = color.new(#787B86, 0) // Gray for Neutral
+
+color state_color = current_phase == 1 ? breakout_color : current_phase == 2 ? reversion_bull_color : current_phase == -2 ? reversion_bear_color : neutral_color
+
+// Background color (very transparent)
+color state_bg_color = neutral_filter ? color.new(neutral_color, 95) : current_phase == 1 ? color.new(breakout_color, 90) : current_phase == 2 ? color.new(reversion_bull_color, 90) : color.new(reversion_bear_color, 90)
+bgcolor(show_state_bg ? state_bg_color : na)
+
+// System Energy Histogram
+float system_energy = breakout_impulse + reversion_setup
+color energy_color = neutral_filter ? color.new(neutral_color, 70) : color.new(state_color, 50)
+plot(system_energy * (z_ekf_vel >= 0 ? 1 : -1), title="System Energy", style=plot.style_histogram, color=energy_color, linewidth=2)
+
+// Main Momentum Baseline (EKF Velocity Z-Score)
+hline(0, "Zero Line", color=color.new(color.gray, 50), linestyle=hline.style_solid)
+plot(z_ekf_vel, title="Momentum Baseline", style=plot.style_line, color=state_color, linewidth=3)

@@ -1,0 +1,7 @@
+- [x] `KHAOS.pine` 的主表达已切换为 breakout / reversion 双核状态，而不是旧版 Force 叙事
+- [x] 指标已显式输出或清晰表达 bull / bear 方向与 neutral/filter 区
+- [x] breakout 的高周期稀疏性已被诚实处理，未通过伪造强度制造跨周期一致性假象
+- [x] 图表的主要阅读入口已围绕双核状态重组，用户能直接判断当前更值得关注哪一类状态
+- [x] `PIKAN_TO_INDICATOR_MAPPING.md` 已删除或替换过时的 Force / 红蓝粗线语义
+- [x] 当日开发日志已记录本轮对双核 Pine 映射的关键观点与边界约束
+- [x] Pine Script v6 语法检查与语义核查已完成，未发现明显残留的旧版命名与叙事冲突
