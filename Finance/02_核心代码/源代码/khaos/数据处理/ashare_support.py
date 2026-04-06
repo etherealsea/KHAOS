@@ -235,9 +235,9 @@ def resample_ohlcv_dataframe(df, timeframe):
     if normalized == '1d':
         rule = '1D'
     elif normalized == '240m':
-        rule = '4H'
+        rule = None
     elif normalized == '60m':
-        rule = '1H'
+        rule = '1h'
     elif normalized == '15m':
         rule = '15min'
     elif normalized == '5m':
@@ -259,6 +259,33 @@ def resample_ohlcv_dataframe(df, timeframe):
         aggregations['turnover'] = 'last'
     if 'adj_factor' in indexed.columns:
         aggregations['adj_factor'] = 'last'
+
+    if normalized == '240m':
+        # A-share "4h/240m" is one full trading-day bar (240 trading minutes),
+        # not two clock-based 4-hour buckets split by the lunch break.
+        rows = []
+        for _, group in indexed.groupby(indexed.index.normalize(), sort=True):
+            if group.empty:
+                continue
+            row = {
+                'time': group.index.max(),
+                'open': group['open'].iloc[0],
+                'high': group['high'].max(),
+                'low': group['low'].min(),
+                'close': group['close'].iloc[-1],
+                'volume': group['volume'].sum(),
+            }
+            if 'amount' in group.columns:
+                row['amount'] = group['amount'].sum()
+            if 'turnover' in group.columns:
+                row['turnover'] = group['turnover'].iloc[-1]
+            if 'adj_factor' in group.columns:
+                row['adj_factor'] = group['adj_factor'].iloc[-1]
+            rows.append(row)
+        resampled = pd.DataFrame(rows)
+        if 'volume' in resampled.columns:
+            resampled['volume'] = resampled['volume'].fillna(0.0)
+        return resampled
 
     resampled = indexed.resample(rule).agg(aggregations)
     resampled = resampled.dropna(subset=['open', 'high', 'low', 'close']).reset_index()
@@ -433,6 +460,17 @@ def prepare_imported_ashare_data(import_dir, normalized_dir, training_ready_dir,
                 source_files.append(os.path.join(root, name))
     source_files.sort()
 
+    def _source_preference_key(source_timeframe, target_timeframe):
+        source = normalize_timeframe_label(source_timeframe)
+        target = normalize_timeframe_label(target_timeframe)
+        source_minutes = TIMEFRAME_TO_MINUTES.get(source)
+        target_minutes = TIMEFRAME_TO_MINUTES.get(target)
+        if source_minutes is None or target_minutes is None or source_minutes > target_minutes:
+            return None
+        if source == target:
+            return (0, 0, source_minutes)
+        return (1, target_minutes - source_minutes, -source_minutes)
+
     for file_path in source_files:
         try:
             raw_df = read_csv_with_fallback(file_path)
@@ -454,15 +492,20 @@ def prepare_imported_ashare_data(import_dir, normalized_dir, training_ready_dir,
                 target_minutes = TIMEFRAME_TO_MINUTES[target_timeframe]
                 if source_minutes is None or source_minutes > target_minutes:
                     continue
+                priority = _source_preference_key(timeframe, target_timeframe)
+                if priority is None:
+                    continue
                 output_df = normalized_df if timeframe == target_timeframe else resample_ohlcv_dataframe(normalized_df, target_timeframe)
                 if output_df.empty:
                     continue
                 target_key = (asset_code, target_timeframe)
                 current = generated.get(target_key)
-                if current is None or source_minutes < current['source_minutes']:
+                if current is None or priority < current['priority']:
                     generated[target_key] = {
                         'df': output_df,
                         'source_minutes': source_minutes,
+                        'source_timeframe': timeframe,
+                        'priority': priority,
                         'source_path': file_path,
                     }
         except Exception as exc:

@@ -1,24 +1,57 @@
 import torch
 import torch.nn as nn
 
+from khaos.数据处理.ashare_dataset import EVENT_FLAG_INDEX
+
+
+LOSS_WEIGHT_PRESETS = {
+    'default': {
+        'main': 1.0,
+        'aux': 0.35,
+        'rank': 0.20,
+        'breakout_event_gap': 0.18,
+        'reversion_event_gap': 0.28,
+        'p3': 0.10,
+        'p4': 0.12,
+        'p6': 0.12,
+        'p7': 0.15,
+        'breakout_hard_negative': 0.24,
+        'reversion_hard_negative': 0.42,
+        'direction_consistency': 0.18,
+        'continuation_suppression': 0.12,
+    },
+    'iterA4': {
+        'main': 1.0,
+        'aux': 0.35,
+        'rank': 0.24,
+        'breakout_event_gap': 0.26,
+        'reversion_event_gap': 0.30,
+        'p3': 0.10,
+        'p4': 0.12,
+        'p6': 0.12,
+        'p7': 0.15,
+        'breakout_hard_negative': 0.32,
+        'reversion_hard_negative': 0.40,
+        'direction_consistency': 0.10,
+        'continuation_suppression': 0.16,
+    },
+}
+
 class PhysicsLoss(nn.Module):
-    def __init__(self, weights=None):
+    def __init__(self, weights=None, profile='default'):
         super().__init__()
-        self.weights = weights or {
-            'main': 1.0,
-            'aux': 0.35,
-            'rank': 0.20,
-            'breakout_event_gap': 0.18,
-            'reversion_event_gap': 0.28,
-            'p3': 0.10,
-            'p4': 0.12,
-            'p6': 0.12,
-            'p7': 0.15,
-            'breakout_hard_negative': 0.24,
-            'reversion_hard_negative': 0.36
-        }
+        base_weights = dict(LOSS_WEIGHT_PRESETS.get(profile, LOSS_WEIGHT_PRESETS['default']))
+        if weights:
+            base_weights.update(weights)
+        self.weights = base_weights
         self.main_loss_fn = nn.SmoothL1Loss(reduction='none')
         self.aux_loss_fn = nn.SmoothL1Loss(reduction='none')
+
+    def _get_flag(self, event_flags, flag_name):
+        idx = EVENT_FLAG_INDEX[flag_name]
+        if event_flags.shape[-1] <= idx:
+            return event_flags.new_zeros(event_flags.shape[:-1])
+        return event_flags[..., idx]
 
     def _pairwise_rank_loss(self, scores, strengths):
         pos_mask = strengths >= torch.quantile(strengths.detach(), 0.75)
@@ -43,7 +76,14 @@ class PhysicsLoss(nn.Module):
             dynamic_margin = margin
         return torch.relu(dynamic_margin - diff).mean()
 
-    def forward(self, pred, aux_pred, target, aux_target, physics_state, event_flags, sigma=None):
+    def _direction_margin_loss(self, preferred_scores, alternate_scores, context_mask, margin=0.10):
+        selected = context_mask > 0.5
+        if not torch.any(selected):
+            return preferred_scores.new_tensor(0.0)
+        diff = preferred_scores[selected] - alternate_scores[selected]
+        return torch.relu(margin - diff).mean()
+
+    def forward(self, pred, aux_pred, target, aux_target, physics_state, event_flags, sigma=None, debug_info=None):
         if pred.shape != target.shape:
             target = target.view_as(pred)
         if aux_pred.shape != aux_target.shape:
@@ -82,8 +122,11 @@ class PhysicsLoss(nn.Module):
 
         breakout_hard_negative = event_flags[..., 2]
         reversion_hard_negative = event_flags[..., 3]
-        breakout_event = event_flags[..., 0]
-        reversion_event = event_flags[..., 1]
+        breakout_event = self._get_flag(event_flags, 'breakout_event')
+        reversion_event = self._get_flag(event_flags, 'reversion_event')
+        blue_context = self._get_flag(event_flags, 'reversion_down_context')
+        purple_context = self._get_flag(event_flags, 'reversion_up_context')
+        continuation_pressure = self._get_flag(event_flags, 'continuation_pressure')
         breakout_hard_negative_penalty = breakout_hard_negative * torch.relu(pred_vol)
         reversion_hard_negative_penalty = reversion_hard_negative * pred_rev
         breakout_event_gap_loss = self._event_margin_loss(
@@ -91,6 +134,21 @@ class PhysicsLoss(nn.Module):
         )
         reversion_event_gap_loss = self._event_margin_loss(
             pred_rev, reversion_event > 0.5, reversion_hard_negative > 0.5, aux_target[..., 1], margin=0.32, scale=0.22
+        )
+        if debug_info is not None:
+            blue_score = torch.relu(debug_info['blue_score'].squeeze(-1))
+            purple_score = torch.relu(debug_info['purple_score'].squeeze(-1))
+        else:
+            blue_score = pred_rev
+            purple_score = pred_rev
+        direction_consistency_loss = (
+            self._direction_margin_loss(blue_score, purple_score, blue_context, margin=0.12) +
+            self._direction_margin_loss(purple_score, blue_score, purple_context, margin=0.12)
+        )
+        continuation_suppression = continuation_pressure * (
+            pred_rev +
+            0.35 * blue_score +
+            0.35 * purple_score
         )
 
         per_sample_loss = (
@@ -103,14 +161,16 @@ class PhysicsLoss(nn.Module):
             0.05 * transition_breakout.unsqueeze(1) * torch.relu(-aux_pred[..., 0]).unsqueeze(1) +
             0.05 * transition_reversion.unsqueeze(1) * torch.relu(-aux_pred[..., 1]).unsqueeze(1) +
             self.weights.get('breakout_hard_negative', 0.24) * breakout_hard_negative_penalty.unsqueeze(1) +
-            self.weights.get('reversion_hard_negative', 0.36) * reversion_hard_negative_penalty.unsqueeze(1)
+            self.weights.get('reversion_hard_negative', 0.42) * reversion_hard_negative_penalty.unsqueeze(1) +
+            self.weights.get('continuation_suppression', 0.12) * continuation_suppression.unsqueeze(1)
         )
         rank_loss = self.weights.get('rank', 0.20) * (
             self._pairwise_rank_loss(pred[..., 0], aux_target[..., 0]) +
             self._pairwise_rank_loss(pred[..., 1], aux_target[..., 1])
         ) + (
             self.weights.get('breakout_event_gap', 0.18) * breakout_event_gap_loss +
-            self.weights.get('reversion_event_gap', 0.28) * reversion_event_gap_loss
+            self.weights.get('reversion_event_gap', 0.28) * reversion_event_gap_loss +
+            self.weights.get('direction_consistency', 0.18) * direction_consistency_loss
         )
 
         return per_sample_loss, rank_loss, {
@@ -124,5 +184,7 @@ class PhysicsLoss(nn.Module):
             'rank': rank_loss.item(),
             'event_gap_loss': (breakout_event_gap_loss + reversion_event_gap_loss).item(),
             'breakout_hard_negative': breakout_hard_negative_penalty.mean().item(),
-            'reversion_hard_negative': reversion_hard_negative_penalty.mean().item()
+            'reversion_hard_negative': reversion_hard_negative_penalty.mean().item(),
+            'direction_consistency': direction_consistency_loss.item(),
+            'continuation_suppression': continuation_suppression.mean().item(),
         }

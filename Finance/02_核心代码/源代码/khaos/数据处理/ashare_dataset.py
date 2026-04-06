@@ -20,11 +20,23 @@ from khaos.数据处理.data_loader import (
     LOCAL_PHYSICS_WINDOW,
     build_breakout_targets,
     build_reversion_targets,
+    compute_ekf_track,
     ema_np,
     rolling_entropy_proxy_np,
     rolling_hurst_proxy_np,
 )
 from khaos.核心引擎.physics import compute_physics_features_bulk, PHYSICS_FEATURE_NAMES
+
+EVENT_FLAG_NAMES = (
+    'breakout_event',
+    'reversion_event',
+    'breakout_hard_negative',
+    'reversion_hard_negative',
+    'reversion_down_context',
+    'reversion_up_context',
+    'continuation_pressure',
+)
+EVENT_FLAG_INDEX = {name: idx for idx, name in enumerate(EVENT_FLAG_NAMES)}
 
 
 def _infer_expected_bar_minutes(df, timeframe_label=None):
@@ -65,6 +77,7 @@ def _build_ashare_trade_profile(df, close, open_, high, low, volume):
     long_gap = (time_delta_minutes > expected_minutes * 3.2) & ~midday_break & (np.arange(len(df)) > 0)
     overnight_gap = (~same_day) & (price_gap >= 0.07)
     announcement_gap = price_gap >= 0.095
+    session_reset = ((~same_day) & (np.arange(len(df)) > 0)) | midday_break
 
     breakout_soft = 1.0
     breakout_soft -= 0.85 * one_word_limit.astype(np.float32)
@@ -72,6 +85,7 @@ def _build_ashare_trade_profile(df, close, open_, high, low, volume):
     breakout_soft -= 0.55 * long_gap.astype(np.float32)
     breakout_soft -= 0.30 * overnight_gap.astype(np.float32)
     breakout_soft -= 0.20 * announcement_gap.astype(np.float32)
+    breakout_soft -= 0.18 * midday_break.astype(np.float32)
     breakout_soft = np.clip(breakout_soft, 0.05, 1.0).astype(np.float32)
 
     reversion_soft = 1.0
@@ -80,13 +94,45 @@ def _build_ashare_trade_profile(df, close, open_, high, low, volume):
     reversion_soft -= 0.45 * long_gap.astype(np.float32)
     reversion_soft -= 0.15 * overnight_gap.astype(np.float32)
     reversion_soft -= 0.25 * announcement_gap.astype(np.float32)
+    reversion_soft -= 0.15 * midday_break.astype(np.float32)
     reversion_soft = np.clip(reversion_soft, 0.05, 1.0).astype(np.float32)
+
+    neutral_break = (midday_break & (price_gap < 0.02)).astype(np.float32)
+    breakout_event_mask = (
+        (breakout_soft >= 0.45) &
+        ~one_word_limit &
+        ~(neutral_break > 0.5)
+    ).astype(np.float32)
+    reversion_event_mask = (
+        (reversion_soft >= 0.40) &
+        ~one_word_limit &
+        ~(neutral_break > 0.5)
+    ).astype(np.float32)
+    breakout_hard_negative_mask = (
+        (breakout_soft >= 0.28) &
+        ~one_word_limit &
+        ~midday_break
+    ).astype(np.float32)
+    reversion_hard_negative_mask = (
+        (reversion_soft >= 0.25) &
+        ~one_word_limit &
+        ~midday_break
+    ).astype(np.float32)
+    reversion_context_mask = (
+        (~one_word_limit) &
+        (reversion_soft >= 0.20) &
+        ~(session_reset & (price_gap < 0.03))
+    ).astype(np.float32)
 
     return {
         'breakout_soft': breakout_soft,
         'reversion_soft': reversion_soft,
-        'breakout_event_mask': (breakout_soft >= 0.45).astype(np.float32),
-        'reversion_event_mask': (reversion_soft >= 0.40).astype(np.float32),
+        'breakout_event_mask': breakout_event_mask,
+        'reversion_event_mask': reversion_event_mask,
+        'breakout_hard_negative_mask': breakout_hard_negative_mask,
+        'reversion_hard_negative_mask': reversion_hard_negative_mask,
+        'reversion_context_mask': reversion_context_mask,
+        'session_reset': session_reset.astype(np.float32),
         'sample_weight': (0.55 + 0.45 * np.minimum(breakout_soft, reversion_soft)).astype(np.float32),
     }
 
@@ -100,12 +146,15 @@ class AshareFinancialDataset(Dataset):
         volatility_window=LOCAL_PHYSICS_WINDOW,
         timeframe_label=None,
         start_index=0,
+        dataset_profile='iterA2',
     ):
         self.window_size = window_size
         self.forecast_horizon = forecast_horizon
         self.feature_names = PHYSICS_FEATURE_NAMES
         self.timeframe_label = normalize_timeframe_label(timeframe_label)
         self.start_index = max(int(start_index), 0)
+        self.dataset_profile = str(dataset_profile or 'iterA2')
+        self.use_continuation_flag = self.dataset_profile in {'iterA3', 'iterA4'}
 
         df = normalize_ohlcv_dataframe(df)
         self.time = df['time'].copy()
@@ -143,24 +192,65 @@ class AshareFinancialDataset(Dataset):
             self.forecast_horizon,
         )
 
+        log_ema20 = np.log(np.maximum(self.ema20, 1e-8))
+        ekf_track = compute_ekf_track(log_close)
+        ekf_residual = log_close - ekf_track
+        ema_log_gap = log_close - log_ema20
+        res_score = ekf_residual / (self.sigma + 1e-8)
+        ema_score = ema_log_gap / (self.sigma + 1e-8)
+        imbalance_direction = np.sign(res_score + ema_score).astype(np.float32)
+        imbalance_alignment = np.abs(res_score + ema_score) / (np.abs(res_score) + np.abs(ema_score) + 1e-6)
+        imbalance_strength = np.maximum(0.0, np.abs(res_score) + np.abs(ema_score) - 0.8)
+        abs_returns = np.abs(returns) / (self.sigma + 1e-8)
+        abr = np.abs(returns) + 1e-6
+        abr_prev = np.roll(abr, 1)
+        abr_prev[0] = abr[0]
+        mle_proxy = ema_np(np.log((abr + 1e-6) / (abr_prev + 1e-6)), LOCAL_PHYSICS_WINDOW)
+        reversion_setup = np.maximum(np.abs(res_score) - 1.0, 0.0) * np.maximum(np.abs(ema_score) - 0.5, 0.0) * imbalance_alignment
+
         trade_profile = _build_ashare_trade_profile(df, self.close, self.open, self.high, self.low, self.volume)
         breakout_target *= trade_profile['breakout_soft']
         breakout_aux *= trade_profile['breakout_soft']
         reversion_target *= trade_profile['reversion_soft']
         reversion_aux *= trade_profile['reversion_soft']
         breakout_event = (breakout_event * trade_profile['breakout_event_mask']).astype(np.float32)
-        breakout_hard_negative = (breakout_hard_negative * trade_profile['breakout_event_mask']).astype(np.float32)
+        breakout_hard_negative = (breakout_hard_negative * trade_profile['breakout_hard_negative_mask']).astype(np.float32)
         reversion_event = (reversion_event * trade_profile['reversion_event_mask']).astype(np.float32)
-        reversion_hard_negative = (reversion_hard_negative * trade_profile['reversion_event_mask']).astype(np.float32)
+        reversion_hard_negative = (reversion_hard_negative * trade_profile['reversion_hard_negative_mask']).astype(np.float32)
+        reversion_down_context = (
+            (imbalance_direction > 0) &
+            (imbalance_strength >= 0.30) &
+            (imbalance_alignment >= 0.35)
+        ).astype(np.float32) * trade_profile['reversion_context_mask']
+        reversion_up_context = (
+            (imbalance_direction < 0) &
+            (imbalance_strength >= 0.30) &
+            (imbalance_alignment >= 0.35)
+        ).astype(np.float32) * trade_profile['reversion_context_mask']
+        continuation_pressure = (
+            (hurst >= 0.57) &
+            (mle_proxy >= 0.03) &
+            (abs_returns >= 0.55) &
+            (reversion_setup < 0.45) &
+            (trade_profile['reversion_context_mask'] > 0.5) &
+            ~(trade_profile['session_reset'] > 0.5)
+        ).astype(np.float32)
 
         self.targets = np.stack([breakout_target, reversion_target], axis=1).astype(np.float32)
         self.aux_targets = np.stack([breakout_aux, reversion_aux], axis=1).astype(np.float32)
-        self.event_flags = np.stack([
+        event_columns = [
             breakout_event,
             reversion_event,
             breakout_hard_negative,
             reversion_hard_negative,
-        ], axis=1).astype(np.float32)
+            reversion_down_context,
+            reversion_up_context,
+        ]
+        self.event_flag_names = EVENT_FLAG_NAMES[:-1]
+        if self.use_continuation_flag:
+            event_columns.append(continuation_pressure)
+            self.event_flag_names = EVENT_FLAG_NAMES
+        self.event_flags = np.stack(event_columns, axis=1).astype(np.float32)
         self.sample_weights = (
             1.0 +
             1.40 * breakout_target +
@@ -172,6 +262,8 @@ class AshareFinancialDataset(Dataset):
             0.65 * breakout_hard_negative +
             0.55 * reversion_hard_negative
         ).astype(np.float32) * trade_profile['sample_weight']
+        if self.use_continuation_flag:
+            self.sample_weights = self.sample_weights * (1.0 + 0.60 * continuation_pressure.astype(np.float32))
 
         raw_data = np.stack([
             self.open, self.high, self.low, self.close, self.volume, self.ema20,
@@ -183,6 +275,11 @@ class AshareFinancialDataset(Dataset):
 
         self._max_start = max(0, len(self.close) - self.window_size - self.forecast_horizon)
         self.start_index = min(self.start_index, self._max_start)
+        self.sample_bar_indices = np.arange(
+            self.start_index + self.window_size - 1,
+            self.start_index + self.window_size - 1 + len(self),
+            dtype=np.int64,
+        )
 
     def __len__(self):
         return max(0, self._max_start - self.start_index)
@@ -228,6 +325,7 @@ def create_ashare_dataset_splits(
     test_start='2025-01-01',
     fast_full=False,
     return_metadata=False,
+    dataset_profile='iterA2',
 ):
     print(f'Loading {file_path}...')
     df = load_ashare_data(file_path)
@@ -262,6 +360,7 @@ def create_ashare_dataset_splits(
             forecast_horizon=horizon,
             timeframe_label=timeframe_label,
             start_index=payload['start_index'],
+            dataset_profile=dataset_profile,
         )
         for split_name, payload in split_payloads.items()
         if payload is not None

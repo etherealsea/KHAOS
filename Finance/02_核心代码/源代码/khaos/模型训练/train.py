@@ -13,7 +13,7 @@ import sys
 import gc
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 
-from khaos.数据处理.ashare_dataset import create_ashare_dataset_splits
+from khaos.数据处理.ashare_dataset import EVENT_FLAG_INDEX, create_ashare_dataset_splits
 from khaos.数据处理.ashare_support import (
     DEFAULT_ASHARE_TIMEFRAMES,
     LEGACY_ITER9_ASSETS,
@@ -92,6 +92,105 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags):
     return best
 
 
+def compute_event_quality(metrics):
+    signal_gap = abs(metrics['signal_frequency'] - metrics['label_frequency'])
+    return (
+        metrics['f1']
+        - 0.20 * metrics['hard_negative_rate']
+        - 0.05 * signal_gap
+    )
+
+
+def compute_direction_metrics(blue_scores, purple_scores, flags):
+    blue_scores = np.asarray(blue_scores, dtype=np.float64).reshape(-1)
+    purple_scores = np.asarray(purple_scores, dtype=np.float64).reshape(-1)
+    flags = np.asarray(flags, dtype=np.float64)
+    blue_idx = EVENT_FLAG_INDEX['reversion_down_context']
+    purple_idx = EVENT_FLAG_INDEX['reversion_up_context']
+    if flags.ndim != 2 or flags.shape[1] <= max(blue_idx, purple_idx):
+        return {
+            'accuracy': 0.0,
+            'macro_f1': 0.0,
+            'blue_f1': 0.0,
+            'purple_f1': 0.0,
+            'support': 0,
+        }
+    blue_mask = flags[:, blue_idx] > 0.5
+    purple_mask = flags[:, purple_idx] > 0.5
+    valid_mask = blue_mask | purple_mask
+    if not np.any(valid_mask):
+        return {
+            'accuracy': 0.0,
+            'macro_f1': 0.0,
+            'blue_f1': 0.0,
+            'purple_f1': 0.0,
+            'support': 0,
+        }
+    truth = np.where(blue_mask[valid_mask], 1, 0)
+    pred = np.where(blue_scores[valid_mask] >= purple_scores[valid_mask], 1, 0)
+
+    def _binary_f1(target_label):
+        truth_mask = truth == target_label
+        pred_mask = pred == target_label
+        tp = np.sum(truth_mask & pred_mask)
+        fp = np.sum(~truth_mask & pred_mask)
+        fn = np.sum(truth_mask & ~pred_mask)
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        return 2 * precision * recall / max(precision + recall, 1e-8)
+
+    blue_f1 = float(_binary_f1(1))
+    purple_f1 = float(_binary_f1(0))
+    return {
+        'accuracy': float(np.mean(truth == pred)),
+        'macro_f1': float((blue_f1 + purple_f1) / 2.0),
+        'blue_f1': blue_f1,
+        'purple_f1': purple_f1,
+        'support': int(np.sum(valid_mask)),
+    }
+
+
+def compute_checkpoint_score(
+    breakout_metrics,
+    reversion_metrics,
+    breakout_corr,
+    reversion_corr,
+    direction_macro_f1=None,
+    profile='default',
+):
+    breakout_quality = compute_event_quality(breakout_metrics)
+    reversion_quality = compute_event_quality(reversion_metrics)
+    if profile == 'iterA4_event_focus':
+        if direction_macro_f1 is None:
+            return (
+                0.55 * breakout_quality +
+                0.39 * reversion_quality +
+                0.03 * breakout_corr +
+                0.03 * reversion_corr
+            )
+        return (
+            0.50 * breakout_quality +
+            0.36 * reversion_quality +
+            0.08 * direction_macro_f1 +
+            0.03 * breakout_corr +
+            0.03 * reversion_corr
+        )
+    if direction_macro_f1 is None:
+        return (
+            0.46 * breakout_quality +
+            0.54 * reversion_quality +
+            0.03 * breakout_corr +
+            0.04 * reversion_corr
+        )
+    return (
+        0.40 * breakout_quality +
+        0.42 * reversion_quality +
+        0.12 * direction_macro_f1 +
+        0.03 * breakout_corr +
+        0.03 * reversion_corr
+    )
+
+
 def parse_list_arg(value):
     if value is None:
         return []
@@ -164,6 +263,7 @@ def create_market_datasets(record, args):
             test_start=getattr(args, 'test_start', None),
             fast_full=args.fast_full,
             return_metadata=True,
+            dataset_profile=getattr(args, 'dataset_profile', 'iterA2'),
         )
         return datasets.get('train'), datasets.get('val'), datasets.get('test'), metadata
 
@@ -218,6 +318,14 @@ def build_eval_loader(dataset, args):
         shuffle=False,
         generator=g,
     )
+
+
+def forward_model(kan, features_seq, return_debug=False):
+    if return_debug:
+        pred, aux_pred, debug_info = kan(features_seq, return_aux=True, return_debug=True)
+        return pred, aux_pred, debug_info
+    pred, aux_pred = kan(features_seq, return_aux=True)
+    return pred, aux_pred, None
 
 def get_resume_path(args):
     resume_path = getattr(args, 'resume_path', None)
@@ -375,13 +483,20 @@ def train(args):
         hidden_dim=args.hidden_dim,
         output_dim=2,
         layers=args.layers, 
-        grid_size=args.grid_size
+        grid_size=args.grid_size,
+        arch_version=getattr(args, 'arch_version', 'iterA2_base'),
     ).to(device)
     
-    optimizer = optim.AdamW(kan.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = optim.AdamW(
+        kan.parameters(),
+        lr=args.lr,
+        weight_decay=getattr(args, 'weight_decay', 1e-4),
+    )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1)
-    criterion = PhysicsLoss()
+    criterion = PhysicsLoss(profile=getattr(args, 'loss_profile', 'default'))
     scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
+    use_direction_metrics = getattr(args, 'arch_version', 'iterA2_base') in {'iterA3_multiscale', 'iterA4_multiscale'}
+    score_profile = getattr(args, 'score_profile', 'default')
     
     start_epoch, best_val_loss, best_score, no_improve_epochs = try_resume_training(
         args, kan, optimizer, scheduler, scaler, device
@@ -405,6 +520,8 @@ def train(args):
         epoch_val_preds = []
         epoch_val_targets = []
         epoch_val_flags = []
+        epoch_val_blue = []
+        epoch_val_purple = []
         processed_files = 0
         for file_idx, record in enumerate(final_records):
             data_path = record['path']
@@ -444,13 +561,22 @@ def train(args):
                     # Use bfloat16 if supported for better numerical stability
                     amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
                     with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=amp_dtype):
-                        pred, aux_pred = kan(features_seq, return_aux=True)
+                        pred, aux_pred, debug_info = forward_model(kan, features_seq, return_debug=use_direction_metrics)
                         
                         if torch.isnan(pred).any():
                             print("NaN in pred! Skipping batch.")
                             continue
                             
-                        loss_unweighted, rank_loss, l_dict = criterion(pred, aux_pred, batch_y, batch_aux, psi_t, batch_flags, batch_sigma)
+                        loss_unweighted, rank_loss, l_dict = criterion(
+                            pred,
+                            aux_pred,
+                            batch_y,
+                            batch_aux,
+                            psi_t,
+                            batch_flags,
+                            batch_sigma,
+                            debug_info=debug_info,
+                        )
                         reg_loss = kan.get_regularization_loss(regularize_activation=1e-4, regularize_entropy=1e-4)
                         loss = (loss_unweighted * batch_weights).mean() + rank_loss + reg_loss
                     
@@ -472,7 +598,7 @@ def train(args):
                                 break
                                 
                     if not has_nan_inf:
-                        torch.nn.utils.clip_grad_norm_(kan.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(kan.parameters(), max_norm=getattr(args, 'grad_clip', 1.0))
                         scaler.step(optimizer)
                     else:
                         print("NaN/Inf in gradients! Skipping optimizer step.")
@@ -497,6 +623,8 @@ def train(args):
                 val_preds = []
                 val_targets = []
                 val_flags = []
+                val_blue = []
+                val_purple = []
                 with torch.no_grad():
                     for features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags in test_loader:
                         features_seq = features_seq.to(device, non_blocking=True)
@@ -510,8 +638,17 @@ def train(args):
                         
                         amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
                         with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=amp_dtype):
-                            pred, aux_pred = kan(features_seq, return_aux=True)
-                            loss_unweighted, rank_loss, l_dict = criterion(pred, aux_pred, batch_y, batch_aux, psi_t, batch_flags, batch_sigma)
+                            pred, aux_pred, debug_info = forward_model(kan, features_seq, return_debug=use_direction_metrics)
+                            loss_unweighted, rank_loss, l_dict = criterion(
+                                pred,
+                                aux_pred,
+                                batch_y,
+                                batch_aux,
+                                psi_t,
+                                batch_flags,
+                                batch_sigma,
+                                debug_info=debug_info,
+                            )
                             reg_loss = kan.get_regularization_loss(regularize_activation=1e-4, regularize_entropy=1e-4)
                             loss = (loss_unweighted * batch_weights).mean() + rank_loss + reg_loss
                             
@@ -520,6 +657,9 @@ def train(args):
                         val_preds.append(pred.detach().float().cpu().numpy())
                         val_targets.append(batch_y.detach().cpu().numpy())
                         val_flags.append(batch_flags.detach().cpu().numpy())
+                        if debug_info is not None:
+                            val_blue.append(torch.relu(debug_info['blue_score']).detach().float().cpu().numpy())
+                            val_purple.append(torch.relu(debug_info['purple_score']).detach().float().cpu().numpy())
                         
                 avg_val_loss = val_loss / len(test_loader)
                 train_main = float(np.mean([x['main'] for x in loss_logs])) if loss_logs else 0.0
@@ -530,12 +670,13 @@ def train(args):
                     pred_np = np.vstack(val_preds)
                     target_np = np.vstack(val_targets)
                     flags_np = np.vstack(val_flags)
+                    pred_rev_np = np.maximum(pred_np[:, 1], 0.0)
                     breakout_corr = safe_corr(pred_np[:, 0], target_np[:, 0])
-                    reversion_corr = safe_corr(pred_np[:, 1], target_np[:, 1])
+                    reversion_corr = safe_corr(pred_rev_np, target_np[:, 1])
                     breakout_event_mean = float(pred_np[flags_np[:, 0] > 0.5, 0].mean()) if np.any(flags_np[:, 0] > 0.5) else 0.0
-                    reversion_event_mean = float(pred_np[flags_np[:, 1] > 0.5, 1].mean()) if np.any(flags_np[:, 1] > 0.5) else 0.0
+                    reversion_event_mean = float(pred_rev_np[flags_np[:, 1] > 0.5].mean()) if np.any(flags_np[:, 1] > 0.5) else 0.0
                     breakout_hn_mean = float(pred_np[flags_np[:, 2] > 0.5, 0].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
-                    reversion_hn_mean = float(pred_np[flags_np[:, 3] > 0.5, 1].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
+                    reversion_hn_mean = float(pred_rev_np[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
                 else:
                     breakout_corr = 0.0
                     reversion_corr = 0.0
@@ -548,14 +689,28 @@ def train(args):
                     f"Train Main/Aux: {train_main:.4f}/{train_aux:.4f} | "
                     f"Val Main/Aux: {val_main:.4f}/{val_aux:.4f}"
                 )
+                breakout_metrics = compute_event_metrics(pred_np[:, 0], flags_np[:, 0] > 0.5, flags_np[:, 2] > 0.5) if val_preds else compute_event_metrics([], [], [])
+                reversion_metrics = compute_event_metrics(pred_rev_np, flags_np[:, 1] > 0.5, flags_np[:, 3] > 0.5) if val_preds else compute_event_metrics([], [], [])
+                direction_metrics = compute_direction_metrics(
+                    np.vstack(val_blue).reshape(-1),
+                    np.vstack(val_purple).reshape(-1),
+                    flags_np,
+                ) if val_blue and val_purple else {
+                    'accuracy': 0.0,
+                    'macro_f1': 0.0,
+                    'blue_f1': 0.0,
+                    'purple_f1': 0.0,
+                    'support': 0,
+                }
                 breakout_gap = breakout_event_mean - breakout_hn_mean
                 reversion_gap = reversion_event_mean - reversion_hn_mean
-                composite_score = (
-                    0.55 * breakout_corr +
-                    0.45 * reversion_corr +
-                    0.08 * breakout_gap +
-                    0.06 * reversion_gap -
-                    0.015 * avg_val_loss
+                composite_score = compute_checkpoint_score(
+                    breakout_metrics,
+                    reversion_metrics,
+                    breakout_corr,
+                    reversion_corr,
+                    direction_metrics['macro_f1'] if use_direction_metrics else None,
+                    profile=score_profile,
                 )
                 print(
                     f"  -> Val Corr Breakout/Reversion: {breakout_corr:.4f}/{reversion_corr:.4f} | "
@@ -563,6 +718,11 @@ def train(args):
                     f"HardNeg Mean: {breakout_hn_mean:.4f}/{reversion_hn_mean:.4f} | "
                     f"Gap: {breakout_gap:.4f}/{reversion_gap:.4f} | "
                     f"Composite: {composite_score:.4f}"
+                )
+                print(
+                    f"  -> Event F1 Breakout/Reversion: {breakout_metrics['f1']:.4f}/{reversion_metrics['f1']:.4f} | "
+                    f"HardNeg: {breakout_metrics['hard_negative_rate']:.4f}/{reversion_metrics['hard_negative_rate']:.4f} | "
+                    f"Direction MacroF1: {direction_metrics['macro_f1']:.4f}"
                 )
                 epoch_train_loss_total += total_loss
                 epoch_train_batches += len(train_loader)
@@ -574,6 +734,9 @@ def train(args):
                     epoch_val_preds.append(np.vstack(val_preds))
                     epoch_val_targets.append(np.vstack(val_targets))
                     epoch_val_flags.append(np.vstack(val_flags))
+                    if val_blue and val_purple:
+                        epoch_val_blue.append(np.vstack(val_blue))
+                        epoch_val_purple.append(np.vstack(val_purple))
                 processed_files += 1
                     
                 # Cleanup to avoid memory leaks
@@ -600,22 +763,35 @@ def train(args):
         pred_np = np.vstack(epoch_val_preds)
         target_np = np.vstack(epoch_val_targets)
         flags_np = np.vstack(epoch_val_flags)
+        pred_rev_np = np.maximum(pred_np[:, 1], 0.0)
         breakout_corr = safe_corr(pred_np[:, 0], target_np[:, 0])
-        reversion_corr = safe_corr(pred_np[:, 1], target_np[:, 1])
+        reversion_corr = safe_corr(pred_rev_np, target_np[:, 1])
         breakout_event_mean = float(pred_np[flags_np[:, 0] > 0.5, 0].mean()) if np.any(flags_np[:, 0] > 0.5) else 0.0
-        reversion_event_mean = float(pred_np[flags_np[:, 1] > 0.5, 1].mean()) if np.any(flags_np[:, 1] > 0.5) else 0.0
+        reversion_event_mean = float(pred_rev_np[flags_np[:, 1] > 0.5].mean()) if np.any(flags_np[:, 1] > 0.5) else 0.0
         breakout_hn_mean = float(pred_np[flags_np[:, 2] > 0.5, 0].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
-        reversion_hn_mean = float(pred_np[flags_np[:, 3] > 0.5, 1].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
+        reversion_hn_mean = float(pred_rev_np[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
         breakout_metrics = compute_event_metrics(pred_np[:, 0], flags_np[:, 0] > 0.5, flags_np[:, 2] > 0.5)
-        reversion_metrics = compute_event_metrics(pred_np[:, 1], flags_np[:, 1] > 0.5, flags_np[:, 3] > 0.5)
+        reversion_metrics = compute_event_metrics(pred_rev_np, flags_np[:, 1] > 0.5, flags_np[:, 3] > 0.5)
+        direction_metrics = compute_direction_metrics(
+            np.vstack(epoch_val_blue).reshape(-1),
+            np.vstack(epoch_val_purple).reshape(-1),
+            flags_np,
+        ) if epoch_val_blue and epoch_val_purple else {
+            'accuracy': 0.0,
+            'macro_f1': 0.0,
+            'blue_f1': 0.0,
+            'purple_f1': 0.0,
+            'support': 0,
+        }
         breakout_gap = breakout_event_mean - breakout_hn_mean
         reversion_gap = reversion_event_mean - reversion_hn_mean
-        composite_score = (
-            0.55 * breakout_corr +
-            0.45 * reversion_corr +
-            0.08 * breakout_gap +
-            0.06 * reversion_gap -
-            0.015 * epoch_avg_val_loss
+        composite_score = compute_checkpoint_score(
+            breakout_metrics,
+            reversion_metrics,
+            breakout_corr,
+            reversion_corr,
+            direction_metrics['macro_f1'] if use_direction_metrics else None,
+            profile=score_profile,
         )
         print(
             f"\n[EPOCH {epoch+1} SUMMARY] Train Loss: {epoch_avg_loss:.6f} | Val Loss: {epoch_avg_val_loss:.6f} | "
@@ -645,6 +821,12 @@ def train(args):
             f"事件命中率/伪信号率: {reversion_metrics['event_rate']:.4f}/{reversion_metrics['hard_negative_rate']:.4f} | "
             f"信号频次/标签频次: {reversion_metrics['signal_frequency']:.4f}/{reversion_metrics['label_frequency']:.4f}"
         )
+        print(
+            f"[EPOCH {epoch+1} SUMMARY] Direction Acc/MacroF1/BlueF1/PurpleF1: "
+            f"{direction_metrics['accuracy']:.4f}/{direction_metrics['macro_f1']:.4f}/"
+            f"{direction_metrics['blue_f1']:.4f}/{direction_metrics['purple_f1']:.4f} | "
+            f"Support: {direction_metrics['support']}"
+        )
 
         scheduler.step(epoch_avg_val_loss)
 
@@ -670,6 +852,7 @@ def train(args):
                 'metrics': {
                     'breakout_corr': breakout_corr,
                     'reversion_corr': reversion_corr,
+                    'direction_macro_f1': direction_metrics['macro_f1'],
                     'breakout_event_mean': breakout_event_mean,
                     'reversion_event_mean': reversion_event_mean,
                     'breakout_hard_negative_mean': breakout_hn_mean,
@@ -699,6 +882,7 @@ def train(args):
         latest_metrics = {
             'breakout_corr': breakout_corr,
             'reversion_corr': reversion_corr,
+            'direction_macro_f1': direction_metrics['macro_f1'],
             'breakout_gap': breakout_gap,
             'reversion_gap': reversion_gap,
             'composite_score': composite_score,
@@ -786,12 +970,18 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=64)
     parser.add_argument('--layers', type=int, default=3)
     parser.add_argument('--grid_size', type=int, default=10)
+    parser.add_argument('--arch_version', type=str, default='iterA2_base')
+    parser.add_argument('--dataset_profile', type=str, default='iterA2')
+    parser.add_argument('--loss_profile', type=str, default='default')
+    parser.add_argument('--score_profile', type=str, default='default')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--deterministic', action='store_true', default=True)
     parser.add_argument('--test_mode', action='store_true', default=False)
     parser.add_argument('--fast_full', action='store_true', default=False)
     parser.add_argument('--early_stop_patience', type=int, default=2)
     parser.add_argument('--early_stop_min_delta', type=float, default=0.002)
+    parser.add_argument('--grad_clip', type=float, default=1.0)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--resume', action='store_true', default=False)
     parser.add_argument('--resume_path', type=str, default=None)
     
