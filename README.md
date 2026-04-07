@@ -1,29 +1,91 @@
-# 基于物理信息增强神经网络（PI-KAN）的金融时间序列相变探测研究
+# KHAOS / PI-KAN：金融时间序列相变探测研究工程
 
-本仓库用于维护一个面向金融时间序列相变探测的 PI-KAN / KHAOS 研究工程，目标是同时保留：
+本仓库用于维护一个围绕金融时间序列相变探测构建的研究工程。项目以 PI-KAN 为神经网络主体，以 KHAOS 为物理与符号语义框架，持续联通以下几条主线：
 
-- 可继续训练和分析的核心代码
-- 可供论文与研发复盘使用的开发文档
-- 能让新的 AI 或协作者只读 GitHub 也能接手推进的上下文
+- 物理特征与符号解释层
+- PI-KAN / teacher 网络训练层
+- TradingView Pine 与同花顺等终端表达层
+- 实验、验证与蒸馏映射层
+- 毕业设计与论文写作材料
 
-## 当前主线
+这里的 A 股训练线很重要，但它只是当前最活跃的一条工程分支，不是整个项目的全部定义。
 
-- 当前最稳定的公开基线是 `iterA3_ashare`
-- `iterA5_ashare` 完成了多尺度诊断能力补齐，但截至 `2026-04-07` 的阶段复盘，尚未达到升级门槛
-- 当前建议继续推进的方向是 `teacher-first + shortT balanced` 系列实验，主入口为：
-  [`Finance/03_实验与验证/脚本/测试与临时脚本/run_teacher_first_ashare_ablation_train.py`](Finance/03_实验与验证/脚本/测试与临时脚本/run_teacher_first_ashare_ablation_train.py)
+## 研究目标
 
-如果你是新接手的 AI，请先读：
+- 用物理信息增强的方式刻画金融时间序列中的相变、机制切换与极端状态。
+- 让 `breakout / reversion` 双核输出在多周期场景下保持清晰语义，而不是退化为普通涨跌预测。
+- 在 Python 研究母体、Pine/同花顺终端表达和论文材料之间保持统一叙事。
+- 为后续跨平台 truth-engine 演化保留明确的特征、版本与映射边界。
 
-1. [`PROJECT_STATUS.md`](PROJECT_STATUS.md)
-2. [`AI_HANDOFF.md`](AI_HANDOFF.md)
-3. [`DATA_CONTRACT.md`](DATA_CONTRACT.md)
-4. [`Finance/03_实验与验证/脚本/README.md`](Finance/03_实验与验证/脚本/README.md)
-5. [`Finance/02_核心代码/源代码/khaos/README.md`](Finance/02_核心代码/源代码/khaos/README.md)
+## 系统分层
 
-## 快速开始
+### 1. 数据层
 
-### 1. 准备环境
+- 管理本地原始数据、研究处理数据和 `training_ready` 文件。
+- 当前活跃工程分支已形成 A 股专用数据支持，但整体目录设计并不局限于 A 股。
+
+### 2. 物理与符号层
+
+- 通过 `Hurst`、`EKF`、`Entropy`、`MLE`、`Compression` 等特征刻画市场状态。
+- 负责把“相变”定义为可计算、可验证、可蒸馏的结构，而不是纯粹的经验标签。
+
+### 3. 神经网络层
+
+- 以 PI-KAN / KAN 为核心，训练 `breakout` 与 `reversion` 双核输出。
+- 当前主干强调多周期输入、局部触发锚点、共享状态门控与约束型训练。
+
+### 4. 终端表达层
+
+- TradingView Pine 与同花顺公式承担终端消费与可视化职责。
+- 它们是表达层，不是项目唯一真值来源；复杂推理仍以 Python 侧研究母体为准。
+
+### 5. 实验与验证层
+
+- 负责 runner、ablation、分析脚本、THS 代理校验和阶段性报告。
+- 当前 A 股工程主线主要从这里组织训练与回看。
+
+### 6. 文档与论文层
+
+- 沉淀技术方案、开发日志、实验报告、论文路线图和阶段复盘。
+- 用于保持研究叙事、工程演进和学术写作之间的一致性。
+
+## 仓库结构
+
+- [`Finance/01_数据中心`](Finance/01_数据中心)
+  本地数据目录约定与研究数据入口。
+- [`Finance/02_核心代码`](Finance/02_核心代码)
+  当前源代码、终端公式、工具箱以及历史归档。
+- [`Finance/03_实验与验证`](Finance/03_实验与验证)
+  数据准备、训练 runner、结果分析与校验脚本。
+- [`Finance/04_项目文档`](Finance/04_项目文档)
+  规划、技术文档、开发日志、实验报告和论文材料。
+- [`.trae`](.trae)
+  历史协作规范、计划文档与辅助技能定义。
+
+更细的目录说明见 [`REPOSITORY_GUIDE.md`](REPOSITORY_GUIDE.md)。
+
+## 当前主要工作线
+
+截至 `2026-04-07`，仓库中最值得关注的工作线包括：
+
+- A 股专用 teacher 网络训练与 `shortT balanced` 系列实验。
+- 同花顺公式作为终端消费层的落地与代理验证。
+- “Python truth-engine + Pine/THS 消费层”的跨平台架构方案。
+- 毕设论文与研究材料的持续整理。
+
+具体状态快照见 [`CURRENT_WORKSTREAMS.md`](CURRENT_WORKSTREAMS.md)。
+
+## 建议阅读路径
+
+1. [`REPOSITORY_GUIDE.md`](REPOSITORY_GUIDE.md)
+2. [`Finance/04_项目文档/02_开发文档/02_技术文档/项目架构.md`](Finance/04_项目文档/02_开发文档/02_技术文档/项目架构.md)
+3. [`Finance/04_项目文档/02_开发文档/02_技术文档/跨平台指标引擎架构方案.md`](Finance/04_项目文档/02_开发文档/02_技术文档/跨平台指标引擎架构方案.md)
+4. [`Finance/04_项目文档/02_开发文档/02_技术文档/PIKAN_A股专用网络训练方案.md`](Finance/04_项目文档/02_开发文档/02_技术文档/PIKAN_A股专用网络训练方案.md)
+5. [`Finance/04_项目文档/02_开发文档/02_技术文档/KHAOS_同花顺落地方案.md`](Finance/04_项目文档/02_开发文档/02_技术文档/KHAOS_同花顺落地方案.md)
+6. [`Finance/03_实验与验证/脚本/README.md`](Finance/03_实验与验证/脚本/README.md)
+7. [`Finance/02_核心代码/源代码/khaos/README.md`](Finance/02_核心代码/源代码/khaos/README.md)
+
+## 环境与运行
 
 ```powershell
 python -m venv .venv
@@ -31,89 +93,28 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-说明：
-
-- 本仓库没有上传原始数据、研究处理数据、训练日志和权重文件
-- 若要实际训练，需要先在本地准备数据目录，规则见 [`DATA_CONTRACT.md`](DATA_CONTRACT.md)
-- `torch` 的 CPU / CUDA 安装方式可能因机器不同需要单独调整
-
-### 2. 典型工作流
-
-准备 A 股数据：
+当前 A 股数据准备入口：
 
 ```powershell
 python Finance/03_实验与验证/脚本/setup/fetch_ashare_data.py
 ```
 
-运行当前推荐的 smoke 实验：
+当前推荐的 smoke 入口：
 
 ```powershell
 python Finance/03_实验与验证/脚本/测试与临时脚本/run_teacher_first_ashare_ablation_train.py --experiments shortT_balanced_v1 --smoke-only
 ```
 
-运行 `iterA5` 正式训练参考入口：
-
-```powershell
-python Finance/03_实验与验证/脚本/测试与临时脚本/run_iterA5_ashare_train.py
-```
-
-分析 `iterA5` 模型输出：
-
-```powershell
-python Finance/03_实验与验证/脚本/测试与临时脚本/analyze_iterA5_ashare_results.py
-```
-
-校验同花顺代理输出：
-
-```powershell
-python Finance/03_实验与验证/脚本/测试与临时脚本/validate_iterA5_ths_proxy.py
-```
-
-## 仓库地图
-
-- [`Finance/02_核心代码`](Finance/02_核心代码)
-  核心源码、工具函数、同花顺映射、历史归档
-- [`Finance/03_实验与验证`](Finance/03_实验与验证)
-  数据准备脚本、训练 runner、分析与验证脚本
-- [`Finance/04_项目文档`](Finance/04_项目文档)
-  开发日志、技术文档、实验报告和论文相关材料
-- [`.trae`](.trae)
-  AI 协作协议、计划和技能说明
-
-## 当前关键入口
-
-- 核心训练器：
-  [`Finance/02_核心代码/源代码/khaos/模型训练/train.py`](Finance/02_核心代码/源代码/khaos/模型训练/train.py)
-- A 股数据支持：
-  [`Finance/02_核心代码/源代码/khaos/数据处理/ashare_support.py`](Finance/02_核心代码/源代码/khaos/数据处理/ashare_support.py)
-- A 股样本权重与数据集 profile：
-  [`Finance/02_核心代码/源代码/khaos/数据处理/ashare_dataset.py`](Finance/02_核心代码/源代码/khaos/数据处理/ashare_dataset.py)
-- 当前主线 runner：
-  [`Finance/03_实验与验证/脚本/测试与临时脚本/run_teacher_first_ashare_ablation_train.py`](Finance/03_实验与验证/脚本/测试与临时脚本/run_teacher_first_ashare_ablation_train.py)
-- `iterA5` 训练参考 runner：
-  [`Finance/03_实验与验证/脚本/测试与临时脚本/run_iterA5_ashare_train.py`](Finance/03_实验与验证/脚本/测试与临时脚本/run_iterA5_ashare_train.py)
-
-## 升级门槛
-
-当前仓库内已经明确记录的版本升级门槛包括：
-
-- `overall_model.composite >= 0.4187`
-- `calibrated_ths.test_objective >= 0.4448`
-- `60m composite >= 0.4032`
-
-这些门槛目前主要出现在：
-
-- [`PROJECT_STATUS.md`](PROJECT_STATUS.md)
-- [`Finance/03_实验与验证/脚本/测试与临时脚本/run_teacher_first_ashare_ablation_train.py`](Finance/03_实验与验证/脚本/测试与临时脚本/run_teacher_first_ashare_ablation_train.py)
+本地数据目录、命名规范与输出边界见 [`LOCAL_DATA_LAYOUT.md`](LOCAL_DATA_LAYOUT.md)。
 
 ## GitHub 中有意缺失的内容
 
-为了保持仓库轻量、可读、便于 AI 接手，以下内容默认不上 GitHub：
+本仓库默认不上传以下本地产物：
 
 - 原始行情数据与研究处理数据
-- 模型权重、断点、局部实验输出
-- 训练日志和中间统计文件
-- 根目录媒体素材、音频、分镜图
-- 本地上下文数据库和缓存目录
+- 模型权重、checkpoint 与临时导出图像
+- 训练日志与中间统计文件
+- 本地实验结果目录
+- 根目录媒体素材、音频与分镜资源
 
-如果未来必须共享大文件，请优先考虑 Git LFS 或独立对象存储，而不是直接把产物塞进源码仓库。
+如果未来必须共享大文件，优先考虑 Git LFS 或独立对象存储，而不是把实验产物直接并入源码仓库。
