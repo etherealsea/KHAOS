@@ -19,12 +19,18 @@ env/
 logs/
 train_log.txt
 
+# Local collaboration caches
+.context_db/
+Finance/.context_db/
+
 # Model weights and serialized caches
 *.pth
 *.pt
 *.ckpt
 *.onnx
 *.pkl
+Finance/02_核心代码/模型权重备份/
+Finance/models/
 
 # Large raw and processed datasets
 Finance/01_数据中心/01_原始数据/
@@ -38,6 +44,7 @@ Finance/03_实验与验证/结果/
 # OS noise
 Thumbs.db
 Desktop.ini
+.DS_Store
 
 # Local media/storyboard assets at repo root
 /storyboard_*.jpg

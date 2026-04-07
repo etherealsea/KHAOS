@@ -1,0 +1,23 @@
+# Core numerical and training stack
+numpy
+pandas
+torch
+
+# Evaluation and research utilities
+scikit-learn
+scipy
+tqdm
+
+# Data acquisition
+requests
+yfinance
+baostock
+
+# Visualization and reporting
+matplotlib
+seaborn
+plotly
+python-docx
+
+# Optional backtesting utilities used by some scripts
+backtrader
