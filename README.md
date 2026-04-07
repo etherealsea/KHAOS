@@ -80,10 +80,11 @@
 1. [`REPOSITORY_GUIDE.md`](REPOSITORY_GUIDE.md)
 2. [`Finance/04_项目文档/02_开发文档/02_技术文档/项目架构.md`](Finance/04_项目文档/02_开发文档/02_技术文档/项目架构.md)
 3. [`Finance/04_项目文档/02_开发文档/02_技术文档/跨平台指标引擎架构方案.md`](Finance/04_项目文档/02_开发文档/02_技术文档/跨平台指标引擎架构方案.md)
-4. [`Finance/04_项目文档/02_开发文档/02_技术文档/PIKAN_A股专用网络训练方案.md`](Finance/04_项目文档/02_开发文档/02_技术文档/PIKAN_A股专用网络训练方案.md)
-5. [`Finance/04_项目文档/02_开发文档/02_技术文档/KHAOS_同花顺落地方案.md`](Finance/04_项目文档/02_开发文档/02_技术文档/KHAOS_同花顺落地方案.md)
-6. [`Finance/03_实验与验证/脚本/README.md`](Finance/03_实验与验证/脚本/README.md)
-7. [`Finance/02_核心代码/源代码/khaos/README.md`](Finance/02_核心代码/源代码/khaos/README.md)
+4. [`Finance/04_项目文档/02_开发文档/02_技术文档/KHAOS_A股训练数据选取与构建报告.md`](Finance/04_项目文档/02_开发文档/02_技术文档/KHAOS_A股训练数据选取与构建报告.md)
+5. [`Finance/04_项目文档/02_开发文档/02_技术文档/PIKAN_A股专用网络训练方案.md`](Finance/04_项目文档/02_开发文档/02_技术文档/PIKAN_A股专用网络训练方案.md)
+6. [`Finance/04_项目文档/02_开发文档/02_技术文档/KHAOS_同花顺落地方案.md`](Finance/04_项目文档/02_开发文档/02_技术文档/KHAOS_同花顺落地方案.md)
+7. [`Finance/03_实验与验证/脚本/README.md`](Finance/03_实验与验证/脚本/README.md)
+8. [`Finance/02_核心代码/源代码/khaos/README.md`](Finance/02_核心代码/源代码/khaos/README.md)
 
 ## 环境与运行
 
