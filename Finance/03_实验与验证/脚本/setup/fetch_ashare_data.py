@@ -1,11 +1,13 @@
 import argparse
 import os
 import sys
+from pathlib import Path
 
-PROJECT_ROOT = r'D:\《基于物理信息增强神经网络（PI-KAN）的金融时间序列相变探测研究》'
-PROJECT_SRC = os.path.join(PROJECT_ROOT, 'Finance', '02_核心代码', '源代码')
-if PROJECT_SRC not in sys.path:
-    sys.path.append(PROJECT_SRC)
+SCRIPT_PATH = Path(__file__).resolve()
+PROJECT_ROOT = SCRIPT_PATH.parents[4]
+PROJECT_SRC = PROJECT_ROOT / 'Finance' / '02_核心代码' / '源代码'
+if str(PROJECT_SRC) not in sys.path:
+    sys.path.append(str(PROJECT_SRC))
 
 from khaos.数据处理.ashare_support import (
     ASHARE_FALLBACK_ASSETS,
@@ -16,27 +18,27 @@ from khaos.数据处理.ashare_support import (
     DEFAULT_VAL_END,
     build_market_coverage_report,
     detect_ifind_sdk,
-    fetch_baostock_ashare_history,
+    fetch_public_ashare_history,
     prepare_imported_ashare_data,
     write_coverage_reports,
 )
 
 
-DEFAULT_RESEARCH_RAW_DIR = os.path.join(PROJECT_ROOT, 'Finance', '01_数据中心', '03_研究数据', 'research_raw', 'ashare')
-DEFAULT_IMPORT_DIR = os.path.join(DEFAULT_RESEARCH_RAW_DIR, 'imports')
-DEFAULT_NORMALIZED_DIR = os.path.join(DEFAULT_RESEARCH_RAW_DIR, 'normalized')
-DEFAULT_DATA_DIR = os.path.join(PROJECT_ROOT, 'Finance', '01_数据中心', '03_研究数据', 'research_processed')
-DEFAULT_TRAINING_READY_DIR = os.path.join(DEFAULT_DATA_DIR, 'training_ready', 'ashare')
-DEFAULT_REPORT_DIR = os.path.join(PROJECT_ROOT, 'logs', 'iterA1_ashare')
+DEFAULT_RESEARCH_RAW_DIR = PROJECT_ROOT / 'Finance' / '01_数据中心' / '03_研究数据' / 'research_raw' / 'ashare'
+DEFAULT_IMPORT_DIR = DEFAULT_RESEARCH_RAW_DIR / 'imports'
+DEFAULT_NORMALIZED_DIR = DEFAULT_RESEARCH_RAW_DIR / 'normalized'
+DEFAULT_DATA_DIR = PROJECT_ROOT / 'Finance' / '01_数据中心' / '03_研究数据' / 'research_processed'
+DEFAULT_TRAINING_READY_DIR = DEFAULT_DATA_DIR / 'training_ready' / 'ashare'
+DEFAULT_REPORT_DIR = PROJECT_ROOT / 'logs' / 'iterA1_ashare'
 
 
 def main():
     parser = argparse.ArgumentParser(description='Prepare A-share training_ready data for iterA1.')
-    parser.add_argument('--import_dir', type=str, default=DEFAULT_IMPORT_DIR)
-    parser.add_argument('--normalized_dir', type=str, default=DEFAULT_NORMALIZED_DIR)
-    parser.add_argument('--data_dir', type=str, default=DEFAULT_DATA_DIR)
-    parser.add_argument('--training_ready_dir', type=str, default=DEFAULT_TRAINING_READY_DIR)
-    parser.add_argument('--report_dir', type=str, default=DEFAULT_REPORT_DIR)
+    parser.add_argument('--import_dir', type=str, default=str(DEFAULT_IMPORT_DIR))
+    parser.add_argument('--normalized_dir', type=str, default=str(DEFAULT_NORMALIZED_DIR))
+    parser.add_argument('--data_dir', type=str, default=str(DEFAULT_DATA_DIR))
+    parser.add_argument('--training_ready_dir', type=str, default=str(DEFAULT_TRAINING_READY_DIR))
+    parser.add_argument('--report_dir', type=str, default=str(DEFAULT_REPORT_DIR))
     parser.add_argument('--assets', type=str, default=','.join(ASHARE_PRIMARY_ASSETS))
     parser.add_argument('--fallback_assets', type=str, default=','.join(ASHARE_FALLBACK_ASSETS))
     parser.add_argument('--timeframes', type=str, default=','.join(DEFAULT_ASHARE_TIMEFRAMES))
@@ -66,17 +68,26 @@ def main():
     )
     if local_csv_count == 0 and not sdk_info['available']:
         print('=== Public Fallback: BaoStock ===')
-        fetch_summary = fetch_baostock_ashare_history(
-            asset_codes=ASHARE_PRIMARY_ASSETS + ASHARE_FALLBACK_ASSETS,
-            output_dir=args.import_dir,
-            timeframes=args.timeframes,
-            daily_start='2018-01-01',
-            minute_start='2021-01-01',
-            end_date='2026-04-01',
-            overwrite=False,
-            pause_seconds=0.15,
-        )
-        print(fetch_summary)
+        try:
+            fetch_summary = fetch_public_ashare_history(
+                asset_codes=ASHARE_PRIMARY_ASSETS + ASHARE_FALLBACK_ASSETS,
+                output_dir=args.import_dir,
+                timeframes=args.timeframes,
+                daily_start='2018-01-01',
+                minute_start='2021-01-01',
+                end_date='2026-04-01',
+                overwrite=False,
+                pause_seconds=0.15,
+            )
+            print(fetch_summary)
+        except Exception as exc:
+            print('!!! BaoStock 拉取失败，无法继续自动生成 A 股训练数据。')
+            print(f'原因: {exc}')
+            print('下一步建议：')
+            print(f'1) 将同花顺/券商导出的 A 股 CSV 放入导入目录: {args.import_dir}')
+            print('2) 或安装并启用 iFinD SDK（detect_ifind_sdk=true）后再执行本脚本')
+            print('3) 或在你本地环境拉取数据后，将最终 training_ready 目录复制到本项目对应位置')
+            raise SystemExit(2)
 
     prep_summary = prepare_imported_ashare_data(
         import_dir=args.import_dir,

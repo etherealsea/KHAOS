@@ -28,7 +28,7 @@ from khaos.数据处理.ashare_support import (
     DEFAULT_TRAIN_END,
     DEFAULT_VAL_END,
     build_market_coverage_report,
-    fetch_baostock_ashare_history,
+    fetch_public_ashare_history,
     prepare_imported_ashare_data,
     write_coverage_reports,
 )
@@ -267,7 +267,7 @@ def prepare_and_validate():
         if file_name.lower().endswith('.csv')
     )
     if local_csv_count == 0:
-        fetch_baostock_ashare_history(
+        fetch_public_ashare_history(
             asset_codes=ASHARE_PRIMARY_ASSETS + ASHARE_FALLBACK_ASSETS,
             output_dir=str(RAW_IMPORT_DIR),
             timeframes=RAW_FETCH_TIMEFRAMES,
@@ -305,7 +305,7 @@ def prepare_and_validate():
             if item['asset_code'] in (ASHARE_PRIMARY_ASSETS + ASHARE_FALLBACK_ASSETS)
         })
         if missing_assets:
-            fetch_baostock_ashare_history(
+            fetch_public_ashare_history(
                 asset_codes=missing_assets,
                 output_dir=str(RAW_IMPORT_DIR),
                 timeframes=RAW_FETCH_TIMEFRAMES,
@@ -407,6 +407,11 @@ def build_namespace(
         resume_name=f'{experiment_name}_resume.pth',
         epoch_metrics_name='epoch_metrics.jsonl',
         per_timeframe_metrics_name='per_timeframe_metrics.jsonl',
+        promotion_overall_composite_threshold=PROMOTION_THRESHOLDS['overall_model_composite'],
+        promotion_timeframe_composite_thresholds=','.join(
+            f'{tf}={threshold}'
+            for tf, threshold in PROMOTION_THRESHOLDS['timeframe_composite'].items()
+        ),
         per_timeframe_train_cap=per_timeframe_train_cap,
         max_files=max_files,
     )
@@ -419,6 +424,7 @@ def run_training_phase(
     report_paths,
     constraint_profile: str = 'default',
     resume: bool = False,
+    skip_ths_validation: bool = False,
 ):
     if phase not in {'smoke', 'formal'}:
         raise ValueError(f'Unsupported phase: {phase}')
@@ -487,6 +493,30 @@ def run_training_phase(
                 'aux_timeframes': namespace.aux_timeframes,
             })
             train(namespace)
+
+            ths_validation = None
+            if phase == 'formal' and not skip_ths_validation:
+                from khaos.同花顺公式.ths_validation import validate_ths_core
+
+                formula_path = (
+                    PROJECT_ROOT
+                    / 'Finance'
+                    / '02_核心代码'
+                    / '源代码'
+                    / 'khaos'
+                    / '同花顺公式'
+                    / 'KHAOS_THS_CORE.txt'
+                )
+                ths_validation = validate_ths_core(
+                    formula_path=formula_path,
+                    data_glob_dir=TRAINING_READY_DIR,
+                    sample_count=3,
+                    fragment_len=240,
+                    seed=42,
+                )
+                print({'ths_proxy_validation': ths_validation})
+                if not ths_validation.get('all_passed', False):
+                    raise RuntimeError('THS proxy validation failed (all_passed=false).')
         log_file.write(f'teacher_first_phase_end={phase}\n')
         log_file.write(f'teacher_first_experiment_end={experiment_name}\n')
         log_file.flush()
@@ -499,6 +529,7 @@ def run_training_phase(
         'best_path': Path(namespace.save_dir) / namespace.best_name,
         'final_path': Path(namespace.save_dir) / namespace.final_name,
         'resume_path': Path(namespace.save_dir) / namespace.resume_name,
+        'ths_proxy_validation': ths_validation,
     }
 
 
@@ -713,6 +744,7 @@ def run_mainline_pipeline(args):
             report_paths=report_paths,
             constraint_profile=args.constraint_profile,
             resume=False,
+            skip_ths_validation=args.skip_ths_validation,
         )
         gate_result = evaluate_smoke_gate(experiment_name)
         summary['smoke'][experiment_name] = {
@@ -736,6 +768,7 @@ def run_mainline_pipeline(args):
         report_paths=report_paths,
         constraint_profile=args.constraint_profile,
         resume=args.resume,
+        skip_ths_validation=args.skip_ths_validation,
     )
     baseline_analysis, baseline_outputs = evaluate_teacher_first_version(
         'iterA4_refresh',
@@ -771,6 +804,7 @@ def run_mainline_pipeline(args):
             report_paths=report_paths,
             constraint_profile=args.constraint_profile,
             resume=args.resume,
+            skip_ths_validation=args.skip_ths_validation,
         )
         candidate_analysis, candidate_outputs = evaluate_teacher_first_version(
             experiment_name,
@@ -785,6 +819,13 @@ def run_mainline_pipeline(args):
             best_checkpoint_metrics=candidate_best_metrics,
             baseline_result=baseline_analysis,
         )
+        ths_proxy_passed = bool(candidate_run.get('ths_proxy_validation', {}).get('all_passed', True))
+        success['checks']['ths_proxy_validation'] = {
+            'actual': ths_proxy_passed,
+            'threshold': True,
+            'passed': ths_proxy_passed,
+        }
+        success['passed'] = bool(success['passed'] and ths_proxy_passed)
         summary['formal'][experiment_name] = {
             'run': candidate_run,
             'analysis_outputs': candidate_outputs,
@@ -824,6 +865,7 @@ def run_manual_mode(args):
                     report_paths=report_paths,
                     constraint_profile=args.constraint_profile,
                     resume=False,
+                    skip_ths_validation=args.skip_ths_validation,
                 )
             )
         if not args.smoke_only:
@@ -835,6 +877,7 @@ def run_manual_mode(args):
                     report_paths=report_paths,
                     constraint_profile=args.constraint_profile,
                     resume=args.resume,
+                    skip_ths_validation=args.skip_ths_validation,
                 )
             )
 
@@ -851,6 +894,7 @@ def main():
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--pipeline', choices=['manual', 'mainline_20260407'], default='manual')
     parser.add_argument('--skip-itera5-freeze', action='store_true')
+    parser.add_argument('--skip-ths-validation', action='store_true')
     args = parser.parse_args()
     if args.smoke_only and args.formal_only:
         raise ValueError('`--smoke-only` and `--formal-only` cannot be used together.')

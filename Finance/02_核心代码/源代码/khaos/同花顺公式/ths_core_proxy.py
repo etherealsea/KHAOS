@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import json
 from pathlib import Path
 import re
 
@@ -58,7 +59,35 @@ class THSCoreParams:
         return replace(self, **kwargs)
 
 
+def load_ths_core_params(params_path: str | Path) -> THSCoreParams:
+    payload = json.loads(Path(params_path).read_text(encoding='utf-8'))
+    kwargs = {}
+    for key, value in payload.items():
+        if not hasattr(THSCoreParams, key):
+            continue
+        if key == 'n':
+            kwargs[key] = int(value)
+        else:
+            kwargs[key] = float(value) if isinstance(value, (int, float)) else value
+    return THSCoreParams(**kwargs)
+
+
+def dump_ths_core_params(params: THSCoreParams, params_path: str | Path) -> None:
+    path = Path(params_path)
+    path.write_text(
+        json.dumps(params.to_dict(), ensure_ascii=False, indent=2) + "\n",
+        encoding='utf-8',
+    )
+
+
 DEFAULT_THS_CORE_PARAMS = THSCoreParams()
+_DEFAULT_PARAMS_PATH = Path(__file__).with_name('params.json')
+if _DEFAULT_PARAMS_PATH.exists():
+    try:
+        DEFAULT_THS_CORE_PARAMS = load_ths_core_params(_DEFAULT_PARAMS_PATH)
+    except Exception:
+        # 保持向后兼容：若 params.json 不可用，则回退到 dataclass 默认值
+        DEFAULT_THS_CORE_PARAMS = THSCoreParams()
 
 PHASE_NAME_MAP = {
     -2: 'purple_reversion',

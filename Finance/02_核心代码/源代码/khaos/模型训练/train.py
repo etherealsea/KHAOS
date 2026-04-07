@@ -472,6 +472,30 @@ def parse_timeframe_cap_config(value):
     return caps
 
 
+def parse_timeframe_threshold_config(value):
+    """
+    解析形如 `60m=0.4032,15m=0.40` 的阈值配置，用于 promotion scoreboard。
+    """
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return {
+            normalize_timeframe_label(key): float(val)
+            for key, val in value.items()
+            if normalize_timeframe_label(key) is not None
+        }
+    thresholds = {}
+    for item in parse_list_arg(value):
+        if '=' not in item:
+            continue
+        timeframe, raw_threshold = item.split('=', 1)
+        normalized = normalize_timeframe_label(timeframe)
+        if normalized is None:
+            continue
+        thresholds[normalized] = float(raw_threshold)
+    return thresholds
+
+
 def resolve_normalized_timeframes(value):
     normalized = [normalize_timeframe_label(item) for item in parse_list_arg(value)]
     return [item for item in normalized if item]
@@ -759,6 +783,10 @@ def train(args):
     score_timeframe_set = set(score_timeframes)
     aux_timeframes = resolve_normalized_timeframes(getattr(args, 'aux_timeframes', None))
     aux_timeframe_set = set(aux_timeframes)
+    promotion_overall_threshold = getattr(args, 'promotion_overall_composite_threshold', None)
+    promotion_timeframe_thresholds = parse_timeframe_threshold_config(
+        getattr(args, 'promotion_timeframe_composite_thresholds', None)
+    )
     
     start_epoch, best_val_loss, best_score, no_improve_epochs = try_resume_training(
         args, kan, optimizer, scheduler, scaler, device
@@ -1110,6 +1138,44 @@ def train(args):
                 f"[EPOCH {epoch+1} SUMMARY] Score Timeframes: {sorted(score_timeframe_set)} | "
                 f"All-Timeframe Composite: {overall_all_summary['composite_score']:.4f}"
             )
+
+        promotion_scoreboard = {}
+        if promotion_overall_threshold is not None:
+            delta = composite_score - float(promotion_overall_threshold)
+            promotion_scoreboard['overall_model_composite'] = {
+                'actual': float(composite_score),
+                'threshold': float(promotion_overall_threshold),
+                'delta': float(delta),
+                'passed': bool(delta >= 0.0),
+            }
+        for timeframe, threshold in promotion_timeframe_thresholds.items():
+            actual = timeframe_summaries.get(timeframe, {}).get('composite_score')
+            promotion_scoreboard[f'timeframe_{timeframe}_composite'] = {
+                'actual': float(actual) if actual is not None else None,
+                'threshold': float(threshold),
+                'delta': float(actual - threshold) if actual is not None else None,
+                'passed': bool(actual is not None and actual >= threshold),
+            }
+
+        if promotion_scoreboard:
+            overall_text = promotion_scoreboard.get('overall_model_composite')
+            parts = []
+            if overall_text:
+                parts.append(
+                    f"overall={overall_text['actual']:.4f} (Δ={overall_text['delta']:+.4f}, th={overall_text['threshold']:.4f})"
+                )
+            for key, item in promotion_scoreboard.items():
+                if not key.startswith('timeframe_'):
+                    continue
+                tf = key.replace('timeframe_', '').replace('_composite', '')
+                if item['actual'] is None:
+                    parts.append(f"{tf}=None (th={item['threshold']:.4f})")
+                else:
+                    parts.append(
+                        f"{tf}={item['actual']:.4f} (Δ={item['delta']:+.4f}, th={item['threshold']:.4f})"
+                    )
+            print(f"[EPOCH {epoch+1} PROMOTION] " + " | ".join(parts))
+
         for timeframe, summary in timeframe_summaries.items():
             score_included = timeframe in score_timeframe_set if score_timeframe_set else True
             print(
@@ -1209,6 +1275,7 @@ def train(args):
                 'continuation_public_violation': epoch_score_summary['continuation_public_violation'],
                 'continuation_public_violation_rate': epoch_score_summary['continuation_public_violation_rate'],
                 'all_timeframes_composite_score': overall_all_summary['composite_score'],
+                'promotion_scoreboard': promotion_scoreboard,
             },
         )
 
@@ -1424,6 +1491,8 @@ if __name__ == "__main__":
     parser.add_argument('--aux_timeframes', type=str, default=None)
     parser.add_argument('--epoch_metrics_name', type=str, default='epoch_metrics.jsonl')
     parser.add_argument('--per_timeframe_metrics_name', type=str, default='per_timeframe_metrics.jsonl')
+    parser.add_argument('--promotion_overall_composite_threshold', type=float, default=None)
+    parser.add_argument('--promotion_timeframe_composite_thresholds', type=str, default=None)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--deterministic', action='store_true', default=True)
     parser.add_argument('--test_mode', action='store_true', default=False)

@@ -321,6 +321,177 @@ def to_baostock_symbol(asset_code):
     return f'sz.{code}'
 
 
+def _normalize_akshare_frame(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    将 AkShare 返回的行情表转换为统一 OHLCV 格式（time/open/high/low/close/volume/amount）。
+    AkShare 的列名通常为中文（时间/开盘/收盘/最高/最低/成交量/成交额/换手率...）。
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['time', 'open', 'high', 'low', 'close', 'volume', 'amount'])
+    normalized = normalize_ohlcv_dataframe(df)
+    if timeframe == '1d':
+        normalized['time'] = normalized['time'].dt.normalize()
+    return normalized
+
+
+def fetch_akshare_ashare_history(
+    asset_codes,
+    output_dir,
+    timeframes=None,
+    daily_start='2018-01-01',
+    minute_start='2021-01-01',
+    end_date=None,
+    overwrite=False,
+    pause_seconds=0.35,
+):
+    """
+    使用 AkShare 作为公开数据源拉取 A 股行情（用于 GitHub-only 场景的数据自助生成）。
+    - 日线：ak.stock_zh_a_hist
+    - 分钟线：ak.stock_zh_a_hist_min_em（period=5/15/60）
+    """
+    ak = importlib.import_module('akshare')
+    timeframes = [normalize_timeframe_label(item) for item in (ensure_list(timeframes) or DEFAULT_ASHARE_TIMEFRAMES)]
+    end_date = end_date or pd.Timestamp.today().strftime('%Y-%m-%d')
+    os.makedirs(output_dir, exist_ok=True)
+
+    minute_period_map = {'5m': '5', '15m': '15', '60m': '60'}
+    daily_start_compact = pd.Timestamp(daily_start).strftime('%Y%m%d')
+    daily_end_compact = pd.Timestamp(end_date).strftime('%Y%m%d')
+    minute_start_ts = pd.Timestamp(minute_start).normalize()
+    minute_end_ts = pd.Timestamp(end_date).normalize()
+
+    written_files = []
+    skipped_files = []
+    for asset_code in ensure_list(asset_codes):
+        code = str(asset_code).strip()
+        for timeframe in timeframes:
+            output_path = os.path.join(output_dir, canonical_training_filename(code, timeframe))
+            if os.path.exists(output_path) and not overwrite and os.path.getsize(output_path) > 128:
+                skipped_files.append({'asset_code': code, 'timeframe': timeframe, 'reason': 'existing_file'})
+                continue
+
+            try:
+                if timeframe == '1d':
+                    frame = None
+                    last_exc = None
+                    for attempt in range(1, 6):
+                        try:
+                            frame = ak.stock_zh_a_hist(
+                                symbol=code,
+                                period='daily',
+                                start_date=daily_start_compact,
+                                end_date=daily_end_compact,
+                                adjust='',
+                            )
+                            break
+                        except Exception as exc:
+                            last_exc = exc
+                            time.sleep(min(2.0 * attempt, 12.0))
+                    if frame is None and last_exc is not None:
+                        raise last_exc
+                else:
+                    period = minute_period_map.get(timeframe)
+                    if period is None:
+                        skipped_files.append({'asset_code': code, 'timeframe': timeframe, 'reason': 'unsupported_timeframe'})
+                        continue
+                    frames = []
+                    for chunk_start, chunk_end in _iter_year_chunks(minute_start_ts.strftime('%Y-%m-%d'), minute_end_ts.strftime('%Y-%m-%d')):
+                        start_date = f'{chunk_start} 09:30:00'
+                        end_date_str = f'{chunk_end} 15:00:00'
+                        print(f'[AKSHARE] {code} {timeframe} chunk {start_date} -> {end_date_str}')
+                        chunk_frame = None
+                        last_exc = None
+                        for attempt in range(1, 6):
+                            try:
+                                chunk_frame = ak.stock_zh_a_hist_min_em(
+                                    symbol=code,
+                                    start_date=start_date,
+                                    end_date=end_date_str,
+                                    period=period,
+                                    adjust='',
+                                )
+                                break
+                            except Exception as exc:
+                                last_exc = exc
+                                time.sleep(min(2.0 * attempt, 12.0))
+                        if chunk_frame is None and last_exc is not None:
+                            raise last_exc
+                        if chunk_frame is not None and not chunk_frame.empty:
+                            frames.append(chunk_frame)
+                        time.sleep(pause_seconds)
+                    frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                normalized = _normalize_akshare_frame(frame, timeframe)
+                if normalized.empty:
+                    skipped_files.append({'asset_code': code, 'timeframe': timeframe, 'reason': 'empty_result'})
+                    continue
+                normalized.to_csv(output_path, index=False, encoding='utf-8')
+                written_files.append({
+                    'asset_code': code,
+                    'timeframe': timeframe,
+                    'path': output_path,
+                    'rows': int(len(normalized)),
+                    'start_time': normalized['time'].iloc[0].isoformat(),
+                    'end_time': normalized['time'].iloc[-1].isoformat(),
+                    'source': 'akshare',
+                })
+            except Exception as exc:
+                skipped_files.append({'asset_code': code, 'timeframe': timeframe, 'reason': repr(exc)})
+            time.sleep(pause_seconds)
+
+    return {
+        'written_files': written_files,
+        'skipped_files': skipped_files,
+        'written_count': len(written_files),
+        'source': 'akshare',
+    }
+
+
+def fetch_public_ashare_history(
+    asset_codes,
+    output_dir,
+    timeframes=None,
+    daily_start='2018-01-01',
+    minute_start='2021-01-01',
+    end_date=None,
+    overwrite=False,
+    pause_seconds=0.2,
+    baostock_retries: int = 3,
+):
+    """
+    公开数据兜底：优先 BaoStock（与既有实现保持一致），失败后自动降级到 AkShare。
+    """
+    last_error = None
+    for attempt in range(1, baostock_retries + 1):
+        try:
+            return fetch_baostock_ashare_history(
+                asset_codes=asset_codes,
+                output_dir=output_dir,
+                timeframes=timeframes,
+                daily_start=daily_start,
+                minute_start=minute_start,
+                end_date=end_date,
+                overwrite=overwrite,
+                pause_seconds=pause_seconds,
+            )
+        except Exception as exc:
+            last_error = exc
+            time.sleep(min(5.0 * attempt, 20.0))
+
+    try:
+        return fetch_akshare_ashare_history(
+            asset_codes=asset_codes,
+            output_dir=output_dir,
+            timeframes=timeframes,
+            daily_start=daily_start,
+            minute_start=minute_start,
+            end_date=end_date,
+            overwrite=overwrite,
+            pause_seconds=max(pause_seconds, 0.35),
+        )
+    except Exception as exc:
+        raise RuntimeError(f'public fetch failed: baostock_error={last_error!r}, akshare_error={exc!r}') from exc
+
+
 def _iter_year_chunks(start_date, end_date):
     current = pd.Timestamp(start_date).normalize()
     end_ts = pd.Timestamp(end_date).normalize()
@@ -388,8 +559,13 @@ def fetch_baostock_ashare_history(
     os.makedirs(output_dir, exist_ok=True)
 
     frequency_map = {'5m': '5', '15m': '15', '60m': '60', '1d': 'd'}
-    login_result = bs_module.login()
-    if login_result.error_code != '0':
+    login_result = None
+    for attempt in range(1, 6):
+        login_result = bs_module.login()
+        if login_result.error_code == '0':
+            break
+        time.sleep(min(3.0 * attempt, 15.0))
+    if login_result is None or login_result.error_code != '0':
         raise RuntimeError(f'baostock login failed: {login_result.error_code} {login_result.error_msg}')
 
     written_files = []

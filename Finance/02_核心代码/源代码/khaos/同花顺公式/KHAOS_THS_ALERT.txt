@@ -1,0 +1,27 @@
+{------------------------------------------------------------------
+ KHAOS 同花顺 ALERT 附加脚本（消费层）
+
+ 使用方式（重要）：
+ 1) 先粘贴/加载 KHAOS_THS_CORE.txt（它会定义 PHASE / EKF_PRED 等核心语言）
+ 2) 再把本文件内容追加在同一个公式里（或复制到同一副图公式的末尾）
+
+ 本文件只消费 CORE 的状态语言（PHASE），不在公式端重建复杂真值逻辑。
+------------------------------------------------------------------}
+
+BK_START:=PHASE=1 AND REF(PHASE,1)<>1;
+BLUE_START:=PHASE=2 AND REF(PHASE,1)<>2;
+PURPLE_START:=PHASE=-2 AND REF(PHASE,1)<>-2;
+
+BK_END:=REF(PHASE,1)=1 AND PHASE<>1;
+REV_END:= (REF(PHASE,1)=2 AND PHASE<>2) OR (REF(PHASE,1)=-2 AND PHASE<>-2);
+
+{信号输出：可用于预警触发}
+ALERT_BK:BK_START,NODRAW;
+ALERT_BLUE:BLUE_START,NODRAW;
+ALERT_PURPLE:PURPLE_START,NODRAW;
+
+{可视化提示（可按个人偏好删改）}
+DRAWTEXT(BK_START,EKF_PRED,'BK'),COLORFF9900;
+DRAWTEXT(BLUE_START,EKF_PRED,'REV↓'),COLORBLUE;
+DRAWTEXT(PURPLE_START,EKF_PRED,'REV↑'),COLORMAGENTA;
+

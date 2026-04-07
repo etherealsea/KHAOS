@@ -1,6 +1,12 @@
 ﻿# KHAOS 同花顺公式 iterA1(A股) 单主线版
 
-本目录当前只交付一个同花顺副图主指标：[KHAOS_THS_CORE.txt](./KHAOS_THS_CORE.txt)。
+本目录当前交付：
+
+- 同花顺副图主指标（CORE）：[KHAOS_THS_CORE.txt](./KHAOS_THS_CORE.txt)
+- 预警消费层（ALERT，需与 CORE 同时使用）：[KHAOS_THS_ALERT.txt](./KHAOS_THS_ALERT.txt)
+- 选股消费层（SELECT，需与 CORE 同时使用）：[KHAOS_THS_SELECT.txt](./KHAOS_THS_SELECT.txt)
+
+以及参数包（用于 Python proxy 与公式常量对齐）：[params.json](./params.json)。
 
 ## 当前设计口径
 
@@ -83,3 +89,11 @@
 - `MAIN_BASE` 灰色底线始终存在
 - 橙 / 蓝 / 紫都只是对同一根线做状态覆写
 - 所以不会因为 `DRAWNULL` 切换而整段消失
+
+## 关于 ALERT / SELECT 的使用说明
+
+`KHAOS_THS_ALERT.txt` 与 `KHAOS_THS_SELECT.txt` 属于“消费层附加脚本”，它们**只消费 CORE 输出的状态语言**（`PHASE`），不在公式端重建真值逻辑。
+
+在同花顺里使用时，建议：
+1. 先粘贴 `KHAOS_THS_CORE.txt`
+2. 再把 ALERT/SELECT 文件内容追加在同一个公式末尾（或复制到对应的预警/选股公式里，并确保 `PHASE` 已定义）
