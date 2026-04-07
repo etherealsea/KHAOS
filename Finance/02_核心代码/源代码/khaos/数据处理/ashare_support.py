@@ -387,7 +387,7 @@ def fetch_baostock_ashare_history(
     end_date = end_date or pd.Timestamp.today().strftime('%Y-%m-%d')
     os.makedirs(output_dir, exist_ok=True)
 
-    frequency_map = {'15m': '15', '60m': '60', '1d': 'd'}
+    frequency_map = {'5m': '5', '15m': '15', '60m': '60', '1d': 'd'}
     login_result = bs_module.login()
     if login_result.error_code != '0':
         raise RuntimeError(f'baostock login failed: {login_result.error_code} {login_result.error_msg}')

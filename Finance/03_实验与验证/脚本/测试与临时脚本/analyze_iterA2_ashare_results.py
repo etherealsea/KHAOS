@@ -129,6 +129,12 @@ def to_builtin(value):
     return value
 
 
+def resolve_ths_metric_source(result, source_name='default'):
+    if source_name == 'calibrated':
+        return result['calibrated_ths']
+    return result['default_ths']
+
+
 def build_model(checkpoint, device):
     args = checkpoint.get('args', {})
     model = KHAOS_KAN(
@@ -164,7 +170,7 @@ def evaluate_dataset_split(model, dataset, device, arch_version='iterA2_base'):
     features = []
     blue_scores = []
     purple_scores = []
-    use_debug = arch_version in {'iterA3_multiscale', 'iterA4_multiscale'}
+    use_debug = arch_version in {'iterA3_multiscale', 'iterA4_multiscale', 'iterA5_multiscale'}
     with torch.no_grad():
         for batch_x, batch_y, _, _, _, batch_flags in loader:
             batch_x = batch_x.to(device)
@@ -596,7 +602,12 @@ def evaluate_version(version_name, device):
     }
 
 
-def write_version_outputs(result, baseline_result=None):
+def write_version_outputs(
+    result,
+    baseline_result=None,
+    baseline_ths_source='default',
+    promotion_thresholds=None,
+):
     version_name = result['version_name']
     log_dir = os.path.join(LOG_ROOT, version_name)
     os.makedirs(log_dir, exist_ok=True)
@@ -606,6 +617,7 @@ def write_version_outputs(result, baseline_result=None):
     selected_name = 'default'
     selected_metrics = current_default
     recommendation = 'keep_current_default'
+    threshold_checks = None
 
     if version_name != 'iterA1_ashare' and result['calibrated_ths']['test_objective'] > current_default['test_objective']:
         selected_params = result['calibrated_ths']['params']
@@ -615,18 +627,56 @@ def write_version_outputs(result, baseline_result=None):
 
     compare_summary = None
     if baseline_result is not None:
+        baseline_metric_block = resolve_ths_metric_source(baseline_result, baseline_ths_source)
         model_win = result['overall_model']['composite_score'] > baseline_result['overall_model']['composite_score']
-        ths_win = selected_metrics['test_objective'] > baseline_result['default_ths']['test_objective']
+        ths_win = selected_metrics['test_objective'] > baseline_metric_block['test_objective']
         compare_summary = {
             'baseline_version': baseline_result['version_name'],
+            'baseline_ths_source': baseline_ths_source,
             'model_win': bool(model_win),
             'ths_win': bool(ths_win),
             'baseline_model_composite': baseline_result['overall_model']['composite_score'],
             'candidate_model_composite': result['overall_model']['composite_score'],
-            'baseline_ths_objective': baseline_result['default_ths']['test_objective'],
+            'baseline_ths_objective': baseline_metric_block['test_objective'],
             'candidate_ths_objective': selected_metrics['test_objective'],
         }
-        if model_win and ths_win:
+    if promotion_thresholds:
+        timeframe_thresholds = promotion_thresholds.get('timeframe_composite', {})
+        threshold_checks = {
+            'overall_model_composite': {
+                'threshold': promotion_thresholds.get('overall_model_composite'),
+                'actual': result['overall_model']['composite_score'],
+            },
+            'calibrated_ths_test_objective': {
+                'threshold': promotion_thresholds.get('calibrated_ths_test_objective'),
+                'actual': result['calibrated_ths']['test_objective'],
+            },
+            'timeframe_composite': {},
+        }
+        passes = []
+        overall_threshold = threshold_checks['overall_model_composite']['threshold']
+        if overall_threshold is not None:
+            passes.append(result['overall_model']['composite_score'] >= overall_threshold)
+        calibrated_threshold = threshold_checks['calibrated_ths_test_objective']['threshold']
+        if calibrated_threshold is not None:
+            passes.append(result['calibrated_ths']['test_objective'] >= calibrated_threshold)
+        for timeframe, threshold in timeframe_thresholds.items():
+            actual = result['model_by_timeframe'].get(timeframe, {}).get('composite_score')
+            threshold_checks['timeframe_composite'][timeframe] = {
+                'threshold': threshold,
+                'actual': actual,
+            }
+            passes.append(actual is not None and actual >= threshold)
+        threshold_checks['all_passed'] = bool(passes) and all(passes)
+        if threshold_checks['all_passed']:
+            recommendation = f'promote_{selected_name}_params'
+        else:
+            recommendation = 'keep_current_default'
+            selected_params = DEFAULT_THS_CORE_PARAMS
+            selected_name = 'default'
+            selected_metrics = current_default
+    elif baseline_result is not None:
+        if compare_summary['model_win'] and compare_summary['ths_win']:
             recommendation = f'promote_{selected_name}_params'
         else:
             recommendation = 'keep_current_default'
@@ -676,6 +726,8 @@ def write_version_outputs(result, baseline_result=None):
         },
         'recommendation': recommendation,
         'comparison': compare_summary,
+        'promotion_thresholds': promotion_thresholds,
+        'threshold_checks': threshold_checks,
     }
 
     Path(model_json_path).write_text(json.dumps(to_builtin(model_payload), ensure_ascii=False, indent=2), encoding='utf-8')
@@ -686,8 +738,11 @@ def write_version_outputs(result, baseline_result=None):
         'selected_params': selected_params.to_dict(),
         'recommendation': recommendation,
     }), ensure_ascii=False, indent=2), encoding='utf-8')
-    if compare_summary is not None:
-        Path(compare_json_path).write_text(json.dumps(to_builtin(compare_summary), ensure_ascii=False, indent=2), encoding='utf-8')
+    if compare_summary is not None or threshold_checks is not None:
+        Path(compare_json_path).write_text(json.dumps(to_builtin({
+            'comparison': compare_summary,
+            'threshold_checks': threshold_checks,
+        }), ensure_ascii=False, indent=2), encoding='utf-8')
 
     model_lines = [
         f'# {version_name} Model Evaluation',
@@ -761,12 +816,23 @@ def write_version_outputs(result, baseline_result=None):
             f'- baseline_ths_objective: `{compare_summary["baseline_ths_objective"]:.4f}`',
             f'- candidate_ths_objective: `{compare_summary["candidate_ths_objective"]:.4f}`',
         ])
+    if threshold_checks is not None:
+        ths_lines.extend([
+            '',
+            '## Promotion Thresholds',
+            '',
+            f'- overall_model_composite: `{threshold_checks["overall_model_composite"]["actual"]:.4f}` / `{threshold_checks["overall_model_composite"]["threshold"]}`',
+            f'- calibrated_ths_test_objective: `{threshold_checks["calibrated_ths_test_objective"]["actual"]:.4f}` / `{threshold_checks["calibrated_ths_test_objective"]["threshold"]}`',
+        ])
+        for timeframe, payload in threshold_checks['timeframe_composite'].items():
+            ths_lines.append(f'- `{timeframe}` composite: `{payload["actual"]:.4f}` / `{payload["threshold"]}`')
+        ths_lines.append(f'- all_passed: `{threshold_checks["all_passed"]}`')
     Path(ths_report_path).write_text('\n'.join(ths_lines) + '\n', encoding='utf-8')
     return {
         'model_json_path': model_json_path,
         'ths_json_path': ths_json_path,
         'params_json_path': params_json_path,
-        'compare_json_path': compare_json_path if compare_summary is not None else None,
+        'compare_json_path': compare_json_path if (compare_summary is not None or threshold_checks is not None) else None,
         'model_report_path': model_report_path,
         'ths_report_path': ths_report_path,
     }

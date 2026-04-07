@@ -35,15 +35,100 @@ LOSS_WEIGHT_PRESETS = {
         'direction_consistency': 0.10,
         'continuation_suppression': 0.16,
     },
+    'iterA5': {
+        'main': 1.0,
+        'aux': 0.35,
+        'rank': 0.24,
+        'breakout_event_gap': 0.28,
+        'reversion_event_gap': 0.34,
+        'p3': 0.10,
+        'p4': 0.12,
+        'p6': 0.12,
+        'p7': 0.15,
+        'breakout_hard_negative': 0.32,
+        'reversion_hard_negative': 0.42,
+        'direction_consistency': 0.08,
+        'continuation_suppression': 0.20,
+    },
+    'shortT_breakout_v1': {
+        'main': 1.0,
+        'aux': 0.38,
+        'rank': 0.24,
+        'breakout_event_gap': 0.34,
+        'reversion_event_gap': 0.24,
+        'p3': 0.10,
+        'p4': 0.10,
+        'p6': 0.12,
+        'p7': 0.14,
+        'breakout_hard_negative': 0.46,
+        'reversion_hard_negative': 0.32,
+        'direction_consistency': 0.12,
+        'continuation_suppression': 0.12,
+    },
+    'shortT_balanced_v1': {
+        'main': 1.0,
+        'aux': 0.36,
+        'rank': 0.24,
+        'breakout_event_gap': 0.30,
+        'reversion_event_gap': 0.30,
+        'p3': 0.10,
+        'p4': 0.10,
+        'p6': 0.12,
+        'p7': 0.14,
+        'breakout_hard_negative': 0.38,
+        'reversion_hard_negative': 0.38,
+        'direction_consistency': 0.12,
+        'continuation_suppression': 0.14,
+    },
+    'shortT_balanced_v2': {
+        'main': 1.0,
+        'aux': 0.36,
+        'rank': 0.24,
+        'breakout_event_gap': 0.28,
+        'reversion_event_gap': 0.32,
+        'p3': 0.10,
+        'p4': 0.10,
+        'p6': 0.12,
+        'p7': 0.14,
+        'breakout_hard_negative': 0.36,
+        'reversion_hard_negative': 0.40,
+        'direction_consistency': 0.16,
+        'continuation_suppression': 0.16,
+    },
 }
 
+
+CONSTRAINT_PROFILE_PRESETS = {
+    'default': {
+        'enabled': False,
+        'weight': 0.0,
+        'blue_margin': 0.12,
+        'purple_margin': 0.12,
+        'reversion_event_margin': 0.10,
+        'continuation_margin': 0.05,
+    },
+    'teacher_feasible_v1': {
+        'enabled': True,
+        'weight': 0.35,
+        'blue_margin': 0.12,
+        'purple_margin': 0.12,
+        'reversion_event_margin': 0.10,
+        'continuation_margin': 0.05,
+    },
+}
+
+
 class PhysicsLoss(nn.Module):
-    def __init__(self, weights=None, profile='default'):
+    def __init__(self, weights=None, profile='default', constraint_profile='default'):
         super().__init__()
         base_weights = dict(LOSS_WEIGHT_PRESETS.get(profile, LOSS_WEIGHT_PRESETS['default']))
         if weights:
             base_weights.update(weights)
         self.weights = base_weights
+        self.constraint_profile = str(constraint_profile or 'default')
+        self.constraint_config = dict(
+            CONSTRAINT_PROFILE_PRESETS.get(self.constraint_profile, CONSTRAINT_PROFILE_PRESETS['default'])
+        )
         self.main_loss_fn = nn.SmoothL1Loss(reduction='none')
         self.aux_loss_fn = nn.SmoothL1Loss(reduction='none')
 
@@ -82,6 +167,13 @@ class PhysicsLoss(nn.Module):
             return preferred_scores.new_tensor(0.0)
         diff = preferred_scores[selected] - alternate_scores[selected]
         return torch.relu(margin - diff).mean()
+
+    def _masked_violation_stats(self, violation, mask):
+        selected = mask > 0.5
+        if not torch.any(selected):
+            return violation.new_tensor(0.0), violation.new_tensor(0.0)
+        selected_violation = violation[selected]
+        return selected_violation.mean(), (selected_violation > 1e-6).float().mean()
 
     def forward(self, pred, aux_pred, target, aux_target, physics_state, event_flags, sigma=None, debug_info=None):
         if pred.shape != target.shape:
@@ -138,12 +230,49 @@ class PhysicsLoss(nn.Module):
         if debug_info is not None:
             blue_score = torch.relu(debug_info['blue_score'].squeeze(-1))
             purple_score = torch.relu(debug_info['purple_score'].squeeze(-1))
+            directional_floor = debug_info.get('directional_floor')
+            if directional_floor is not None:
+                directional_floor = torch.relu(directional_floor.squeeze(-1))
+            else:
+                directional_floor = torch.maximum(blue_score, purple_score)
         else:
             blue_score = pred_rev
             purple_score = pred_rev
+            directional_floor = pred_rev
         direction_consistency_loss = (
             self._direction_margin_loss(blue_score, purple_score, blue_context, margin=0.12) +
             self._direction_margin_loss(purple_score, blue_score, purple_context, margin=0.12)
+        )
+        constraint_cfg = self.constraint_config
+        blue_over_purple_raw = torch.relu(
+            purple_score + constraint_cfg.get('blue_margin', 0.12) - blue_score
+        )
+        purple_over_blue_raw = torch.relu(
+            blue_score + constraint_cfg.get('purple_margin', 0.12) - purple_score
+        )
+        public_below_directional_raw = torch.relu(
+            directional_floor + constraint_cfg.get('reversion_event_margin', 0.10) - pred_rev
+        )
+        continuation_public_raw = torch.relu(
+            pred_rev - (directional_floor + constraint_cfg.get('continuation_margin', 0.05))
+        )
+        blue_over_purple_violation, blue_over_purple_violation_rate = self._masked_violation_stats(
+            blue_over_purple_raw, blue_context
+        )
+        purple_over_blue_violation, purple_over_blue_violation_rate = self._masked_violation_stats(
+            purple_over_blue_raw, purple_context
+        )
+        public_below_directional_violation, public_below_directional_violation_rate = self._masked_violation_stats(
+            public_below_directional_raw, reversion_event
+        )
+        continuation_public_violation, continuation_public_violation_rate = self._masked_violation_stats(
+            continuation_public_raw, continuation_pressure
+        )
+        constraint_penalty = (
+            blue_context * blue_over_purple_raw +
+            purple_context * purple_over_blue_raw +
+            reversion_event * public_below_directional_raw +
+            continuation_pressure * continuation_public_raw
         )
         continuation_suppression = continuation_pressure * (
             pred_rev +
@@ -162,7 +291,8 @@ class PhysicsLoss(nn.Module):
             0.05 * transition_reversion.unsqueeze(1) * torch.relu(-aux_pred[..., 1]).unsqueeze(1) +
             self.weights.get('breakout_hard_negative', 0.24) * breakout_hard_negative_penalty.unsqueeze(1) +
             self.weights.get('reversion_hard_negative', 0.42) * reversion_hard_negative_penalty.unsqueeze(1) +
-            self.weights.get('continuation_suppression', 0.12) * continuation_suppression.unsqueeze(1)
+            self.weights.get('continuation_suppression', 0.12) * continuation_suppression.unsqueeze(1) +
+            constraint_cfg.get('weight', 0.0) * constraint_penalty.unsqueeze(1)
         )
         rank_loss = self.weights.get('rank', 0.20) * (
             self._pairwise_rank_loss(pred[..., 0], aux_target[..., 0]) +
@@ -187,4 +317,13 @@ class PhysicsLoss(nn.Module):
             'reversion_hard_negative': reversion_hard_negative_penalty.mean().item(),
             'direction_consistency': direction_consistency_loss.item(),
             'continuation_suppression': continuation_suppression.mean().item(),
+            'constraint_penalty': constraint_penalty.mean().item(),
+            'blue_over_purple_violation': blue_over_purple_violation.item(),
+            'blue_over_purple_violation_rate': blue_over_purple_violation_rate.item(),
+            'purple_over_blue_violation': purple_over_blue_violation.item(),
+            'purple_over_blue_violation_rate': purple_over_blue_violation_rate.item(),
+            'public_below_directional_violation': public_below_directional_violation.item(),
+            'public_below_directional_violation_rate': public_below_directional_violation_rate.item(),
+            'continuation_public_violation': continuation_public_violation.item(),
+            'continuation_public_violation_rate': continuation_public_violation_rate.item(),
         }

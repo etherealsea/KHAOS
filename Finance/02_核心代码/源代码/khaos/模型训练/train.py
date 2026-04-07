@@ -4,9 +4,11 @@ from torch.utils.data import DataLoader, RandomSampler
 from torch.amp import autocast, GradScaler
 import argparse
 import glob
+import json
 import os
 import numpy as np
 import random
+from collections import defaultdict
 
 # Adjust import to run as script
 import sys
@@ -26,6 +28,23 @@ from khaos.数据处理.data_loader import create_rolling_datasets
 from khaos.模型定义.kan import KHAOS_KAN
 from khaos.模型训练.loss import PhysicsLoss
 from khaos.核心引擎.physics import PHYSICS_FEATURE_NAMES
+
+DEBUG_BATCH_KEYS = (
+    'blue_score',
+    'purple_score',
+    'direction_gate',
+    'public_reversion_gate',
+    'breakout_residual_gate',
+    'directional_floor',
+)
+
+CONSTRAINT_STAT_BASE_KEYS = (
+    'blue_over_purple_violation',
+    'purple_over_blue_violation',
+    'public_below_directional_violation',
+    'continuation_public_violation',
+)
+
 
 def set_seed(seed: int = 42, deterministic: bool = True):
     random.seed(seed)
@@ -160,6 +179,51 @@ def compute_checkpoint_score(
 ):
     breakout_quality = compute_event_quality(breakout_metrics)
     reversion_quality = compute_event_quality(reversion_metrics)
+    if profile == 'short_t_breakout_focus':
+        if direction_macro_f1 is None:
+            return (
+                0.66 * breakout_quality +
+                0.24 * reversion_quality +
+                0.06 * breakout_corr +
+                0.04 * reversion_corr
+            )
+        return (
+            0.58 * breakout_quality +
+            0.20 * reversion_quality +
+            0.12 * direction_macro_f1 +
+            0.06 * breakout_corr +
+            0.04 * reversion_corr
+        )
+    if profile == 'short_t_balanced_focus':
+        if direction_macro_f1 is None:
+            return (
+                0.47 * breakout_quality +
+                0.47 * reversion_quality +
+                0.03 * breakout_corr +
+                0.03 * reversion_corr
+            )
+        return (
+            0.43 * breakout_quality +
+            0.43 * reversion_quality +
+            0.10 * direction_macro_f1 +
+            0.02 * breakout_corr +
+            0.02 * reversion_corr
+        )
+    if profile == 'short_t_balanced_guarded':
+        if direction_macro_f1 is None:
+            return (
+                0.45 * breakout_quality +
+                0.45 * reversion_quality +
+                0.05 * breakout_corr +
+                0.05 * reversion_corr
+            )
+        return (
+            0.40 * breakout_quality +
+            0.40 * reversion_quality +
+            0.14 * direction_macro_f1 +
+            0.03 * breakout_corr +
+            0.03 * reversion_corr
+        )
     if profile == 'iterA4_event_focus':
         if direction_macro_f1 is None:
             return (
@@ -189,6 +253,190 @@ def compute_checkpoint_score(
         0.03 * breakout_corr +
         0.03 * reversion_corr
     )
+
+
+def build_metric_bucket():
+    return {
+        'preds': [],
+        'targets': [],
+        'flags': [],
+        'logs': [],
+        'debug_batches': {key: [] for key in DEBUG_BATCH_KEYS},
+    }
+
+
+def merge_metric_bucket(destination, source):
+    destination['preds'].extend(source['preds'])
+    destination['targets'].extend(source['targets'])
+    destination['flags'].extend(source['flags'])
+    destination['logs'].extend(source['logs'])
+    for key in DEBUG_BATCH_KEYS:
+        destination['debug_batches'][key].extend(source['debug_batches'][key])
+
+
+def _flatten_debug_batches(batches):
+    if not batches:
+        return np.array([], dtype=np.float32)
+    return np.concatenate([np.asarray(batch, dtype=np.float32).reshape(-1) for batch in batches]).astype(np.float32)
+
+
+def _metric_bucket_mean(logs, key):
+    values = [float(item[key]) for item in logs if key in item]
+    if not values:
+        return 0.0
+    return float(np.mean(values))
+
+
+def _zero_direction_metrics():
+    return {
+        'accuracy': 0.0,
+        'macro_f1': 0.0,
+        'blue_f1': 0.0,
+        'purple_f1': 0.0,
+        'support': 0,
+    }
+
+
+def summarize_metric_bucket(bucket, score_profile='default', use_direction_metrics=False):
+    if not bucket['preds']:
+        breakout_metrics = compute_event_metrics([], [], [])
+        reversion_metrics = compute_event_metrics([], [], [])
+        return {
+            'sample_count': 0,
+            'avg_val_loss': 0.0,
+            'breakout_corr': 0.0,
+            'reversion_corr': 0.0,
+            'breakout_event_mean': 0.0,
+            'reversion_event_mean': 0.0,
+            'breakout_hard_negative_mean': 0.0,
+            'reversion_hard_negative_mean': 0.0,
+            'breakout_gap': 0.0,
+            'reversion_gap': 0.0,
+            'composite_score': 0.0,
+            'breakout_metrics': breakout_metrics,
+            'reversion_metrics': reversion_metrics,
+            'direction_metrics': _zero_direction_metrics(),
+            'signal_frequency': {'breakout': 0.0, 'reversion': 0.0},
+            'label_frequency': {'breakout': 0.0, 'reversion': 0.0},
+            'breakout_signal_frequency': 0.0,
+            'reversion_signal_frequency': 0.0,
+            'breakout_label_frequency': 0.0,
+            'reversion_label_frequency': 0.0,
+            'direction_gate_mean': 0.0,
+            'direction_gate_std': 0.0,
+            'public_reversion_gate_mean': 0.0,
+            'public_reversion_gate_std': 0.0,
+            'breakout_residual_gate_mean': 0.0,
+            'breakout_residual_gate_std': 0.0,
+            'directional_floor_mean': 0.0,
+            'loss_main': 0.0,
+            'loss_aux': 0.0,
+            'loss_rank': 0.0,
+            'loss_constraint_penalty': 0.0,
+            **{
+                key: 0.0
+                for base_key in CONSTRAINT_STAT_BASE_KEYS
+                for key in (base_key, f'{base_key}_rate')
+            },
+        }
+
+    pred_np = np.vstack(bucket['preds'])
+    target_np = np.vstack(bucket['targets'])
+    flags_np = np.vstack(bucket['flags'])
+    pred_rev_np = np.maximum(pred_np[:, 1], 0.0)
+    breakout_corr = safe_corr(pred_np[:, 0], target_np[:, 0])
+    reversion_corr = safe_corr(pred_rev_np, target_np[:, 1])
+    breakout_event_mean = float(pred_np[flags_np[:, 0] > 0.5, 0].mean()) if np.any(flags_np[:, 0] > 0.5) else 0.0
+    reversion_event_mean = float(pred_rev_np[flags_np[:, 1] > 0.5].mean()) if np.any(flags_np[:, 1] > 0.5) else 0.0
+    breakout_hn_mean = float(pred_np[flags_np[:, 2] > 0.5, 0].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
+    reversion_hn_mean = float(pred_rev_np[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
+    breakout_metrics = compute_event_metrics(pred_np[:, 0], flags_np[:, 0] > 0.5, flags_np[:, 2] > 0.5)
+    reversion_metrics = compute_event_metrics(pred_rev_np, flags_np[:, 1] > 0.5, flags_np[:, 3] > 0.5)
+
+    blue_scores = _flatten_debug_batches(bucket['debug_batches']['blue_score'])
+    purple_scores = _flatten_debug_batches(bucket['debug_batches']['purple_score'])
+    if use_direction_metrics and blue_scores.size > 0 and purple_scores.size > 0:
+        direction_metrics = compute_direction_metrics(blue_scores, purple_scores, flags_np)
+    else:
+        direction_metrics = _zero_direction_metrics()
+
+    direction_gate_values = _flatten_debug_batches(bucket['debug_batches']['direction_gate'])
+    public_gate_values = _flatten_debug_batches(bucket['debug_batches']['public_reversion_gate'])
+    breakout_residual_gate_values = _flatten_debug_batches(bucket['debug_batches']['breakout_residual_gate'])
+    directional_floor_values = _flatten_debug_batches(bucket['debug_batches']['directional_floor'])
+
+    breakout_gap = breakout_event_mean - breakout_hn_mean
+    reversion_gap = reversion_event_mean - reversion_hn_mean
+    composite_score = compute_checkpoint_score(
+        breakout_metrics,
+        reversion_metrics,
+        breakout_corr,
+        reversion_corr,
+        direction_metrics['macro_f1'] if use_direction_metrics else None,
+        profile=score_profile,
+    )
+
+    summary = {
+        'sample_count': int(pred_np.shape[0]),
+        'avg_val_loss': _metric_bucket_mean(bucket['logs'], 'total_loss'),
+        'breakout_corr': breakout_corr,
+        'reversion_corr': reversion_corr,
+        'breakout_event_mean': breakout_event_mean,
+        'reversion_event_mean': reversion_event_mean,
+        'breakout_hard_negative_mean': breakout_hn_mean,
+        'reversion_hard_negative_mean': reversion_hn_mean,
+        'breakout_gap': breakout_gap,
+        'reversion_gap': reversion_gap,
+        'composite_score': composite_score,
+        'breakout_metrics': breakout_metrics,
+        'reversion_metrics': reversion_metrics,
+        'direction_metrics': direction_metrics,
+        'signal_frequency': {
+            'breakout': breakout_metrics['signal_frequency'],
+            'reversion': reversion_metrics['signal_frequency'],
+        },
+        'label_frequency': {
+            'breakout': breakout_metrics['label_frequency'],
+            'reversion': reversion_metrics['label_frequency'],
+        },
+        'breakout_signal_frequency': breakout_metrics['signal_frequency'],
+        'reversion_signal_frequency': reversion_metrics['signal_frequency'],
+        'breakout_label_frequency': breakout_metrics['label_frequency'],
+        'reversion_label_frequency': reversion_metrics['label_frequency'],
+        'direction_gate_mean': float(direction_gate_values.mean()) if direction_gate_values.size else 0.0,
+        'direction_gate_std': float(direction_gate_values.std()) if direction_gate_values.size else 0.0,
+        'public_reversion_gate_mean': float(public_gate_values.mean()) if public_gate_values.size else 0.0,
+        'public_reversion_gate_std': float(public_gate_values.std()) if public_gate_values.size else 0.0,
+        'breakout_residual_gate_mean': float(breakout_residual_gate_values.mean()) if breakout_residual_gate_values.size else 0.0,
+        'breakout_residual_gate_std': float(breakout_residual_gate_values.std()) if breakout_residual_gate_values.size else 0.0,
+        'directional_floor_mean': float(directional_floor_values.mean()) if directional_floor_values.size else 0.0,
+        'loss_main': _metric_bucket_mean(bucket['logs'], 'main'),
+        'loss_aux': _metric_bucket_mean(bucket['logs'], 'aux'),
+        'loss_rank': _metric_bucket_mean(bucket['logs'], 'rank'),
+        'loss_constraint_penalty': _metric_bucket_mean(bucket['logs'], 'constraint_penalty'),
+    }
+    for base_key in CONSTRAINT_STAT_BASE_KEYS:
+        summary[base_key] = _metric_bucket_mean(bucket['logs'], base_key)
+        summary[f'{base_key}_rate'] = _metric_bucket_mean(bucket['logs'], f'{base_key}_rate')
+    return summary
+
+
+def make_json_safe(value):
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(val) for key, val in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def append_jsonl(path, payload):
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'a', encoding='utf-8') as handle:
+        handle.write(json.dumps(make_json_safe(payload), ensure_ascii=False) + '\n')
 
 
 def parse_list_arg(value):
@@ -222,6 +470,11 @@ def parse_timeframe_cap_config(value):
             continue
         caps[normalized] = int(raw_cap)
     return caps
+
+
+def resolve_normalized_timeframes(value):
+    normalized = [normalize_timeframe_label(item) for item in parse_list_arg(value)]
+    return [item for item in normalized if item]
 
 
 def resolve_training_filters(args):
@@ -493,16 +746,34 @@ def train(args):
         weight_decay=getattr(args, 'weight_decay', 1e-4),
     )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1)
-    criterion = PhysicsLoss(profile=getattr(args, 'loss_profile', 'default'))
+    constraint_profile = getattr(args, 'constraint_profile', 'default')
+    criterion = PhysicsLoss(
+        profile=getattr(args, 'loss_profile', 'default'),
+        constraint_profile=constraint_profile,
+    )
     scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
-    use_direction_metrics = getattr(args, 'arch_version', 'iterA2_base') in {'iterA3_multiscale', 'iterA4_multiscale'}
+    use_direction_metrics = getattr(args, 'arch_version', 'iterA2_base') in {'iterA3_multiscale', 'iterA4_multiscale', 'iterA5_multiscale'}
+    use_debug_metrics = use_direction_metrics or constraint_profile != 'default'
     score_profile = getattr(args, 'score_profile', 'default')
+    score_timeframes = resolve_normalized_timeframes(getattr(args, 'score_timeframes', None))
+    score_timeframe_set = set(score_timeframes)
+    aux_timeframes = resolve_normalized_timeframes(getattr(args, 'aux_timeframes', None))
+    aux_timeframe_set = set(aux_timeframes)
     
     start_epoch, best_val_loss, best_score, no_improve_epochs = try_resume_training(
         args, kan, optimizer, scheduler, scaler, device
     )
     resume_path = get_resume_path(args)
     latest_metrics = None
+    epoch_metrics_path = os.path.join(args.save_dir, getattr(args, 'epoch_metrics_name', 'epoch_metrics.jsonl'))
+    per_timeframe_metrics_path = os.path.join(
+        args.save_dir,
+        getattr(args, 'per_timeframe_metrics_name', 'per_timeframe_metrics.jsonl'),
+    )
+    if start_epoch == 0:
+        for metric_path in (epoch_metrics_path, per_timeframe_metrics_path):
+            if os.path.exists(metric_path):
+                os.remove(metric_path)
     
     print("\nStarting Accelerated Sequential Training...")
     
@@ -514,14 +785,8 @@ def train(args):
         epoch_train_loss_total = 0.0
         epoch_train_batches = 0
         epoch_train_logs = []
-        epoch_val_loss_total = 0.0
-        epoch_val_batches = 0
-        epoch_val_logs = []
-        epoch_val_preds = []
-        epoch_val_targets = []
-        epoch_val_flags = []
-        epoch_val_blue = []
-        epoch_val_purple = []
+        epoch_all_bucket = build_metric_bucket()
+        epoch_timeframe_buckets = defaultdict(build_metric_bucket)
         processed_files = 0
         for file_idx, record in enumerate(final_records):
             data_path = record['path']
@@ -538,7 +803,7 @@ def train(args):
                     print("  -> Dataset too small for this configuration, skipping.")
                     continue
 
-                timeframe_label = dataset_meta.get('timeframe') or record.get('timeframe')
+                timeframe_label = normalize_timeframe_label(dataset_meta.get('timeframe') or record.get('timeframe')) or 'unknown'
                 train_loader = build_train_loader(train_ds, args, timeframe_label)
                 test_loader = build_eval_loader(eval_ds, args)
                 
@@ -561,7 +826,7 @@ def train(args):
                     # Use bfloat16 if supported for better numerical stability
                     amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
                     with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=amp_dtype):
-                        pred, aux_pred, debug_info = forward_model(kan, features_seq, return_debug=use_direction_metrics)
+                        pred, aux_pred, debug_info = forward_model(kan, features_seq, return_debug=use_debug_metrics)
                         
                         if torch.isnan(pred).any():
                             print("NaN in pred! Skipping batch.")
@@ -614,17 +879,11 @@ def train(args):
                             f"Loss: {loss.item():.6f} | Main: {l_dict['main']:.4f} | Aux: {l_dict['aux']:.4f} | Rank: {l_dict['rank']:.4f}"
                         )
                         
-                avg_loss = total_loss / len(train_loader)
+                avg_loss = total_loss / max(len(train_loader), 1)
                 
                 # Validation
                 kan.eval()
-                val_loss = 0
-                val_logs = []
-                val_preds = []
-                val_targets = []
-                val_flags = []
-                val_blue = []
-                val_purple = []
+                file_bucket = build_metric_bucket()
                 with torch.no_grad():
                     for features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags in test_loader:
                         features_seq = features_seq.to(device, non_blocking=True)
@@ -638,7 +897,7 @@ def train(args):
                         
                         amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
                         with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=amp_dtype):
-                            pred, aux_pred, debug_info = forward_model(kan, features_seq, return_debug=use_direction_metrics)
+                            pred, aux_pred, debug_info = forward_model(kan, features_seq, return_debug=use_debug_metrics)
                             loss_unweighted, rank_loss, l_dict = criterion(
                                 pred,
                                 aux_pred,
@@ -652,91 +911,62 @@ def train(args):
                             reg_loss = kan.get_regularization_loss(regularize_activation=1e-4, regularize_entropy=1e-4)
                             loss = (loss_unweighted * batch_weights).mean() + rank_loss + reg_loss
                             
-                        val_loss += loss.item()
-                        val_logs.append(l_dict)
-                        val_preds.append(pred.detach().float().cpu().numpy())
-                        val_targets.append(batch_y.detach().cpu().numpy())
-                        val_flags.append(batch_flags.detach().cpu().numpy())
+                        batch_log = dict(l_dict)
+                        batch_log['total_loss'] = float(loss.item())
+                        file_bucket['logs'].append(batch_log)
+                        file_bucket['preds'].append(pred.detach().float().cpu().numpy())
+                        file_bucket['targets'].append(batch_y.detach().cpu().numpy())
+                        file_bucket['flags'].append(batch_flags.detach().cpu().numpy())
                         if debug_info is not None:
-                            val_blue.append(torch.relu(debug_info['blue_score']).detach().float().cpu().numpy())
-                            val_purple.append(torch.relu(debug_info['purple_score']).detach().float().cpu().numpy())
-                        
-                avg_val_loss = val_loss / len(test_loader)
+                            for debug_key in DEBUG_BATCH_KEYS:
+                                debug_value = debug_info.get(debug_key)
+                                if debug_value is None:
+                                    continue
+                                if isinstance(debug_value, torch.Tensor):
+                                    debug_value = debug_value.detach().float().cpu().numpy()
+                                else:
+                                    debug_value = np.asarray(debug_value, dtype=np.float32)
+                                file_bucket['debug_batches'][debug_key].append(debug_value)
+
+                file_summary = summarize_metric_bucket(
+                    file_bucket,
+                    score_profile=score_profile,
+                    use_direction_metrics=use_direction_metrics,
+                )
                 train_main = float(np.mean([x['main'] for x in loss_logs])) if loss_logs else 0.0
                 train_aux = float(np.mean([x['aux'] for x in loss_logs])) if loss_logs else 0.0
-                val_main = float(np.mean([x['main'] for x in val_logs])) if val_logs else 0.0
-                val_aux = float(np.mean([x['aux'] for x in val_logs])) if val_logs else 0.0
-                if val_preds:
-                    pred_np = np.vstack(val_preds)
-                    target_np = np.vstack(val_targets)
-                    flags_np = np.vstack(val_flags)
-                    pred_rev_np = np.maximum(pred_np[:, 1], 0.0)
-                    breakout_corr = safe_corr(pred_np[:, 0], target_np[:, 0])
-                    reversion_corr = safe_corr(pred_rev_np, target_np[:, 1])
-                    breakout_event_mean = float(pred_np[flags_np[:, 0] > 0.5, 0].mean()) if np.any(flags_np[:, 0] > 0.5) else 0.0
-                    reversion_event_mean = float(pred_rev_np[flags_np[:, 1] > 0.5].mean()) if np.any(flags_np[:, 1] > 0.5) else 0.0
-                    breakout_hn_mean = float(pred_np[flags_np[:, 2] > 0.5, 0].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
-                    reversion_hn_mean = float(pred_rev_np[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
-                else:
-                    breakout_corr = 0.0
-                    reversion_corr = 0.0
-                    breakout_event_mean = 0.0
-                    reversion_event_mean = 0.0
-                    breakout_hn_mean = 0.0
-                    reversion_hn_mean = 0.0
                 print(
-                    f"  -> Train Loss: {avg_loss:.6f} | Val Loss: {avg_val_loss:.6f} | "
+                    f"  -> Train Loss: {avg_loss:.6f} | Val Loss: {file_summary['avg_val_loss']:.6f} | "
                     f"Train Main/Aux: {train_main:.4f}/{train_aux:.4f} | "
-                    f"Val Main/Aux: {val_main:.4f}/{val_aux:.4f}"
-                )
-                breakout_metrics = compute_event_metrics(pred_np[:, 0], flags_np[:, 0] > 0.5, flags_np[:, 2] > 0.5) if val_preds else compute_event_metrics([], [], [])
-                reversion_metrics = compute_event_metrics(pred_rev_np, flags_np[:, 1] > 0.5, flags_np[:, 3] > 0.5) if val_preds else compute_event_metrics([], [], [])
-                direction_metrics = compute_direction_metrics(
-                    np.vstack(val_blue).reshape(-1),
-                    np.vstack(val_purple).reshape(-1),
-                    flags_np,
-                ) if val_blue and val_purple else {
-                    'accuracy': 0.0,
-                    'macro_f1': 0.0,
-                    'blue_f1': 0.0,
-                    'purple_f1': 0.0,
-                    'support': 0,
-                }
-                breakout_gap = breakout_event_mean - breakout_hn_mean
-                reversion_gap = reversion_event_mean - reversion_hn_mean
-                composite_score = compute_checkpoint_score(
-                    breakout_metrics,
-                    reversion_metrics,
-                    breakout_corr,
-                    reversion_corr,
-                    direction_metrics['macro_f1'] if use_direction_metrics else None,
-                    profile=score_profile,
+                    f"Val Main/Aux: {file_summary['loss_main']:.4f}/{file_summary['loss_aux']:.4f}"
                 )
                 print(
-                    f"  -> Val Corr Breakout/Reversion: {breakout_corr:.4f}/{reversion_corr:.4f} | "
-                    f"Event Mean: {breakout_event_mean:.4f}/{reversion_event_mean:.4f} | "
-                    f"HardNeg Mean: {breakout_hn_mean:.4f}/{reversion_hn_mean:.4f} | "
-                    f"Gap: {breakout_gap:.4f}/{reversion_gap:.4f} | "
-                    f"Composite: {composite_score:.4f}"
+                    f"  -> Val Corr Breakout/Reversion: {file_summary['breakout_corr']:.4f}/{file_summary['reversion_corr']:.4f} | "
+                    f"Event Mean: {file_summary['breakout_event_mean']:.4f}/{file_summary['reversion_event_mean']:.4f} | "
+                    f"HardNeg Mean: {file_summary['breakout_hard_negative_mean']:.4f}/{file_summary['reversion_hard_negative_mean']:.4f} | "
+                    f"Gap: {file_summary['breakout_gap']:.4f}/{file_summary['reversion_gap']:.4f} | "
+                    f"Composite: {file_summary['composite_score']:.4f}"
                 )
                 print(
-                    f"  -> Event F1 Breakout/Reversion: {breakout_metrics['f1']:.4f}/{reversion_metrics['f1']:.4f} | "
-                    f"HardNeg: {breakout_metrics['hard_negative_rate']:.4f}/{reversion_metrics['hard_negative_rate']:.4f} | "
-                    f"Direction MacroF1: {direction_metrics['macro_f1']:.4f}"
+                    f"  -> Event F1 Breakout/Reversion: {file_summary['breakout_metrics']['f1']:.4f}/{file_summary['reversion_metrics']['f1']:.4f} | "
+                    f"HardNeg: {file_summary['breakout_metrics']['hard_negative_rate']:.4f}/{file_summary['reversion_metrics']['hard_negative_rate']:.4f} | "
+                    f"Direction MacroF1: {file_summary['direction_metrics']['macro_f1']:.4f}"
+                )
+                print(
+                    f"  -> Gate Mean Dir/Public/Break: "
+                    f"{file_summary['direction_gate_mean']:.4f}/{file_summary['public_reversion_gate_mean']:.4f}/{file_summary['breakout_residual_gate_mean']:.4f} | "
+                    f"Floor: {file_summary['directional_floor_mean']:.4f} | "
+                    f"Constraint B/P/Pub/Cont: "
+                    f"{file_summary['blue_over_purple_violation']:.4f}/"
+                    f"{file_summary['purple_over_blue_violation']:.4f}/"
+                    f"{file_summary['public_below_directional_violation']:.4f}/"
+                    f"{file_summary['continuation_public_violation']:.4f}"
                 )
                 epoch_train_loss_total += total_loss
                 epoch_train_batches += len(train_loader)
                 epoch_train_logs.extend(loss_logs)
-                epoch_val_loss_total += val_loss
-                epoch_val_batches += len(test_loader)
-                epoch_val_logs.extend(val_logs)
-                if val_preds:
-                    epoch_val_preds.append(np.vstack(val_preds))
-                    epoch_val_targets.append(np.vstack(val_targets))
-                    epoch_val_flags.append(np.vstack(val_flags))
-                    if val_blue and val_purple:
-                        epoch_val_blue.append(np.vstack(val_blue))
-                        epoch_val_purple.append(np.vstack(val_purple))
+                merge_metric_bucket(epoch_all_bucket, file_bucket)
+                merge_metric_bucket(epoch_timeframe_buckets[timeframe_label], file_bucket)
                 processed_files += 1
                     
                 # Cleanup to avoid memory leaks
@@ -749,6 +979,42 @@ def train(args):
                 traceback.print_exc()
                 print(f"Error processing {data_path}: {e}")
                 continue
+
+        timeframe_summaries = {
+            timeframe: summarize_metric_bucket(
+                bucket,
+                score_profile=score_profile,
+                use_direction_metrics=use_direction_metrics,
+            )
+            for timeframe, bucket in sorted(epoch_timeframe_buckets.items())
+        }
+        overall_all_summary = summarize_metric_bucket(
+            epoch_all_bucket,
+            score_profile=score_profile,
+            use_direction_metrics=use_direction_metrics,
+        )
+        if score_timeframe_set:
+            score_bucket = build_metric_bucket()
+            for timeframe, bucket in epoch_timeframe_buckets.items():
+                if timeframe in score_timeframe_set:
+                    merge_metric_bucket(score_bucket, bucket)
+            if not score_bucket['preds']:
+                score_bucket = epoch_all_bucket
+        else:
+            score_bucket = epoch_all_bucket
+        epoch_score_summary = summarize_metric_bucket(
+            score_bucket,
+            score_profile=score_profile,
+            use_direction_metrics=use_direction_metrics,
+        )
+        epoch_val_batches = len(score_bucket['logs'])
+        epoch_val_loss_total = float(sum(item.get('total_loss', 0.0) for item in score_bucket['logs']))
+        epoch_val_logs = list(score_bucket['logs'])
+        epoch_val_preds = list(score_bucket['preds'])
+        epoch_val_targets = list(score_bucket['targets'])
+        epoch_val_flags = list(score_bucket['flags'])
+        epoch_val_blue = list(score_bucket['debug_batches']['blue_score'])
+        epoch_val_purple = list(score_bucket['debug_batches']['purple_score'])
 
         if processed_files == 0 or epoch_val_batches == 0:
             print("No valid files processed in this epoch.")
@@ -827,6 +1093,124 @@ def train(args):
             f"{direction_metrics['blue_f1']:.4f}/{direction_metrics['purple_f1']:.4f} | "
             f"Support: {direction_metrics['support']}"
         )
+        print(
+            f"[EPOCH {epoch+1} SUMMARY] Gate Mean Dir/Public/Break: "
+            f"{epoch_score_summary['direction_gate_mean']:.4f}/"
+            f"{epoch_score_summary['public_reversion_gate_mean']:.4f}/"
+            f"{epoch_score_summary['breakout_residual_gate_mean']:.4f} | "
+            f"Floor: {epoch_score_summary['directional_floor_mean']:.4f} | "
+            f"Constraint B/P/Pub/Cont: "
+            f"{epoch_score_summary['blue_over_purple_violation']:.4f}/"
+            f"{epoch_score_summary['purple_over_blue_violation']:.4f}/"
+            f"{epoch_score_summary['public_below_directional_violation']:.4f}/"
+            f"{epoch_score_summary['continuation_public_violation']:.4f}"
+        )
+        if score_timeframe_set:
+            print(
+                f"[EPOCH {epoch+1} SUMMARY] Score Timeframes: {sorted(score_timeframe_set)} | "
+                f"All-Timeframe Composite: {overall_all_summary['composite_score']:.4f}"
+            )
+        for timeframe, summary in timeframe_summaries.items():
+            score_included = timeframe in score_timeframe_set if score_timeframe_set else True
+            print(
+                f"[EPOCH {epoch+1}][{timeframe}] Composite: {summary['composite_score']:.4f} | "
+                f"Breakout/Reversion F1: {summary['breakout_metrics']['f1']:.4f}/{summary['reversion_metrics']['f1']:.4f} | "
+                f"DirectionF1: {summary['direction_metrics']['macro_f1']:.4f} | "
+                f"ScoreIncluded: {score_included}"
+            )
+            append_jsonl(
+                per_timeframe_metrics_path,
+                {
+                    'epoch': epoch + 1,
+                    'timeframe': timeframe,
+                    'score_included': score_included,
+                    'aux_timeframe': timeframe in aux_timeframe_set,
+                    'constraint_profile': constraint_profile,
+                    'arch_version': getattr(args, 'arch_version', 'iterA2_base'),
+                    'dataset_profile': getattr(args, 'dataset_profile', 'iterA2'),
+                    'loss_profile': getattr(args, 'loss_profile', 'default'),
+                    'score_profile': score_profile,
+                    'sample_count': summary['sample_count'],
+                    'breakout_f1': summary['breakout_metrics']['f1'],
+                    'reversion_f1': summary['reversion_metrics']['f1'],
+                    'breakout_hard_negative_rate': summary['breakout_metrics']['hard_negative_rate'],
+                    'reversion_hard_negative_rate': summary['reversion_metrics']['hard_negative_rate'],
+                    'breakout_gap': summary['breakout_gap'],
+                    'reversion_gap': summary['reversion_gap'],
+                    'composite_score': summary['composite_score'],
+                    'direction_macro_f1': summary['direction_metrics']['macro_f1'],
+                    'signal_frequency': summary['signal_frequency'],
+                    'label_frequency': summary['label_frequency'],
+                    'breakout_signal_frequency': summary['breakout_signal_frequency'],
+                    'reversion_signal_frequency': summary['reversion_signal_frequency'],
+                    'breakout_label_frequency': summary['breakout_label_frequency'],
+                    'reversion_label_frequency': summary['reversion_label_frequency'],
+                    'direction_gate_mean': summary['direction_gate_mean'],
+                    'direction_gate_std': summary['direction_gate_std'],
+                    'public_reversion_gate_mean': summary['public_reversion_gate_mean'],
+                    'public_reversion_gate_std': summary['public_reversion_gate_std'],
+                    'breakout_residual_gate_mean': summary['breakout_residual_gate_mean'],
+                    'breakout_residual_gate_std': summary['breakout_residual_gate_std'],
+                    'directional_floor_mean': summary['directional_floor_mean'],
+                    'blue_over_purple_violation': summary['blue_over_purple_violation'],
+                    'blue_over_purple_violation_rate': summary['blue_over_purple_violation_rate'],
+                    'purple_over_blue_violation': summary['purple_over_blue_violation'],
+                    'purple_over_blue_violation_rate': summary['purple_over_blue_violation_rate'],
+                    'public_below_directional_violation': summary['public_below_directional_violation'],
+                    'public_below_directional_violation_rate': summary['public_below_directional_violation_rate'],
+                    'continuation_public_violation': summary['continuation_public_violation'],
+                    'continuation_public_violation_rate': summary['continuation_public_violation_rate'],
+                },
+            )
+        append_jsonl(
+            epoch_metrics_path,
+            {
+                'epoch': epoch + 1,
+                'processed_files': processed_files,
+                'constraint_profile': constraint_profile,
+                'arch_version': getattr(args, 'arch_version', 'iterA2_base'),
+                'dataset_profile': getattr(args, 'dataset_profile', 'iterA2'),
+                'loss_profile': getattr(args, 'loss_profile', 'default'),
+                'score_profile': score_profile,
+                'score_timeframes': score_timeframes or sorted(timeframe_summaries.keys()),
+                'aux_timeframes': aux_timeframes,
+                'train_loss': epoch_avg_loss,
+                'val_loss': epoch_avg_val_loss,
+                'train_main': epoch_train_main,
+                'train_aux': epoch_train_aux,
+                'val_main': epoch_val_main,
+                'val_aux': epoch_val_aux,
+                'sample_count': epoch_score_summary['sample_count'],
+                'breakout_corr': epoch_score_summary['breakout_corr'],
+                'reversion_corr': epoch_score_summary['reversion_corr'],
+                'breakout_gap': epoch_score_summary['breakout_gap'],
+                'reversion_gap': epoch_score_summary['reversion_gap'],
+                'composite_score': composite_score,
+                'direction_macro_f1': epoch_score_summary['direction_metrics']['macro_f1'],
+                'breakout_f1': epoch_score_summary['breakout_metrics']['f1'],
+                'reversion_f1': epoch_score_summary['reversion_metrics']['f1'],
+                'breakout_hard_negative_rate': epoch_score_summary['breakout_metrics']['hard_negative_rate'],
+                'reversion_hard_negative_rate': epoch_score_summary['reversion_metrics']['hard_negative_rate'],
+                'signal_frequency': epoch_score_summary['signal_frequency'],
+                'label_frequency': epoch_score_summary['label_frequency'],
+                'direction_gate_mean': epoch_score_summary['direction_gate_mean'],
+                'direction_gate_std': epoch_score_summary['direction_gate_std'],
+                'public_reversion_gate_mean': epoch_score_summary['public_reversion_gate_mean'],
+                'public_reversion_gate_std': epoch_score_summary['public_reversion_gate_std'],
+                'breakout_residual_gate_mean': epoch_score_summary['breakout_residual_gate_mean'],
+                'breakout_residual_gate_std': epoch_score_summary['breakout_residual_gate_std'],
+                'directional_floor_mean': epoch_score_summary['directional_floor_mean'],
+                'blue_over_purple_violation': epoch_score_summary['blue_over_purple_violation'],
+                'blue_over_purple_violation_rate': epoch_score_summary['blue_over_purple_violation_rate'],
+                'purple_over_blue_violation': epoch_score_summary['purple_over_blue_violation'],
+                'purple_over_blue_violation_rate': epoch_score_summary['purple_over_blue_violation_rate'],
+                'public_below_directional_violation': epoch_score_summary['public_below_directional_violation'],
+                'public_below_directional_violation_rate': epoch_score_summary['public_below_directional_violation_rate'],
+                'continuation_public_violation': epoch_score_summary['continuation_public_violation'],
+                'continuation_public_violation_rate': epoch_score_summary['continuation_public_violation_rate'],
+                'all_timeframes_composite_score': overall_all_summary['composite_score'],
+            },
+        )
 
         scheduler.step(epoch_avg_val_loss)
 
@@ -863,7 +1247,37 @@ def train(args):
                     'processed_files': processed_files,
                     'epoch': epoch + 1,
                     'breakout_eval': breakout_metrics,
-                    'reversion_eval': reversion_metrics
+                    'reversion_eval': reversion_metrics,
+                    'direction_eval': epoch_score_summary['direction_metrics'],
+                    'gate_stats': {
+                        'direction_gate_mean': epoch_score_summary['direction_gate_mean'],
+                        'direction_gate_std': epoch_score_summary['direction_gate_std'],
+                        'public_reversion_gate_mean': epoch_score_summary['public_reversion_gate_mean'],
+                        'public_reversion_gate_std': epoch_score_summary['public_reversion_gate_std'],
+                        'breakout_residual_gate_mean': epoch_score_summary['breakout_residual_gate_mean'],
+                        'breakout_residual_gate_std': epoch_score_summary['breakout_residual_gate_std'],
+                        'directional_floor_mean': epoch_score_summary['directional_floor_mean'],
+                    },
+                    'constraint_stats': {
+                        key: epoch_score_summary[key]
+                        for key in CONSTRAINT_STAT_BASE_KEYS
+                    },
+                    'constraint_rates': {
+                        f'{key}_rate': epoch_score_summary[f'{key}_rate']
+                        for key in CONSTRAINT_STAT_BASE_KEYS
+                    },
+                    'score_timeframes': score_timeframes or sorted(timeframe_summaries.keys()),
+                    'aux_timeframes': aux_timeframes,
+                    'per_timeframe_metrics': {
+                        timeframe: {
+                            'composite_score': summary['composite_score'],
+                            'breakout_f1': summary['breakout_metrics']['f1'],
+                            'reversion_f1': summary['reversion_metrics']['f1'],
+                            'direction_macro_f1': summary['direction_metrics']['macro_f1'],
+                        }
+                        for timeframe, summary in timeframe_summaries.items()
+                    },
+                    'all_timeframes_composite_score': overall_all_summary['composite_score'],
                 },
                 'feature_names': PHYSICS_FEATURE_NAMES,
                 'env': {
@@ -890,7 +1304,37 @@ def train(args):
             'processed_files': processed_files,
             'epoch': epoch + 1,
             'breakout_eval': breakout_metrics,
-            'reversion_eval': reversion_metrics
+            'reversion_eval': reversion_metrics,
+            'direction_eval': epoch_score_summary['direction_metrics'],
+            'gate_stats': {
+                'direction_gate_mean': epoch_score_summary['direction_gate_mean'],
+                'direction_gate_std': epoch_score_summary['direction_gate_std'],
+                'public_reversion_gate_mean': epoch_score_summary['public_reversion_gate_mean'],
+                'public_reversion_gate_std': epoch_score_summary['public_reversion_gate_std'],
+                'breakout_residual_gate_mean': epoch_score_summary['breakout_residual_gate_mean'],
+                'breakout_residual_gate_std': epoch_score_summary['breakout_residual_gate_std'],
+                'directional_floor_mean': epoch_score_summary['directional_floor_mean'],
+            },
+            'constraint_stats': {
+                key: epoch_score_summary[key]
+                for key in CONSTRAINT_STAT_BASE_KEYS
+            },
+            'constraint_rates': {
+                f'{key}_rate': epoch_score_summary[f'{key}_rate']
+                for key in CONSTRAINT_STAT_BASE_KEYS
+            },
+            'score_timeframes': score_timeframes or sorted(timeframe_summaries.keys()),
+            'aux_timeframes': aux_timeframes,
+            'per_timeframe_metrics': {
+                timeframe: {
+                    'composite_score': summary['composite_score'],
+                    'breakout_f1': summary['breakout_metrics']['f1'],
+                    'reversion_f1': summary['reversion_metrics']['f1'],
+                    'direction_macro_f1': summary['direction_metrics']['macro_f1'],
+                }
+                for timeframe, summary in timeframe_summaries.items()
+            },
+            'all_timeframes_composite_score': overall_all_summary['composite_score'],
         }
         save_resume_checkpoint(
             resume_path=resume_path,
@@ -922,6 +1366,7 @@ def train(args):
         'args': vars(args),
         'dataset_manifest': final_records,
         'feature_names': PHYSICS_FEATURE_NAMES,
+        'latest_metrics': latest_metrics,
         'env': {
             'torch': torch.__version__,
             'cuda': torch.version.cuda if torch.cuda.is_available() else None,
@@ -973,7 +1418,12 @@ if __name__ == "__main__":
     parser.add_argument('--arch_version', type=str, default='iterA2_base')
     parser.add_argument('--dataset_profile', type=str, default='iterA2')
     parser.add_argument('--loss_profile', type=str, default='default')
+    parser.add_argument('--constraint_profile', type=str, default='default')
     parser.add_argument('--score_profile', type=str, default='default')
+    parser.add_argument('--score_timeframes', type=str, default=None)
+    parser.add_argument('--aux_timeframes', type=str, default=None)
+    parser.add_argument('--epoch_metrics_name', type=str, default='epoch_metrics.jsonl')
+    parser.add_argument('--per_timeframe_metrics_name', type=str, default='per_timeframe_metrics.jsonl')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--deterministic', action='store_true', default=True)
     parser.add_argument('--test_mode', action='store_true', default=False)

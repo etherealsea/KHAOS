@@ -38,3 +38,14 @@ Finance/03_实验与验证/结果/
 # OS noise
 Thumbs.db
 Desktop.ini
+
+# Local media/storyboard assets at repo root
+/storyboard_*.jpg
+/sb*.jpg
+/bili_*.jpg
+/chart_bottom.jpg
+/chat_top.jpg
+/temp_bili_audio.m4s
+
+# Local experiment outputs not intended for source control
+Finance/02_核心代码/模型权重备份/teacher_first_ashare_smoke/

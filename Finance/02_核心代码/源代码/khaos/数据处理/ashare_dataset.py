@@ -38,6 +38,38 @@ EVENT_FLAG_NAMES = (
 )
 EVENT_FLAG_INDEX = {name: idx for idx, name in enumerate(EVENT_FLAG_NAMES)}
 
+ITERA5_TIMEFRAME_WEIGHT = {
+    '5m': 0.85,
+    '15m': 1.00,
+    '60m': 1.20,
+    '240m': 1.05,
+    '1d': 1.00,
+}
+
+SHORT_T_TIMEFRAME_WEIGHT = {
+    '5m': 1.18,
+    '15m': 1.20,
+    '60m': 1.12,
+    '240m': 0.90,
+    '1d': 0.78,
+}
+
+SHORT_T_BALANCED_V1_TIMEFRAME_WEIGHT = {
+    '5m': 1.05,
+    '15m': 1.15,
+    '60m': 1.18,
+    '240m': 1.00,
+    '1d': 0.95,
+}
+
+SHORT_T_BALANCED_V2_TIMEFRAME_WEIGHT = {
+    '5m': 0.92,
+    '15m': 1.10,
+    '60m': 1.22,
+    '240m': 1.02,
+    '1d': 0.98,
+}
+
 
 def _infer_expected_bar_minutes(df, timeframe_label=None):
     normalized = normalize_timeframe_label(timeframe_label)
@@ -49,6 +81,38 @@ def _infer_expected_bar_minutes(df, timeframe_label=None):
         if not delta.empty:
             return max(int(round(delta.median().total_seconds() / 60.0)), 1)
     return 60
+
+
+def _build_itera5_boundary_penalty(df, timeframe_label=None):
+    normalized = normalize_timeframe_label(timeframe_label)
+    penalty = np.ones(len(df), dtype=np.float32)
+    if normalized != '5m' or len(df) == 0:
+        return penalty
+    hours = df['time'].dt.hour.to_numpy()
+    minutes = df['time'].dt.minute.to_numpy()
+    boundary_mask = (
+        ((hours == 9) & np.isin(minutes, [35, 40])) |
+        ((hours == 14) & (minutes == 55)) |
+        ((hours == 15) & (minutes == 0))
+    )
+    penalty[boundary_mask] = 0.75
+    return penalty
+
+
+def _build_shortt_boundary_penalty(df, timeframe_label=None):
+    normalized = normalize_timeframe_label(timeframe_label)
+    penalty = np.ones(len(df), dtype=np.float32)
+    if normalized != '5m' or len(df) == 0:
+        return penalty
+    hours = df['time'].dt.hour.to_numpy()
+    minutes = df['time'].dt.minute.to_numpy()
+    boundary_mask = (
+        ((hours == 9) & np.isin(minutes, [35, 40, 45])) |
+        ((hours == 14) & np.isin(minutes, [50, 55])) |
+        ((hours == 15) & (minutes == 0))
+    )
+    penalty[boundary_mask] = 0.60
+    return penalty
 
 
 def _build_ashare_trade_profile(df, close, open_, high, low, volume):
@@ -154,7 +218,14 @@ class AshareFinancialDataset(Dataset):
         self.timeframe_label = normalize_timeframe_label(timeframe_label)
         self.start_index = max(int(start_index), 0)
         self.dataset_profile = str(dataset_profile or 'iterA2')
-        self.use_continuation_flag = self.dataset_profile in {'iterA3', 'iterA4'}
+        self.use_continuation_flag = self.dataset_profile in {
+            'iterA3',
+            'iterA4',
+            'iterA5',
+            'shortT_v1',
+            'shortT_balanced_v1',
+            'shortT_balanced_v2',
+        }
 
         df = normalize_ohlcv_dataframe(df)
         self.time = df['time'].copy()
@@ -264,6 +335,28 @@ class AshareFinancialDataset(Dataset):
         ).astype(np.float32) * trade_profile['sample_weight']
         if self.use_continuation_flag:
             self.sample_weights = self.sample_weights * (1.0 + 0.60 * continuation_pressure.astype(np.float32))
+        if self.dataset_profile == 'iterA5':
+            timeframe_weight = ITERA5_TIMEFRAME_WEIGHT.get(self.timeframe_label, 1.0)
+            boundary_penalty = _build_itera5_boundary_penalty(df, self.timeframe_label)
+            self.sample_weights = self.sample_weights * timeframe_weight * boundary_penalty
+        elif self.dataset_profile == 'shortT_v1':
+            timeframe_weight = SHORT_T_TIMEFRAME_WEIGHT.get(self.timeframe_label, 1.0)
+            boundary_penalty = _build_shortt_boundary_penalty(df, self.timeframe_label)
+            breakout_bias = (
+                1.0 +
+                0.20 * breakout_event.astype(np.float32) +
+                0.10 * breakout_aux.astype(np.float32) +
+                0.16 * breakout_hard_negative.astype(np.float32)
+            )
+            self.sample_weights = self.sample_weights * timeframe_weight * boundary_penalty * breakout_bias
+        elif self.dataset_profile == 'shortT_balanced_v1':
+            timeframe_weight = SHORT_T_BALANCED_V1_TIMEFRAME_WEIGHT.get(self.timeframe_label, 1.0)
+            boundary_penalty = _build_shortt_boundary_penalty(df, self.timeframe_label)
+            self.sample_weights = self.sample_weights * timeframe_weight * boundary_penalty
+        elif self.dataset_profile == 'shortT_balanced_v2':
+            timeframe_weight = SHORT_T_BALANCED_V2_TIMEFRAME_WEIGHT.get(self.timeframe_label, 1.0)
+            boundary_penalty = _build_shortt_boundary_penalty(df, self.timeframe_label)
+            self.sample_weights = self.sample_weights * timeframe_weight * boundary_penalty
 
         raw_data = np.stack([
             self.open, self.high, self.low, self.close, self.volume, self.ema20,
