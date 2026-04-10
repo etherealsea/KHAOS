@@ -557,6 +557,18 @@ def _collect_horizon_targets(
 
 def discover_horizon_profile(train_df, window_size, timeframe_label, horizon_search_spec):
     train_df = normalize_ohlcv_dataframe(train_df)
+    if len(train_df) == 0:
+        spec = normalize_horizon_search_spec(horizon_search_spec)
+        return {
+            'timeframe': normalize_timeframe_label(timeframe_label),
+            'candidate_horizons': [int(spec['min_horizon'])],
+            'search_spec': spec,
+            'task_stats': {
+                'breakout': {'mode_mass': 0.0, 'h_mode': int(spec['min_horizon']), 'iqr': 0.0, 'distribution': []},
+                'reversion': {'mode_mass': 0.0, 'h_mode': int(spec['min_horizon']), 'iqr': 0.0, 'distribution': []},
+            },
+            'q_distribution_mean': {'breakout': [], 'reversion': []},
+        }
     close = train_df['close'].values.astype(np.float32)
     open_ = train_df['open'].values.astype(np.float32)
     high = train_df['high'].values.astype(np.float32)
@@ -566,7 +578,7 @@ def discover_horizon_profile(train_df, window_size, timeframe_label, horizon_sea
     log_high = np.log(np.maximum(high, 1e-8))
     log_low = np.log(np.maximum(low, 1e-8))
     returns = np.diff(log_close, prepend=log_close[0])
-    sigma = pd.Series(returns).rolling(window=LOCAL_PHYSICS_WINDOW, min_periods=1).std().bfill().values
+    sigma = pd.Series(returns).rolling(window=LOCAL_PHYSICS_WINDOW, min_periods=2).std().ffill().fillna(1e-6).values
     sigma = np.maximum(sigma, 1e-6).astype(np.float32)
     ema20 = ema_np(close, 20)
     entropy = rolling_entropy_proxy_np(high, low, close, LOCAL_PHYSICS_WINDOW)
@@ -695,7 +707,7 @@ class AshareFinancialDataset(Dataset):
         log_high = np.log(np.maximum(self.high, 1e-8))
         log_low = np.log(np.maximum(self.low, 1e-8))
         returns = np.diff(log_close, prepend=log_close[0])
-        sigma = pd.Series(returns).rolling(window=volatility_window, min_periods=1).std().bfill().values
+        sigma = pd.Series(returns).rolling(window=volatility_window, min_periods=2).std().ffill().fillna(1e-6).values
         self.sigma = np.maximum(sigma, 1e-6).astype(np.float32)
         self.ema20 = ema_np(self.close, 20)
         entropy = rolling_entropy_proxy_np(self.high, self.low, self.close, LOCAL_PHYSICS_WINDOW)
@@ -1065,7 +1077,6 @@ class AshareFinancialDataset(Dataset):
             'trade_masks': self.trade_masks[end_idx - 1],
             'horizon_prior': self.horizon_prior[end_idx - 1],
             'selected_horizon_index': self.selected_horizon_indices[end_idx - 1],
-            'candidate_horizons': self.candidate_horizons_tensor,
             'valid_horizon_mask': self.valid_horizon_mask,
             'global_horizon_grid': self.global_horizon_grid_tensor,
         }
