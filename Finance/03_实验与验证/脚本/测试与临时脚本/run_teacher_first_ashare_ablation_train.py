@@ -580,14 +580,14 @@ def run_training_phase(
             max_files=len(phase_assets) * len(spec['timeframes']),
         )
     else:
-        phase_assets = selected_assets
+        phase_assets = selected_assets[:2]
         namespace = build_namespace(
             experiment_name=experiment_name,
             save_dir=WEIGHT_ROOT / experiment_name,
             assets=phase_assets,
-            epochs=spec['epochs'],
+            epochs=2,
             batch_size=256,
-            fast_full=False,
+            fast_full=True,
             per_timeframe_train_cap=spec['per_timeframe_train_cap'],
             constraint_profile=constraint_profile,
             resume=resume,
