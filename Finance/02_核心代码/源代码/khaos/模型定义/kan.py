@@ -428,19 +428,25 @@ class KHAOS_KAN(nn.Module):
         public_reversion_score = torch.maximum(blue_score, purple_score)
         if self.arch_version == 'iterA5_multiscale':
             public_reversion_score = self.public_reversion_head(public_reversion_state)
+            
         public_reversion_gate = torch.zeros_like(direction_gate)
+        
         if self.arch_version in {'iterA4_multiscale', 'iterA5_multiscale'}:
             public_reversion_gate = torch.sigmoid(
                 self.public_reversion_gate(
-                    torch.cat(
-                        [reversion_context, (short_state - mid_state).abs(), (last_state - global_state).abs()],
-                        dim=1,
-                    )
+                    torch.cat([
+                        reversion_context,
+                        (short_state - mid_state).abs(),
+                        (last_state - global_state).abs()
+                    ], dim=1)
                 )
             )
-            reversion_pred = (
-                public_reversion_gate * public_reversion_score +
-                (1.0 - public_reversion_gate) * directional_reversion
+            
+            # 【优化修改】：打破严格的凸组合限制，解决 public_below_directional_violation_rate 接近 100% 的问题
+            # 将加权平均改为“以 directional_reversion 为基座，向上叠加残差”的方式，
+            # 确保 reversion_pred 能够突破 max(blue, purple) 的上限限制，满足 loss.py 中的可行域约束。
+            reversion_pred = directional_reversion + public_reversion_gate * torch.relu(
+                public_reversion_score - directional_reversion + 0.15
             )
         else:
             reversion_pred = directional_reversion
