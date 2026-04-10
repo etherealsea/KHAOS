@@ -185,6 +185,87 @@ EXPERIMENT_SPECS = {
         'per_timeframe_train_cap': SHORT_T_BALANCED_CAPS,
         'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_BALANCED,
     },
+    'shortT_precision_v1': {
+        'timeframes': WITH_5M_TIMEFRAMES,
+        'arch_version': 'iterA4_multiscale',
+        'dataset_profile': 'shortT_precision_v1',
+        'loss_profile': 'shortT_precision_v1',
+        'score_profile': 'short_t_precision_focus',
+        'score_timeframes': ['15m', '60m', '240m', '1d'],
+        'aux_timeframes': ['5m'],
+        'constraint_profile': 'teacher_feasible_precision_v1',
+        'epochs': 16,
+        'early_stop_patience': 4,
+        'per_timeframe_train_cap': SHORT_T_BALANCED_CAPS,
+        'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_BALANCED,
+        'warm_start_from': 'shortT_balanced_v1',
+    },
+    'horizon_single_precision_v1': {
+        'timeframes': WITH_5M_TIMEFRAMES,
+        'arch_version': 'iterA4_multiscale',
+        'dataset_profile': 'shortT_precision_v1',
+        'loss_profile': 'horizon_precision_v1',
+        'score_profile': 'recent_precision_v1',
+        'score_timeframes': ['15m', '60m', '240m', '1d'],
+        'aux_timeframes': ['5m'],
+        'constraint_profile': 'teacher_feasible_precision_v1',
+        'split_scheme': 'rolling_recent_v1',
+        'horizon_family_mode': 'single_cycle',
+        'horizon_search_spec': {
+            'min_horizon': 20,
+            'max_horizon': 120,
+            'max_fraction': 0.12,
+            'saturation_ratio': 0.01,
+            'saturation_patience': 8,
+            'saturation_ema': 5,
+        },
+        'epochs': 18,
+        'early_stop_patience': 5,
+        'per_timeframe_train_cap': SHORT_T_BALANCED_CAPS,
+        'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_BALANCED,
+        'warm_start_from': 'shortT_balanced_v1',
+        'breakout_precision_floor': 0.50,
+        'reversion_precision_floor': 0.48,
+        'public_violation_cap': 0.20,
+        'signal_frequency_cap_ratio': 0.70,
+        'retired_baseline': True,
+        'enforce_horizon_family_guard': True,
+    },
+    'horizon_adaptive_precision_v1': {
+        'timeframes': WITH_5M_TIMEFRAMES,
+        'arch_version': 'iterA4_multiscale',
+        'dataset_profile': 'shortT_precision_v1',
+        'loss_profile': 'horizon_precision_v1',
+        'score_profile': 'recent_precision_v1',
+        'score_timeframes': ['15m', '60m', '240m', '1d'],
+        'aux_timeframes': ['5m'],
+        'constraint_profile': 'teacher_feasible_precision_v1',
+        'split_scheme': 'rolling_recent_v1',
+        'horizon_family_mode': 'adaptive_resonance',
+        'horizon_search_spec': {
+            'min_horizon': 20,
+            'max_horizon': 120,
+            'max_fraction': 0.12,
+            'saturation_ratio': 0.01,
+            'saturation_patience': 8,
+            'saturation_ema': 5,
+        },
+        'epochs': 18,
+        'early_stop_patience': 5,
+        'per_timeframe_train_cap': SHORT_T_BALANCED_CAPS,
+        'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_BALANCED,
+        'warm_start_from': 'shortT_balanced_v1',
+        'breakout_precision_floor': 0.50,
+        'reversion_precision_floor': 0.48,
+        'public_violation_cap': 0.20,
+        'signal_frequency_cap_ratio': 0.70,
+        'kill_keep_review_epoch': 3,
+        'kill_keep_public_violation_rate_max': 0.95,
+        'kill_keep_signal_frequency_max': 0.42,
+        'kill_keep_timeframe_60m_composite_min': 0.22,
+        'kill_keep_horizon_entropy_min': 0.05,
+        'kill_keep_horizon_entropy_timeframes': ['15m', '60m'],
+    },
 }
 
 
@@ -240,7 +321,14 @@ def load_latest_epoch_snapshot(save_dir: Path):
 
 
 def load_best_checkpoint_metrics(save_dir: Path, experiment_name: str):
-    best_path = save_dir / f'{experiment_name}_best.pth'
+    candidates = [
+        save_dir / f'{experiment_name}_best.pth',
+        save_dir / f'{experiment_name}_best_raw.pth',
+        save_dir / f'{experiment_name}_best_gate.pth',
+    ]
+    best_path = next((path for path in candidates if path.exists()), None)
+    if best_path is None:
+        raise FileNotFoundError(f'No best checkpoint found for {experiment_name} under {save_dir}')
     checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
     return checkpoint, checkpoint.get('metrics', {})
 
@@ -344,7 +432,10 @@ def prepare_and_validate():
 
 def parse_experiments(value: str):
     if not value or value.strip().lower() == 'all':
-        return list(EXPERIMENT_SPECS.keys())
+        return [
+            name for name, spec in EXPERIMENT_SPECS.items()
+            if not spec.get('retired_baseline', False)
+        ]
     experiments = [item.strip() for item in value.split(',') if item.strip()]
     unknown = [item for item in experiments if item not in EXPERIMENT_SPECS]
     if unknown:
@@ -366,6 +457,19 @@ def build_namespace(
 ):
     spec = EXPERIMENT_SPECS[experiment_name]
     resolved_constraint_profile = spec.get('constraint_profile', constraint_profile)
+    resolved_resume = resume
+    resolved_resume_path = None
+    resolved_warm_start_weights_only = bool(spec.get('warm_start_weights_only', False))
+    resolved_warm_start_path = spec.get('warm_start_path')
+    warm_start_from = spec.get('warm_start_from')
+    resolved_baseline_reference_dir = spec.get('baseline_reference_dir')
+    if warm_start_from:
+        warm_start_best = WEIGHT_ROOT / warm_start_from / f'{warm_start_from}_best.pth'
+        if warm_start_best.exists():
+            resolved_warm_start_weights_only = True
+            resolved_warm_start_path = str(warm_start_best)
+            if resolved_baseline_reference_dir is None:
+                resolved_baseline_reference_dir = str(WEIGHT_ROOT / warm_start_from)
     return argparse.Namespace(
         data_dir=str(DATA_DIR),
         save_dir=str(save_dir),
@@ -374,6 +478,8 @@ def build_namespace(
         assets=assets,
         timeframes=spec['timeframes'],
         split_mode='time',
+        split_scheme=spec.get('split_scheme', 'time'),
+        split_labels=spec.get('split_labels'),
         train_end=DEFAULT_TRAIN_END,
         val_end=DEFAULT_VAL_END,
         test_start=DEFAULT_TEST_START,
@@ -382,6 +488,8 @@ def build_namespace(
         lr=7e-4,
         window_size=24,
         horizon=10,
+        horizon_search_spec=json.dumps(spec['horizon_search_spec'], ensure_ascii=False) if isinstance(spec.get('horizon_search_spec'), dict) else spec.get('horizon_search_spec'),
+        horizon_family_mode=spec.get('horizon_family_mode', 'legacy'),
         hidden_dim=80,
         layers=4,
         grid_size=12,
@@ -400,13 +508,32 @@ def build_namespace(
         early_stop_min_delta=0.001,
         grad_clip=0.8,
         weight_decay=1e-4,
-        resume=resume,
-        resume_path=None,
+        resume=resolved_resume,
+        resume_path=resolved_resume_path,
+        warm_start_weights_only=resolved_warm_start_weights_only,
+        warm_start_path=resolved_warm_start_path,
+        config_fingerprint=None,
+        baseline_reference_dir=resolved_baseline_reference_dir,
+        enforce_horizon_family_guard=bool(spec.get('enforce_horizon_family_guard', False) and not fast_full),
+        signal_frequency_cap_ratio=spec.get('signal_frequency_cap_ratio', 0.70),
+        signal_frequency_cap=spec.get('signal_frequency_cap'),
+        public_violation_cap=spec.get('public_violation_cap', 0.20),
+        breakout_precision_floor=spec.get('breakout_precision_floor', 0.0),
+        reversion_precision_floor=spec.get('reversion_precision_floor', 0.0),
         best_name=f'{experiment_name}_best.pth',
+        best_raw_name=f'{experiment_name}_best_raw.pth',
+        best_gate_name=f'{experiment_name}_best_gate.pth',
         final_name=f'{experiment_name}_final.pth',
         resume_name=f'{experiment_name}_resume.pth',
         epoch_metrics_name='epoch_metrics.jsonl',
         per_timeframe_metrics_name='per_timeframe_metrics.jsonl',
+        per_fold_metrics_name='per_fold_metrics.jsonl',
+        kill_keep_review_epoch=spec.get('kill_keep_review_epoch', 0),
+        kill_keep_public_violation_rate_max=spec.get('kill_keep_public_violation_rate_max', 1.0),
+        kill_keep_signal_frequency_max=spec.get('kill_keep_signal_frequency_max', 1.0),
+        kill_keep_timeframe_60m_composite_min=spec.get('kill_keep_timeframe_60m_composite_min', 0.0),
+        kill_keep_horizon_entropy_min=spec.get('kill_keep_horizon_entropy_min', 0.0),
+        kill_keep_horizon_entropy_timeframes=spec.get('kill_keep_horizon_entropy_timeframes'),
         promotion_overall_composite_threshold=PROMOTION_THRESHOLDS['overall_model_composite'],
         promotion_timeframe_composite_thresholds=','.join(
             f'{tf}={threshold}'
@@ -527,6 +654,8 @@ def run_training_phase(
         'save_dir': Path(namespace.save_dir),
         'log_path': log_path,
         'best_path': Path(namespace.save_dir) / namespace.best_name,
+        'best_raw_path': Path(namespace.save_dir) / namespace.best_raw_name,
+        'best_gate_path': Path(namespace.save_dir) / namespace.best_gate_name,
         'final_path': Path(namespace.save_dir) / namespace.final_name,
         'resume_path': Path(namespace.save_dir) / namespace.resume_name,
         'ths_proxy_validation': ths_validation,

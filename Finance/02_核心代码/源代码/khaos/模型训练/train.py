@@ -1,21 +1,50 @@
-import torch
-import torch.optim as optim
-from torch.utils.data import DataLoader, RandomSampler
-from torch.amp import autocast, GradScaler
 import argparse
+import gc
 import glob
+import hashlib
 import json
 import os
-import numpy as np
 import random
+import sys
 from collections import defaultdict
 
-# Adjust import to run as script
-import sys
-import gc
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+import numpy as np
+import torch
+import torch.optim as optim
+from torch.amp import GradScaler
+from torch.utils.data import DataLoader, RandomSampler
 
-from khaos.数据处理.ashare_dataset import EVENT_FLAG_INDEX, create_ashare_dataset_splits
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
+"""
+
+from khaos.鏁版嵁澶勭悊.ashare_dataset import (
+    AshareFinancialDataset,
+    EVENT_FLAG_INDEX,
+    ROLLING_RECENT_SPLITS,
+    build_global_horizon_grid,
+    create_ashare_dataset_splits,
+)
+from khaos.鏁版嵁澶勭悊.ashare_support import (
+    DEFAULT_ASHARE_TIMEFRAMES,
+    LEGACY_ITER9_ASSETS,
+    discover_training_files,
+    normalize_timeframe_label,
+    resolve_training_ready_dir,
+)
+from khaos.鏁版嵁澶勭悊.data_loader import create_rolling_datasets
+from khaos.鏁版嵁澶勭悊.data_processor import process_multi_timeframe
+from khaos.妯″瀷瀹氫箟.kan import KHAOS_KAN
+from khaos.妯″瀷璁粌.loss import PhysicsLoss
+from khaos.鏍稿績寮曟搸.physics import PHYSICS_FEATURE_NAMES
+
+
+"""
+from khaos.数据处理.ashare_dataset import (
+    EVENT_FLAG_INDEX,
+    ROLLING_RECENT_SPLITS,
+    build_global_horizon_grid,
+    create_ashare_dataset_splits,
+)
 from khaos.数据处理.ashare_support import (
     DEFAULT_ASHARE_TIMEFRAMES,
     LEGACY_ITER9_ASSETS,
@@ -23,8 +52,8 @@ from khaos.数据处理.ashare_support import (
     normalize_timeframe_label,
     resolve_training_ready_dir,
 )
-from khaos.数据处理.data_processor import process_multi_timeframe
 from khaos.数据处理.data_loader import create_rolling_datasets
+from khaos.数据处理.data_processor import process_multi_timeframe
 from khaos.模型定义.kan import KHAOS_KAN
 from khaos.模型训练.loss import PhysicsLoss
 from khaos.核心引擎.physics import PHYSICS_FEATURE_NAMES
@@ -36,6 +65,12 @@ DEBUG_BATCH_KEYS = (
     'public_reversion_gate',
     'breakout_residual_gate',
     'directional_floor',
+    'selected_horizon_breakout',
+    'selected_horizon_reversion',
+    'selected_horizon_breakout_value',
+    'selected_horizon_reversion_value',
+    'horizon_entropy_breakout',
+    'horizon_entropy_reversion',
 )
 
 CONSTRAINT_STAT_BASE_KEYS = (
@@ -45,8 +80,11 @@ CONSTRAINT_STAT_BASE_KEYS = (
     'continuation_public_violation',
 )
 
+RECENT_FOLD_ORDER = ('fold_3', 'fold_4')
+DATASET_CACHE_VERSION = 1
 
-def set_seed(seed: int = 42, deterministic: bool = True):
+
+def set_seed(seed=42, deterministic=True):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -55,12 +93,17 @@ def set_seed(seed: int = 42, deterministic: bool = True):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+
+# SECTION: METRICS
+
+
 def safe_corr(a, b):
     a = np.asarray(a, dtype=np.float64)
     b = np.asarray(b, dtype=np.float64)
     if len(a) < 2 or np.std(a) < 1e-12 or np.std(b) < 1e-12:
         return 0.0
     return float(np.corrcoef(a, b)[0, 1])
+
 
 def compute_event_metrics(scores, event_flags, hard_negative_flags):
     scores = np.asarray(scores, dtype=np.float64)
@@ -76,7 +119,7 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags):
             'event_rate': 0.0,
             'hard_negative_rate': 0.0,
             'signal_frequency': 0.0,
-            'label_frequency': 0.0
+            'label_frequency': 0.0,
         }
     label_frequency = float(np.mean(event_flags)) if len(event_flags) > 0 else 0.0
     thresholds = np.unique(np.quantile(scores, np.linspace(0.55, 0.95, 9)))
@@ -102,7 +145,7 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags):
             'event_rate': float(event_rate),
             'hard_negative_rate': float(hn_rate),
             'signal_frequency': float(np.mean(pred)),
-            'label_frequency': label_frequency
+            'label_frequency': label_frequency,
         }
         if best is None or candidate['f1'] > best['f1'] or (
             candidate['f1'] == best['f1'] and candidate['hard_negative_rate'] < best['hard_negative_rate']
@@ -113,11 +156,41 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags):
 
 def compute_event_quality(metrics):
     signal_gap = abs(metrics['signal_frequency'] - metrics['label_frequency'])
+    return metrics['f1'] - 0.20 * metrics['hard_negative_rate'] - 0.05 * signal_gap
+
+
+def compute_precision_first_event_quality(metrics, event_type='generic'):
+    signal_gap = abs(metrics['signal_frequency'] - metrics['label_frequency'])
+    oversignal = max(metrics['signal_frequency'] - metrics['label_frequency'], 0.0)
+    if event_type == 'reversion':
+        return (
+            0.44 * metrics['precision'] +
+            0.34 * metrics['f1'] +
+            0.12 * metrics['accuracy'] +
+            0.10 * metrics['recall'] -
+            0.30 * metrics['hard_negative_rate'] -
+            0.18 * oversignal -
+            0.05 * signal_gap
+        )
     return (
-        metrics['f1']
-        - 0.20 * metrics['hard_negative_rate']
-        - 0.05 * signal_gap
+        0.42 * metrics['precision'] +
+        0.36 * metrics['f1'] +
+        0.12 * metrics['accuracy'] +
+        0.10 * metrics['recall'] -
+        0.26 * metrics['hard_negative_rate'] -
+        0.14 * oversignal -
+        0.05 * signal_gap
     )
+
+
+def _zero_direction_metrics():
+    return {
+        'accuracy': 0.0,
+        'macro_f1': 0.0,
+        'blue_f1': 0.0,
+        'purple_f1': 0.0,
+        'support': 0,
+    }
 
 
 def compute_direction_metrics(blue_scores, purple_scores, flags):
@@ -127,24 +200,12 @@ def compute_direction_metrics(blue_scores, purple_scores, flags):
     blue_idx = EVENT_FLAG_INDEX['reversion_down_context']
     purple_idx = EVENT_FLAG_INDEX['reversion_up_context']
     if flags.ndim != 2 or flags.shape[1] <= max(blue_idx, purple_idx):
-        return {
-            'accuracy': 0.0,
-            'macro_f1': 0.0,
-            'blue_f1': 0.0,
-            'purple_f1': 0.0,
-            'support': 0,
-        }
+        return _zero_direction_metrics()
     blue_mask = flags[:, blue_idx] > 0.5
     purple_mask = flags[:, purple_idx] > 0.5
     valid_mask = blue_mask | purple_mask
     if not np.any(valid_mask):
-        return {
-            'accuracy': 0.0,
-            'macro_f1': 0.0,
-            'blue_f1': 0.0,
-            'purple_f1': 0.0,
-            'support': 0,
-        }
+        return _zero_direction_metrics()
     truth = np.where(blue_mask[valid_mask], 1, 0)
     pred = np.where(blue_scores[valid_mask] >= purple_scores[valid_mask], 1, 0)
 
@@ -179,6 +240,23 @@ def compute_checkpoint_score(
 ):
     breakout_quality = compute_event_quality(breakout_metrics)
     reversion_quality = compute_event_quality(reversion_metrics)
+    if profile in {'short_t_precision_focus', 'recent_precision_v1'}:
+        breakout_quality = compute_precision_first_event_quality(breakout_metrics, event_type='breakout')
+        reversion_quality = compute_precision_first_event_quality(reversion_metrics, event_type='reversion')
+        if direction_macro_f1 is None:
+            return (
+                0.46 * breakout_quality +
+                0.46 * reversion_quality +
+                0.04 * breakout_corr +
+                0.04 * reversion_corr
+            )
+        return (
+            0.40 * breakout_quality +
+            0.44 * reversion_quality +
+            0.10 * direction_macro_f1 +
+            0.03 * breakout_corr +
+            0.03 * reversion_corr
+        )
     if profile == 'short_t_breakout_focus':
         if direction_macro_f1 is None:
             return (
@@ -287,84 +365,100 @@ def _metric_bucket_mean(logs, key):
     return float(np.mean(values))
 
 
-def _zero_direction_metrics():
-    return {
-        'accuracy': 0.0,
-        'macro_f1': 0.0,
-        'blue_f1': 0.0,
-        'purple_f1': 0.0,
-        'support': 0,
-    }
+def _masked_array_mean(values, mask):
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    if values.size == 0 or mask.size == 0 or values.size != mask.size or not np.any(mask):
+        return 0.0
+    return float(values[mask].mean())
 
 
 def summarize_metric_bucket(bucket, score_profile='default', use_direction_metrics=False):
+    zero_summary = {
+        'sample_count': 0,
+        'avg_val_loss': 0.0,
+        'breakout_corr': 0.0,
+        'reversion_corr': 0.0,
+        'pred_rev_mean': 0.0,
+        'pred_rev_event_mean': 0.0,
+        'breakout_event_mean': 0.0,
+        'reversion_event_mean': 0.0,
+        'breakout_hard_negative_mean': 0.0,
+        'reversion_hard_negative_mean': 0.0,
+        'breakout_gap': 0.0,
+        'reversion_gap': 0.0,
+        'reversion_event_count': 0,
+        'composite_score': 0.0,
+        'breakout_metrics': compute_event_metrics([], [], []),
+        'reversion_metrics': compute_event_metrics([], [], []),
+        'direction_metrics': _zero_direction_metrics(),
+        'signal_frequency': {'breakout': 0.0, 'reversion': 0.0},
+        'label_frequency': {'breakout': 0.0, 'reversion': 0.0},
+        'breakout_signal_frequency': 0.0,
+        'reversion_signal_frequency': 0.0,
+        'breakout_label_frequency': 0.0,
+        'reversion_label_frequency': 0.0,
+        'direction_gate_mean': 0.0,
+        'direction_gate_std': 0.0,
+        'public_reversion_gate_mean': 0.0,
+        'public_reversion_gate_std': 0.0,
+        'breakout_residual_gate_mean': 0.0,
+        'breakout_residual_gate_std': 0.0,
+        'directional_floor_mean': 0.0,
+        'directional_floor_reversion_event_mean': 0.0,
+        'selected_horizon_breakout_mean': 0.0,
+        'selected_horizon_reversion_mean': 0.0,
+        'selected_horizon_breakout_value_mean': 0.0,
+        'selected_horizon_reversion_value_mean': 0.0,
+        'horizon_entropy_breakout_mean': 0.0,
+        'horizon_entropy_reversion_mean': 0.0,
+        'loss_main': 0.0,
+        'loss_aux': 0.0,
+        'loss_rank': 0.0,
+        'loss_constraint_penalty': 0.0,
+        'loss_horizon_event': 0.0,
+        'loss_horizon_aux': 0.0,
+        'loss_horizon_align': 0.0,
+        'loss_horizon_hard_negative': 0.0,
+        'loss_horizon_entropy': 0.0,
+        'loss_signal_calibration': 0.0,
+        **{
+            key: 0.0
+            for base_key in CONSTRAINT_STAT_BASE_KEYS
+            for key in (base_key, f'{base_key}_rate')
+        },
+    }
     if not bucket['preds']:
-        breakout_metrics = compute_event_metrics([], [], [])
-        reversion_metrics = compute_event_metrics([], [], [])
-        return {
-            'sample_count': 0,
-            'avg_val_loss': 0.0,
-            'breakout_corr': 0.0,
-            'reversion_corr': 0.0,
-            'breakout_event_mean': 0.0,
-            'reversion_event_mean': 0.0,
-            'breakout_hard_negative_mean': 0.0,
-            'reversion_hard_negative_mean': 0.0,
-            'breakout_gap': 0.0,
-            'reversion_gap': 0.0,
-            'composite_score': 0.0,
-            'breakout_metrics': breakout_metrics,
-            'reversion_metrics': reversion_metrics,
-            'direction_metrics': _zero_direction_metrics(),
-            'signal_frequency': {'breakout': 0.0, 'reversion': 0.0},
-            'label_frequency': {'breakout': 0.0, 'reversion': 0.0},
-            'breakout_signal_frequency': 0.0,
-            'reversion_signal_frequency': 0.0,
-            'breakout_label_frequency': 0.0,
-            'reversion_label_frequency': 0.0,
-            'direction_gate_mean': 0.0,
-            'direction_gate_std': 0.0,
-            'public_reversion_gate_mean': 0.0,
-            'public_reversion_gate_std': 0.0,
-            'breakout_residual_gate_mean': 0.0,
-            'breakout_residual_gate_std': 0.0,
-            'directional_floor_mean': 0.0,
-            'loss_main': 0.0,
-            'loss_aux': 0.0,
-            'loss_rank': 0.0,
-            'loss_constraint_penalty': 0.0,
-            **{
-                key: 0.0
-                for base_key in CONSTRAINT_STAT_BASE_KEYS
-                for key in (base_key, f'{base_key}_rate')
-            },
-        }
+        return zero_summary
 
     pred_np = np.vstack(bucket['preds'])
     target_np = np.vstack(bucket['targets'])
     flags_np = np.vstack(bucket['flags'])
     pred_rev_np = np.maximum(pred_np[:, 1], 0.0)
+    reversion_event_mask = flags_np[:, 1] > 0.5
     breakout_corr = safe_corr(pred_np[:, 0], target_np[:, 0])
     reversion_corr = safe_corr(pred_rev_np, target_np[:, 1])
     breakout_event_mean = float(pred_np[flags_np[:, 0] > 0.5, 0].mean()) if np.any(flags_np[:, 0] > 0.5) else 0.0
-    reversion_event_mean = float(pred_rev_np[flags_np[:, 1] > 0.5].mean()) if np.any(flags_np[:, 1] > 0.5) else 0.0
+    reversion_event_mean = float(pred_rev_np[reversion_event_mask].mean()) if np.any(reversion_event_mask) else 0.0
     breakout_hn_mean = float(pred_np[flags_np[:, 2] > 0.5, 0].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
     reversion_hn_mean = float(pred_rev_np[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
     breakout_metrics = compute_event_metrics(pred_np[:, 0], flags_np[:, 0] > 0.5, flags_np[:, 2] > 0.5)
-    reversion_metrics = compute_event_metrics(pred_rev_np, flags_np[:, 1] > 0.5, flags_np[:, 3] > 0.5)
-
+    reversion_metrics = compute_event_metrics(pred_rev_np, reversion_event_mask, flags_np[:, 3] > 0.5)
     blue_scores = _flatten_debug_batches(bucket['debug_batches']['blue_score'])
     purple_scores = _flatten_debug_batches(bucket['debug_batches']['purple_score'])
-    if use_direction_metrics and blue_scores.size > 0 and purple_scores.size > 0:
-        direction_metrics = compute_direction_metrics(blue_scores, purple_scores, flags_np)
-    else:
-        direction_metrics = _zero_direction_metrics()
-
+    direction_metrics = compute_direction_metrics(blue_scores, purple_scores, flags_np) if (
+        use_direction_metrics and blue_scores.size > 0 and purple_scores.size > 0
+    ) else _zero_direction_metrics()
     direction_gate_values = _flatten_debug_batches(bucket['debug_batches']['direction_gate'])
     public_gate_values = _flatten_debug_batches(bucket['debug_batches']['public_reversion_gate'])
     breakout_residual_gate_values = _flatten_debug_batches(bucket['debug_batches']['breakout_residual_gate'])
     directional_floor_values = _flatten_debug_batches(bucket['debug_batches']['directional_floor'])
-
+    selected_breakout = _flatten_debug_batches(bucket['debug_batches']['selected_horizon_breakout'])
+    selected_reversion = _flatten_debug_batches(bucket['debug_batches']['selected_horizon_reversion'])
+    selected_breakout_value = _flatten_debug_batches(bucket['debug_batches']['selected_horizon_breakout_value'])
+    selected_reversion_value = _flatten_debug_batches(bucket['debug_batches']['selected_horizon_reversion_value'])
+    entropy_breakout = _flatten_debug_batches(bucket['debug_batches']['horizon_entropy_breakout'])
+    entropy_reversion = _flatten_debug_batches(bucket['debug_batches']['horizon_entropy_reversion'])
     breakout_gap = breakout_event_mean - breakout_hn_mean
     reversion_gap = reversion_event_mean - reversion_hn_mean
     composite_score = compute_checkpoint_score(
@@ -375,46 +469,64 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         direction_metrics['macro_f1'] if use_direction_metrics else None,
         profile=score_profile,
     )
-
-    summary = {
-        'sample_count': int(pred_np.shape[0]),
-        'avg_val_loss': _metric_bucket_mean(bucket['logs'], 'total_loss'),
-        'breakout_corr': breakout_corr,
-        'reversion_corr': reversion_corr,
-        'breakout_event_mean': breakout_event_mean,
-        'reversion_event_mean': reversion_event_mean,
-        'breakout_hard_negative_mean': breakout_hn_mean,
-        'reversion_hard_negative_mean': reversion_hn_mean,
-        'breakout_gap': breakout_gap,
-        'reversion_gap': reversion_gap,
-        'composite_score': composite_score,
-        'breakout_metrics': breakout_metrics,
-        'reversion_metrics': reversion_metrics,
-        'direction_metrics': direction_metrics,
-        'signal_frequency': {
-            'breakout': breakout_metrics['signal_frequency'],
-            'reversion': reversion_metrics['signal_frequency'],
-        },
-        'label_frequency': {
-            'breakout': breakout_metrics['label_frequency'],
-            'reversion': reversion_metrics['label_frequency'],
-        },
-        'breakout_signal_frequency': breakout_metrics['signal_frequency'],
-        'reversion_signal_frequency': reversion_metrics['signal_frequency'],
-        'breakout_label_frequency': breakout_metrics['label_frequency'],
-        'reversion_label_frequency': reversion_metrics['label_frequency'],
-        'direction_gate_mean': float(direction_gate_values.mean()) if direction_gate_values.size else 0.0,
-        'direction_gate_std': float(direction_gate_values.std()) if direction_gate_values.size else 0.0,
-        'public_reversion_gate_mean': float(public_gate_values.mean()) if public_gate_values.size else 0.0,
-        'public_reversion_gate_std': float(public_gate_values.std()) if public_gate_values.size else 0.0,
-        'breakout_residual_gate_mean': float(breakout_residual_gate_values.mean()) if breakout_residual_gate_values.size else 0.0,
-        'breakout_residual_gate_std': float(breakout_residual_gate_values.std()) if breakout_residual_gate_values.size else 0.0,
-        'directional_floor_mean': float(directional_floor_values.mean()) if directional_floor_values.size else 0.0,
-        'loss_main': _metric_bucket_mean(bucket['logs'], 'main'),
-        'loss_aux': _metric_bucket_mean(bucket['logs'], 'aux'),
-        'loss_rank': _metric_bucket_mean(bucket['logs'], 'rank'),
-        'loss_constraint_penalty': _metric_bucket_mean(bucket['logs'], 'constraint_penalty'),
-    }
+    summary = dict(zero_summary)
+    summary.update(
+        {
+            'sample_count': int(pred_np.shape[0]),
+            'avg_val_loss': _metric_bucket_mean(bucket['logs'], 'total_loss'),
+            'breakout_corr': breakout_corr,
+            'reversion_corr': reversion_corr,
+            'pred_rev_mean': float(pred_rev_np.mean()) if pred_rev_np.size else 0.0,
+            'pred_rev_event_mean': reversion_event_mean,
+            'breakout_event_mean': breakout_event_mean,
+            'reversion_event_mean': reversion_event_mean,
+            'breakout_hard_negative_mean': breakout_hn_mean,
+            'reversion_hard_negative_mean': reversion_hn_mean,
+            'breakout_gap': breakout_gap,
+            'reversion_gap': reversion_gap,
+            'reversion_event_count': int(np.sum(reversion_event_mask)),
+            'composite_score': composite_score,
+            'breakout_metrics': breakout_metrics,
+            'reversion_metrics': reversion_metrics,
+            'direction_metrics': direction_metrics,
+            'signal_frequency': {
+                'breakout': breakout_metrics['signal_frequency'],
+                'reversion': reversion_metrics['signal_frequency'],
+            },
+            'label_frequency': {
+                'breakout': breakout_metrics['label_frequency'],
+                'reversion': reversion_metrics['label_frequency'],
+            },
+            'breakout_signal_frequency': breakout_metrics['signal_frequency'],
+            'reversion_signal_frequency': reversion_metrics['signal_frequency'],
+            'breakout_label_frequency': breakout_metrics['label_frequency'],
+            'reversion_label_frequency': reversion_metrics['label_frequency'],
+            'direction_gate_mean': float(direction_gate_values.mean()) if direction_gate_values.size else 0.0,
+            'direction_gate_std': float(direction_gate_values.std()) if direction_gate_values.size else 0.0,
+            'public_reversion_gate_mean': float(public_gate_values.mean()) if public_gate_values.size else 0.0,
+            'public_reversion_gate_std': float(public_gate_values.std()) if public_gate_values.size else 0.0,
+            'breakout_residual_gate_mean': float(breakout_residual_gate_values.mean()) if breakout_residual_gate_values.size else 0.0,
+            'breakout_residual_gate_std': float(breakout_residual_gate_values.std()) if breakout_residual_gate_values.size else 0.0,
+            'directional_floor_mean': float(directional_floor_values.mean()) if directional_floor_values.size else 0.0,
+            'directional_floor_reversion_event_mean': _masked_array_mean(directional_floor_values, reversion_event_mask),
+            'selected_horizon_breakout_mean': float(selected_breakout.mean()) if selected_breakout.size else 0.0,
+            'selected_horizon_reversion_mean': float(selected_reversion.mean()) if selected_reversion.size else 0.0,
+            'selected_horizon_breakout_value_mean': float(selected_breakout_value.mean()) if selected_breakout_value.size else 0.0,
+            'selected_horizon_reversion_value_mean': float(selected_reversion_value.mean()) if selected_reversion_value.size else 0.0,
+            'horizon_entropy_breakout_mean': float(entropy_breakout.mean()) if entropy_breakout.size else 0.0,
+            'horizon_entropy_reversion_mean': float(entropy_reversion.mean()) if entropy_reversion.size else 0.0,
+            'loss_main': _metric_bucket_mean(bucket['logs'], 'main'),
+            'loss_aux': _metric_bucket_mean(bucket['logs'], 'aux'),
+            'loss_rank': _metric_bucket_mean(bucket['logs'], 'rank'),
+            'loss_constraint_penalty': _metric_bucket_mean(bucket['logs'], 'constraint_penalty'),
+            'loss_horizon_event': _metric_bucket_mean(bucket['logs'], 'horizon_event'),
+            'loss_horizon_aux': _metric_bucket_mean(bucket['logs'], 'horizon_aux'),
+            'loss_horizon_align': _metric_bucket_mean(bucket['logs'], 'horizon_align'),
+            'loss_horizon_hard_negative': _metric_bucket_mean(bucket['logs'], 'horizon_hard_negative'),
+            'loss_horizon_entropy': _metric_bucket_mean(bucket['logs'], 'horizon_entropy'),
+            'loss_signal_calibration': _metric_bucket_mean(bucket['logs'], 'signal_calibration'),
+        }
+    )
     for base_key in CONSTRAINT_STAT_BASE_KEYS:
         summary[base_key] = _metric_bucket_mean(bucket['logs'], base_key)
         summary[f'{base_key}_rate'] = _metric_bucket_mean(bucket['logs'], f'{base_key}_rate')
@@ -428,6 +540,8 @@ def make_json_safe(value):
         return [make_json_safe(item) for item in value]
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
     return value
 
 
@@ -437,6 +551,133 @@ def append_jsonl(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'a', encoding='utf-8') as handle:
         handle.write(json.dumps(make_json_safe(payload), ensure_ascii=False) + '\n')
+
+
+def read_jsonl_records(path):
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, 'r', encoding='utf-8') as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+# SECTION: DATA HELPERS
+
+
+def dataset_cache_enabled(args):
+    if getattr(args, 'disable_dataset_cache', False):
+        return False
+    return getattr(args, 'market', 'legacy_multiasset') == 'ashare'
+
+
+def resolve_dataset_cache_dir(args):
+    cache_dir = getattr(args, 'dataset_cache_dir', None)
+    if cache_dir:
+        return cache_dir
+    return os.path.join(args.save_dir, 'dataset_cache')
+
+
+def build_runtime_dataset_cache_path(record, args, global_horizon_grid=None):
+    source_path = os.path.abspath(record['path'])
+    source_stat = os.stat(source_path)
+    cache_identity = {
+        'version': DATASET_CACHE_VERSION,
+        'path': source_path,
+        'source_size': int(source_stat.st_size),
+        'source_mtime_ns': int(getattr(source_stat, 'st_mtime_ns', int(source_stat.st_mtime * 1e9))),
+        'split_label': record.get('split_label') or getattr(args, 'split_label', None),
+        'window_size': int(getattr(args, 'window_size', 20)),
+        'forecast_horizon': int(getattr(args, 'horizon', 10)),
+        'fast_full': bool(getattr(args, 'fast_full', False)),
+        'dataset_profile': getattr(args, 'dataset_profile', 'iterA2'),
+        'split_scheme': getattr(args, 'split_scheme', 'time'),
+        'horizon_search_spec': getattr(args, 'horizon_search_spec', None),
+        'horizon_family_mode': getattr(args, 'horizon_family_mode', 'legacy'),
+        'global_horizon_grid': global_horizon_grid,
+        'config_fingerprint': getattr(args, 'config_fingerprint', None),
+    }
+    digest = hashlib.sha256(
+        json.dumps(make_json_safe(cache_identity), ensure_ascii=False, sort_keys=True).encode('utf-8')
+    ).hexdigest()[:24]
+    file_stub = '_'.join(
+        item for item in [
+            record.get('asset_code'),
+            normalize_timeframe_label(record.get('timeframe')) or 'unknown',
+            record.get('split_label') or getattr(args, 'split_label', None) or 'default',
+        ]
+        if item
+    )
+    safe_stub = ''.join(ch if ch.isalnum() or ch in {'_', '-'} else '_' for ch in file_stub) or 'dataset'
+    return os.path.join(resolve_dataset_cache_dir(args), f'{safe_stub}_{digest}.pt')
+
+
+def try_load_runtime_dataset_cache(cache_path):
+    if not cache_path or not os.path.exists(cache_path):
+        return None
+    try:
+        payload = torch.load(cache_path, map_location='cpu', weights_only=False)
+    except Exception as exc:
+        print(f"[DATASET CACHE] Failed to load {cache_path}: {exc}. Rebuilding cache entry.")
+        try:
+            os.remove(cache_path)
+        except OSError:
+            pass
+        return None
+    if not isinstance(payload, dict):
+        return None
+    dataset_payloads = payload.get('datasets', {})
+    if isinstance(dataset_payloads, dict):
+        payload['datasets'] = {
+            split_name: deserialize_cached_dataset(dataset_payload)
+            for split_name, dataset_payload in dataset_payloads.items()
+            if dataset_payload is not None
+        }
+    return payload
+
+
+def serialize_cached_dataset(dataset):
+    if dataset is None:
+        return None
+    state = dataset.__getstate__() if hasattr(dataset, '__getstate__') else dict(dataset.__dict__)
+    return {
+        'class_name': dataset.__class__.__name__,
+        'state': state,
+    }
+
+
+def deserialize_cached_dataset(payload):
+    if payload is None:
+        return None
+    class_name = payload.get('class_name')
+    if class_name != 'AshareFinancialDataset':
+        raise ValueError(f'Unsupported cached dataset class: {class_name}')
+    dataset_cls = create_ashare_dataset_splits.__globals__.get('AshareFinancialDataset')
+    if dataset_cls is None:
+        raise RuntimeError('AshareFinancialDataset class is unavailable for cache restore.')
+    dataset = dataset_cls.__new__(dataset_cls)
+    state = payload.get('state', {})
+    if hasattr(dataset, '__setstate__'):
+        dataset.__setstate__(state)
+    else:
+        dataset.__dict__.update(state)
+    return dataset
+
+
+def write_runtime_dataset_cache(cache_path, datasets, metadata):
+    if not cache_path:
+        return
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    payload = {
+        'version': DATASET_CACHE_VERSION,
+        'datasets': {
+            split_name: serialize_cached_dataset(dataset)
+            for split_name, dataset in (datasets or {}).items()
+            if dataset is not None
+        },
+        'metadata': metadata,
+    }
+    temp_path = f"{cache_path}.tmp"
+    torch.save(payload, temp_path)
+    os.replace(temp_path, cache_path)
 
 
 def parse_list_arg(value):
@@ -473,9 +714,6 @@ def parse_timeframe_cap_config(value):
 
 
 def parse_timeframe_threshold_config(value):
-    """
-    解析形如 `60m=0.4032,15m=0.40` 的阈值配置，用于 promotion scoreboard。
-    """
     if value is None:
         return {}
     if isinstance(value, dict):
@@ -514,13 +752,12 @@ def resolve_training_filters(args):
 
 def discover_runtime_files(args):
     market, assets, timeframes = resolve_training_filters(args)
-    training_subdir = getattr(args, 'training_subdir', None)
     records = discover_training_files(
         data_dir=args.data_dir,
         market=market,
         assets=assets,
         timeframes=timeframes,
-        training_subdir=training_subdir,
+        training_subdir=getattr(args, 'training_subdir', None),
     )
     max_files = getattr(args, 'max_files', None)
     if max_files:
@@ -528,33 +765,135 @@ def discover_runtime_files(args):
     return records
 
 
-def create_market_datasets(record, args):
+def resolve_split_labels(args, include_final_holdout=False):
+    if getattr(args, 'split_scheme', 'time') != 'rolling_recent_v1':
+        split_label = getattr(args, 'split_label', None)
+        return [split_label] if split_label else [None]
+    requested = parse_list_arg(getattr(args, 'split_labels', None))
+    if requested:
+        unknown = [item for item in requested if item not in ROLLING_RECENT_SPLITS]
+        if unknown:
+            raise ValueError(f'Unsupported rolling split labels: {unknown}')
+        labels = requested
+    else:
+        labels = [label for label in ROLLING_RECENT_SPLITS if include_final_holdout or label != 'final_holdout']
+    if include_final_holdout and 'final_holdout' not in labels:
+        labels = list(labels) + ['final_holdout']
+    if not include_final_holdout:
+        labels = [label for label in labels if label != 'final_holdout']
+    return labels
+
+
+def expand_runtime_records(records, args, include_final_holdout=False):
+    if getattr(args, 'market', 'legacy_multiasset') != 'ashare' or getattr(args, 'split_scheme', 'time') != 'rolling_recent_v1':
+        return [dict(record) for record in records]
+    expanded = []
+    for split_label in resolve_split_labels(args, include_final_holdout=include_final_holdout):
+        for record in records:
+            expanded_record = dict(record)
+            expanded_record['split_label'] = split_label
+            expanded.append(expanded_record)
+    return expanded
+
+
+def resolve_global_horizon_grid(args):
+    if getattr(args, 'market', 'legacy_multiasset') != 'ashare':
+        return None
+    if not getattr(args, 'horizon_search_spec', None):
+        return None
+    return build_global_horizon_grid(getattr(args, 'horizon_search_spec', None))
+
+
+def recommend_horizon_family(task_stats, h_mode_std=None):
+    recommended_family = task_stats.get('recommended_family')
+    if recommended_family in {'single_cycle', 'adaptive_resonance'}:
+        return recommended_family
+    mode_mass = float(task_stats.get('mode_mass', 0.0))
+    iqr = float(task_stats.get('iqr', 0.0))
+    h_mode = float(task_stats.get('h_mode', 0.0))
+    stable_single_cycle = bool(
+        mode_mass >= 0.68 and
+        iqr <= 0.25 * max(h_mode, 1.0) and
+        (h_mode_std is None or float(h_mode_std) <= 6.0)
+    )
+    return 'single_cycle' if stable_single_cycle else 'adaptive_resonance'
+
+
+def create_market_datasets(record, args, global_horizon_grid=None):
     market = getattr(args, 'market', 'legacy_multiasset')
     if market == 'ashare':
+        cache_path = None
+        if dataset_cache_enabled(args):
+            cache_path = build_runtime_dataset_cache_path(record, args, global_horizon_grid=global_horizon_grid)
+            cached_payload = try_load_runtime_dataset_cache(cache_path)
+            if cached_payload is not None:
+                datasets = cached_payload.get('datasets', {})
+                metadata = dict(cached_payload.get('metadata', {}) or {})
+                metadata['split_label'] = record.get('split_label') or getattr(args, 'split_label', None)
+                return datasets.get('train'), datasets.get('val'), datasets.get('test'), metadata
         datasets, metadata = create_ashare_dataset_splits(
             file_path=record['path'],
             window_size=args.window_size,
-            horizon=args.horizon,
+            horizon=getattr(args, 'horizon', 10),
             train_end=getattr(args, 'train_end', None),
             val_end=getattr(args, 'val_end', None),
             test_start=getattr(args, 'test_start', None),
             fast_full=args.fast_full,
             return_metadata=True,
             dataset_profile=getattr(args, 'dataset_profile', 'iterA2'),
+            split_scheme=getattr(args, 'split_scheme', 'time'),
+            split_label=record.get('split_label') or getattr(args, 'split_label', None),
+            horizon_search_spec=getattr(args, 'horizon_search_spec', None),
+            horizon_family_mode=getattr(args, 'horizon_family_mode', 'legacy'),
+            global_horizon_grid=global_horizon_grid,
         )
+        metadata['split_label'] = record.get('split_label') or getattr(args, 'split_label', None)
+        if cache_path:
+            try:
+                write_runtime_dataset_cache(cache_path, datasets, metadata)
+            except Exception as exc:
+                print(f"[DATASET CACHE] Failed to write {cache_path}: {exc}")
         return datasets.get('train'), datasets.get('val'), datasets.get('test'), metadata
 
     train_ds, test_ds = create_rolling_datasets(
         record['path'],
         window_size=args.window_size,
-        horizon=args.horizon,
+        horizon=getattr(args, 'horizon', 10),
         fast_full=args.fast_full,
     )
-    metadata = {
+    return train_ds, test_ds, None, {
         'asset_code': record.get('asset_code'),
         'timeframe': record.get('timeframe'),
+        'split_label': record.get('split_label'),
     }
-    return train_ds, test_ds, None, metadata
+
+
+def prewarm_runtime_dataset_cache(runtime_records, args, global_horizon_grid=None):
+    if not dataset_cache_enabled(args) or getattr(args, 'skip_dataset_cache_prewarm', False):
+        return
+    missing_records = []
+    for record in runtime_records:
+        cache_path = build_runtime_dataset_cache_path(record, args, global_horizon_grid=global_horizon_grid)
+        if not os.path.exists(cache_path):
+            missing_records.append((record, cache_path))
+    if not missing_records:
+        print('[DATASET CACHE] Runtime dataset cache already warm.')
+        return
+    print(f"[DATASET CACHE] Prewarming {len(missing_records)} runtime dataset artifacts...")
+    for index, (record, _) in enumerate(missing_records, start=1):
+        train_ds = val_ds = test_ds = dataset_meta = None
+        try:
+            train_ds, val_ds, test_ds, dataset_meta = create_market_datasets(
+                record,
+                args,
+                global_horizon_grid=global_horizon_grid,
+            )
+        finally:
+            del train_ds, val_ds, test_ds, dataset_meta
+            gc.collect()
+            torch.cuda.empty_cache()
+        if index % 20 == 0 or index == len(missing_records):
+            print(f"[DATASET CACHE] Prewarm progress {index}/{len(missing_records)}")
 
 
 def build_train_loader(dataset, args, timeframe_label):
@@ -574,14 +913,14 @@ def build_train_loader(dataset, args, timeframe_label):
             dataset,
             batch_size=args.batch_size,
             sampler=sampler,
-            drop_last=True,
+            drop_last=len(dataset) >= args.batch_size,
             generator=g,
         )
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        drop_last=True,
+        drop_last=len(dataset) >= args.batch_size,
         generator=g,
     )
 
@@ -589,27 +928,127 @@ def build_train_loader(dataset, args, timeframe_label):
 def build_eval_loader(dataset, args):
     g = torch.Generator()
     g.manual_seed(args.seed)
-    return DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        generator=g,
+    return DataLoader(dataset, batch_size=args.batch_size, shuffle=False, generator=g)
+
+
+# SECTION: FORWARD
+
+
+def _move_payload_to_device(payload, device):
+    if payload is None:
+        return None
+    moved = {}
+    for key, value in payload.items():
+        if torch.is_tensor(value):
+            moved[key] = value.to(device, non_blocking=True)
+        else:
+            moved[key] = value
+    return moved
+
+
+def unpack_batch(batch, device):
+    horizon_payload = None
+    if len(batch) == 7:
+        features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags, horizon_payload = batch
+    elif len(batch) == 6:
+        features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags = batch
+    else:
+        raise ValueError(f'Unexpected batch structure: {len(batch)}')
+    return (
+        features_seq.to(device, non_blocking=True),
+        batch_y.to(device, non_blocking=True),
+        batch_aux.to(device, non_blocking=True),
+        batch_sigma.to(device, non_blocking=True),
+        batch_weights.to(device, non_blocking=True).unsqueeze(1),
+        batch_flags.to(device, non_blocking=True),
+        _move_payload_to_device(horizon_payload, device),
     )
 
 
-def forward_model(kan, features_seq, return_debug=False):
+def _selected_horizon_values(debug_info, horizon_payload):
+    if debug_info is None or horizon_payload is None:
+        return {}
+    grid = horizon_payload.get('global_horizon_grid')
+    if grid is None:
+        return {}
+    if grid.dim() == 1:
+        grid = grid.unsqueeze(0)
+    grid = grid.to(dtype=torch.float32)
+    values = {}
+    for key in ('selected_horizon_breakout', 'selected_horizon_reversion'):
+        selected = debug_info.get(key)
+        if selected is None:
+            continue
+        selected = selected.detach().long()
+        if selected.dim() == 0:
+            selected = selected.unsqueeze(0)
+        selected = selected.clamp(min=0, max=grid.size(1) - 1)
+        values[f'{key}_value'] = torch.gather(grid, 1, selected.unsqueeze(1)).squeeze(1)
+    return values
+
+
+def append_debug_batches(bucket, debug_info, horizon_payload=None):
+    if debug_info is None:
+        return
+    computed = _selected_horizon_values(debug_info, horizon_payload)
+    for debug_key in DEBUG_BATCH_KEYS:
+        debug_value = computed.get(debug_key, debug_info.get(debug_key))
+        if debug_value is None:
+            continue
+        if isinstance(debug_value, torch.Tensor):
+            debug_value = debug_value.detach().float().cpu().numpy()
+        else:
+            debug_value = np.asarray(debug_value, dtype=np.float32)
+        bucket['debug_batches'][debug_key].append(debug_value)
+
+
+def forward_model(kan, features_seq, args, horizon_payload=None, return_debug=False):
+    horizon_prior = horizon_payload.get('horizon_prior') if horizon_payload else None
+    valid_horizon_mask = horizon_payload.get('valid_horizon_mask') if horizon_payload else None
+    family_mode = getattr(args, 'horizon_family_mode', None) if horizon_payload else None
     if return_debug:
-        pred, aux_pred, debug_info = kan(features_seq, return_aux=True, return_debug=True)
+        pred, aux_pred, debug_info = kan(
+            features_seq,
+            return_aux=True,
+            return_debug=True,
+            horizon_prior=horizon_prior,
+            family_mode=family_mode,
+            valid_horizon_mask=valid_horizon_mask,
+        )
         return pred, aux_pred, debug_info
-    pred, aux_pred = kan(features_seq, return_aux=True)
+    pred, aux_pred = kan(
+        features_seq,
+        return_aux=True,
+        horizon_prior=horizon_prior,
+        family_mode=family_mode,
+        valid_horizon_mask=valid_horizon_mask,
+    )
     return pred, aux_pred, None
+
+
+# SECTION: CHECKPOINT
+
+
+def get_best_raw_path(args):
+    return os.path.join(
+        args.save_dir,
+        getattr(args, 'best_raw_name', getattr(args, 'best_name', 'khaos_kan_best.pth')),
+    )
+
+
+def get_best_gate_path(args):
+    return os.path.join(
+        args.save_dir,
+        getattr(args, 'best_gate_name', 'khaos_kan_best_gate.pth'),
+    )
+
 
 def get_resume_path(args):
     resume_path = getattr(args, 'resume_path', None)
     if resume_path:
         return resume_path
-    resume_name = getattr(args, 'resume_name', 'khaos_kan_resume.pth')
-    return os.path.join(args.save_dir, resume_name)
+    return os.path.join(args.save_dir, getattr(args, 'resume_name', 'khaos_kan_resume.pth'))
+
 
 def save_resume_checkpoint(
     resume_path,
@@ -621,163 +1060,674 @@ def save_resume_checkpoint(
     epoch,
     best_val_loss,
     best_score,
+    best_gate_val_loss,
+    best_gate_score,
     no_improve_epochs,
     latest_metrics,
     device,
-    completed=False
+    completed=False,
 ):
-    torch.save({
-        'model_state_dict': kan.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'scaler_state_dict': scaler.state_dict(),
-        'args': vars(args),
-        'epoch': epoch,
-        'best_val_loss': best_val_loss,
-        'best_score': best_score,
-        'no_improve_epochs': no_improve_epochs,
-        'latest_metrics': latest_metrics,
-        'feature_names': PHYSICS_FEATURE_NAMES,
-        'completed': completed,
-        'env': {
-            'torch': torch.__version__,
-            'cuda': torch.version.cuda if torch.cuda.is_available() else None,
-            'device': str(device)
-        }
-    }, resume_path)
+    torch.save(
+        {
+            'model_state_dict': kan.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'args': vars(args),
+            'epoch': epoch,
+            'best_val_loss': best_val_loss,
+            'best_score': best_score,
+            'best_raw_val_loss': best_val_loss,
+            'best_raw_score': best_score,
+            'best_gate_val_loss': best_gate_val_loss,
+            'best_gate_score': best_gate_score,
+            'no_improve_epochs': no_improve_epochs,
+            'latest_metrics': latest_metrics,
+            'feature_names': PHYSICS_FEATURE_NAMES,
+            'completed': completed,
+            'config_fingerprint': getattr(args, 'config_fingerprint', None),
+            'global_horizon_grid': getattr(args, 'global_horizon_grid', None),
+            'env': {
+                'torch': torch.__version__,
+                'cuda': torch.version.cuda if torch.cuda.is_available() else None,
+                'device': str(device),
+            },
+        },
+        resume_path,
+    )
+
+
+def load_matching_model_weights(model, state_dict):
+    current_state = model.state_dict()
+    matched = {}
+    skipped = []
+    for key, value in state_dict.items():
+        if key not in current_state or current_state[key].shape != value.shape:
+            skipped.append(key)
+            continue
+        matched[key] = value
+    current_state.update(matched)
+    model.load_state_dict(current_state, strict=False)
+    return {
+        'matched_keys': len(matched),
+        'skipped_keys': len(skipped),
+        'sample_skipped': skipped[:8],
+    }
+
+
+def resolve_config_fingerprint(args, runtime_records, global_horizon_grid):
+    payload = {
+        'market': getattr(args, 'market', 'legacy_multiasset'),
+        'training_subdir': getattr(args, 'training_subdir', None),
+        'assets': parse_list_arg(getattr(args, 'assets', None)),
+        'timeframes': resolve_normalized_timeframes(getattr(args, 'timeframes', None)),
+        'window_size': getattr(args, 'window_size', None),
+        'arch_version': getattr(args, 'arch_version', None),
+        'dataset_profile': getattr(args, 'dataset_profile', None),
+        'loss_profile': getattr(args, 'loss_profile', None),
+        'constraint_profile': getattr(args, 'constraint_profile', None),
+        'score_profile': getattr(args, 'score_profile', None),
+        'split_scheme': getattr(args, 'split_scheme', None),
+        'split_labels': [record.get('split_label') for record in runtime_records if record.get('split_label') is not None],
+        'horizon_search_spec': getattr(args, 'horizon_search_spec', None),
+        'horizon_family_mode': getattr(args, 'horizon_family_mode', None),
+        'global_horizon_grid': global_horizon_grid,
+        'records': [
+            {
+                'asset_code': record.get('asset_code'),
+                'timeframe': record.get('timeframe'),
+                'path': os.path.abspath(record['path']),
+                'split_label': record.get('split_label'),
+            }
+            for record in runtime_records
+        ],
+    }
+    return hashlib.sha1(
+        json.dumps(make_json_safe(payload), ensure_ascii=False, sort_keys=True).encode('utf-8')
+    ).hexdigest()[:16]
+
+
+def load_baseline_reference(reference_path):
+    if not reference_path:
+        return None
+    base_dir = reference_path
+    if os.path.isfile(base_dir):
+        base_dir = os.path.dirname(base_dir)
+    epoch_path = os.path.join(base_dir, 'epoch_metrics.jsonl')
+    per_tf_path = os.path.join(base_dir, 'per_timeframe_metrics.jsonl')
+    epoch_records = read_jsonl_records(epoch_path)
+    if not epoch_records:
+        return None
+    latest_epoch = int(epoch_records[-1].get('epoch', 0))
+    per_tf_records = {
+        item['timeframe']: item
+        for item in read_jsonl_records(per_tf_path)
+        if int(item.get('epoch', -1)) == latest_epoch and item.get('timeframe')
+    }
+    return {
+        'overall': epoch_records[-1],
+        'per_timeframe': per_tf_records,
+        'epoch_metrics_path': epoch_path,
+        'per_timeframe_metrics_path': per_tf_path,
+    }
+
+
+def resolve_baseline_signal_cap(baseline_reference, ratio, fallback=None):
+    values = []
+    if baseline_reference:
+        overall = baseline_reference.get('overall', {})
+        signal_frequency = overall.get('signal_frequency', {})
+        values.extend(
+            [
+                overall.get('breakout_signal_frequency'),
+                overall.get('reversion_signal_frequency'),
+                signal_frequency.get('breakout') if isinstance(signal_frequency, dict) else None,
+                signal_frequency.get('reversion') if isinstance(signal_frequency, dict) else None,
+            ]
+        )
+    valid = [float(item) for item in values if item is not None]
+    if valid:
+        return max(valid) * float(ratio)
+    if fallback is not None:
+        return float(fallback)
+    return None
+
+
+def should_update_checkpoint(candidate_score, candidate_val_loss, best_score, best_val_loss, min_delta):
+    return candidate_score > best_score + min_delta or (
+        abs(candidate_score - best_score) <= min_delta and
+        candidate_val_loss < best_val_loss - min_delta
+    )
+
 
 def try_resume_training(args, kan, optimizer, scheduler, scaler, device):
     start_epoch = 0
-    best_val_loss = float('inf')
-    best_score = float('-inf')
+    best_raw_val_loss = float('inf')
+    best_raw_score = float('-inf')
+    best_gate_val_loss = float('inf')
+    best_gate_score = float('-inf')
     no_improve_epochs = 0
     resume_path = get_resume_path(args)
-    if not getattr(args, 'resume', False):
-        return start_epoch, best_val_loss, best_score, no_improve_epochs
-
-    if os.path.exists(resume_path):
+    current_fingerprint = getattr(args, 'config_fingerprint', None)
+    if getattr(args, 'resume', False) and os.path.exists(resume_path):
         try:
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
-            kan.load_state_dict(checkpoint['model_state_dict'])
-            if 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            if 'scheduler_state_dict' in checkpoint:
-                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            if 'scaler_state_dict' in checkpoint:
-                scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            start_epoch = int(checkpoint.get('epoch', 0))
-            best_val_loss = float(checkpoint.get('best_val_loss', best_val_loss))
-            best_score = float(checkpoint.get('best_score', best_score))
-            no_improve_epochs = int(checkpoint.get('no_improve_epochs', 0))
-            print(
-                f"[RESUME] 已从断点恢复训练：epoch={start_epoch}, "
-                f"best_score={best_score:.4f}, best_val_loss={best_val_loss:.4f}"
-            )
-            return start_epoch, best_val_loss, best_score, no_improve_epochs
+            checkpoint_fingerprint = checkpoint.get('config_fingerprint')
+            if checkpoint_fingerprint and current_fingerprint and checkpoint_fingerprint != current_fingerprint:
+                print(
+                    f"[RESUME] Fingerprint mismatch. checkpoint={checkpoint_fingerprint}, current={current_fingerprint}. "
+                    "Skipping strict resume."
+                )
+            else:
+                kan.load_state_dict(checkpoint['model_state_dict'])
+                if 'optimizer_state_dict' in checkpoint:
+                    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if 'scheduler_state_dict' in checkpoint:
+                    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                if 'scaler_state_dict' in checkpoint:
+                    scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                start_epoch = int(checkpoint.get('epoch', 0))
+                legacy_best_val_loss = checkpoint.get('best_val_loss', best_raw_val_loss)
+                legacy_best_score = checkpoint.get('best_score', best_raw_score)
+                best_raw_val_loss = float(checkpoint.get('best_raw_val_loss', legacy_best_val_loss))
+                best_raw_score = float(checkpoint.get('best_raw_score', legacy_best_score))
+                best_gate_val_loss = float(checkpoint.get('best_gate_val_loss', legacy_best_val_loss))
+                best_gate_score = float(checkpoint.get('best_gate_score', legacy_best_score))
+                no_improve_epochs = int(checkpoint.get('no_improve_epochs', 0))
+                print(
+                    f"[RESUME] Loaded checkpoint: epoch={start_epoch}, "
+                    f"best_raw_score={best_raw_score:.4f}, best_gate_score={best_gate_score:.4f}, "
+                    f"best_raw_val_loss={best_raw_val_loss:.4f}"
+                )
+                return {
+                    'start_epoch': start_epoch,
+                    'best_raw_val_loss': best_raw_val_loss,
+                    'best_raw_score': best_raw_score,
+                    'best_gate_val_loss': best_gate_val_loss,
+                    'best_gate_score': best_gate_score,
+                    'no_improve_epochs': no_improve_epochs,
+                }
         except Exception as exc:
-            print(f"[RESUME] 断点文件不可用，忽略并重新开始：{resume_path} | {exc}")
+            print(f"[RESUME] Failed to load strict resume checkpoint: {resume_path} | {exc}")
 
-    best_path = os.path.join(args.save_dir, getattr(args, 'best_name', 'khaos_kan_best.pth'))
-    if os.path.exists(best_path):
+    warm_start_enabled = bool(getattr(args, 'warm_start_weights_only', False) or getattr(args, 'warm_start_path', None))
+    warm_start_path = getattr(args, 'warm_start_path', None)
+    if warm_start_enabled and warm_start_path and os.path.exists(warm_start_path):
         try:
-            checkpoint = torch.load(best_path, map_location=device, weights_only=False)
-            kan.load_state_dict(checkpoint['model_state_dict'])
-            start_epoch = int(checkpoint.get('metrics', {}).get('epoch', 0))
-            best_val_loss = float(checkpoint.get('val_loss', best_val_loss))
-            best_score = float(checkpoint.get('best_score', best_score))
+            checkpoint = torch.load(warm_start_path, map_location=device, weights_only=False)
+            state_dict = checkpoint.get('model_state_dict', checkpoint)
+            report = load_matching_model_weights(kan, state_dict)
             print(
-                f"[RESUME] 未找到断点文件，已从 best checkpoint 热启动：epoch={start_epoch}, "
-                f"best_score={best_score:.4f}, best_val_loss={best_val_loss:.4f}"
+                f"[WARM START] Loaded weights only from {warm_start_path} | "
+                f"matched={report['matched_keys']} skipped={report['skipped_keys']}"
             )
         except Exception as exc:
-            print(f"[RESUME] best checkpoint 不可热启动，改为从头训练：{best_path} | {exc}")
+            print(f"[WARM START] Failed to load weights from {warm_start_path}: {exc}")
+    return {
+        'start_epoch': start_epoch,
+        'best_raw_val_loss': best_raw_val_loss,
+        'best_raw_score': best_raw_score,
+        'best_gate_val_loss': best_gate_val_loss,
+        'best_gate_score': best_gate_score,
+        'no_improve_epochs': no_improve_epochs,
+    }
+
+
+def collect_horizon_guard_registry(runtime_records, args, global_horizon_grid):
+    registry = {}
+    for record in runtime_records:
+        train_ds = val_ds = test_ds = None
+        try:
+            train_ds, val_ds, test_ds, dataset_meta = create_market_datasets(
+                record,
+                args,
+                global_horizon_grid=global_horizon_grid,
+            )
+            update_horizon_registry(registry, dataset_meta)
+        finally:
+            del train_ds, val_ds, test_ds
+            gc.collect()
+            torch.cuda.empty_cache()
+    return registry
+
+
+def evaluate_single_cycle_family_guard(horizon_registry, score_timeframes=None):
+    score_timeframe_set = set(score_timeframes or [])
+    violations = []
+    checked_records = 0
+    checked_tasks = 0
+    for (asset_code, timeframe, split_label), profile in sorted(horizon_registry.items()):
+        if score_timeframe_set and timeframe not in score_timeframe_set:
+            continue
+        task_stats_map = profile.get('task_stats', {})
+        if not task_stats_map:
+            continue
+        checked_records += 1
+        for task_name, task_stats in sorted(task_stats_map.items()):
+            checked_tasks += 1
+            recommended_family = recommend_horizon_family(task_stats)
+            if recommended_family != 'single_cycle':
+                violations.append(
+                    {
+                        'asset_code': asset_code,
+                        'timeframe': timeframe,
+                        'split_label': split_label,
+                        'task': task_name,
+                        'recommended_family': recommended_family,
+                        'mode_mass': float(task_stats.get('mode_mass', 0.0)),
+                        'iqr': float(task_stats.get('iqr', 0.0)),
+                        'h_mode': float(task_stats.get('h_mode', 0.0)),
+                    }
+                )
+    return {
+        'passed': bool(checked_tasks > 0 and not violations),
+        'checked_records': checked_records,
+        'checked_tasks': checked_tasks,
+        'violations': violations,
+    }
+
+
+def write_horizon_summary_artifact(path, registry, global_horizon_grid, config_fingerprint):
+    summary = summarize_horizon_registry(registry)
+    with open(path, 'w', encoding='utf-8') as handle:
+        json.dump(
+            make_json_safe(
+                {
+                    'config_fingerprint': config_fingerprint,
+                    'global_horizon_grid': global_horizon_grid,
+                    'records': registry,
+                    'summary': summary,
+                }
+            ),
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+    return summary
+
+
+def evaluate_kill_keep_review(epoch_score_summary, timeframe_summaries, args):
+    review_epoch = int(getattr(args, 'kill_keep_review_epoch', 0) or 0)
+    if review_epoch <= 0:
+        return None
+    signal_frequency = epoch_score_summary.get('signal_frequency', {})
+    avg_signal_frequency = 0.5 * (
+        float(signal_frequency.get('breakout', 0.0)) +
+        float(signal_frequency.get('reversion', 0.0))
+    )
+    entropy_threshold = float(getattr(args, 'kill_keep_horizon_entropy_min', 0.0) or 0.0)
+    entropy_timeframes = resolve_normalized_timeframes(
+        getattr(args, 'kill_keep_horizon_entropy_timeframes', None)
+    ) or ['15m', '60m']
+    entropy_candidates = {}
+    for timeframe in entropy_timeframes:
+        summary = timeframe_summaries.get(timeframe)
+        if summary is None:
+            continue
+        entropy_candidates[timeframe] = max(
+            float(summary.get('horizon_entropy_breakout_mean', 0.0)),
+            float(summary.get('horizon_entropy_reversion_mean', 0.0)),
+        )
+    checks = {
+        'public_below_directional_violation_rate': {
+            'actual': float(epoch_score_summary.get('public_below_directional_violation_rate', 0.0)),
+            'threshold': float(getattr(args, 'kill_keep_public_violation_rate_max', 1.0)),
+            'passed': float(epoch_score_summary.get('public_below_directional_violation_rate', 0.0)) <
+            float(getattr(args, 'kill_keep_public_violation_rate_max', 1.0)),
+        },
+        'avg_signal_frequency': {
+            'actual': avg_signal_frequency,
+            'threshold': float(getattr(args, 'kill_keep_signal_frequency_max', 1.0)),
+            'passed': avg_signal_frequency < float(getattr(args, 'kill_keep_signal_frequency_max', 1.0)),
+        },
+        'timeframe_60m_composite': {
+            'actual': timeframe_summaries.get('60m', {}).get('composite_score'),
+            'threshold': float(getattr(args, 'kill_keep_timeframe_60m_composite_min', 0.0)),
+            'passed': timeframe_summaries.get('60m', {}).get('composite_score') is not None and
+            float(timeframe_summaries.get('60m', {}).get('composite_score', 0.0)) >
+            float(getattr(args, 'kill_keep_timeframe_60m_composite_min', 0.0)),
+        },
+        'horizon_entropy': {
+            'actual': entropy_candidates,
+            'threshold': entropy_threshold,
+            'passed': any(value > entropy_threshold for value in entropy_candidates.values()),
+        },
+    }
+    return {
+        'review_epoch': review_epoch,
+        'passed': all(item['passed'] for item in checks.values()),
+        'checks': checks,
+        'entropy_timeframes': entropy_timeframes,
+    }
+
+
+def compute_recent_precision_score(
+    fold_summaries,
+    timeframe_summaries,
+    baseline_reference,
+    args,
+):
+    ordered_labels = [label for label in RECENT_FOLD_ORDER if label in fold_summaries]
+    if not ordered_labels:
+        ordered_labels = sorted(fold_summaries.keys())[-2:]
+    if not ordered_labels:
+        return 0.0, {'mode': 'empty'}, {'passed': True, 'reasons': []}
+
+    recent_min_precision = []
+    recent_avg_precision = []
+    recent_direction = []
+    recent_hn = []
+    recent_signal = []
+    recent_public_violation = []
+    breakout_floor = float(getattr(args, 'breakout_precision_floor', 0.0))
+    reversion_floor = float(getattr(args, 'reversion_precision_floor', 0.0))
+    public_violation_cap = float(getattr(args, 'public_violation_cap', 0.20))
+    signal_cap = resolve_baseline_signal_cap(
+        baseline_reference=baseline_reference,
+        ratio=float(getattr(args, 'signal_frequency_cap_ratio', 0.70)),
+        fallback=getattr(args, 'signal_frequency_cap', None),
+    )
+    veto_reasons = []
+    for label in ordered_labels:
+        summary = fold_summaries[label]
+        breakout_precision = float(summary['breakout_metrics']['precision'])
+        reversion_precision = float(summary['reversion_metrics']['precision'])
+        recent_min_precision.append(min(breakout_precision, reversion_precision))
+        recent_avg_precision.append(0.5 * (breakout_precision + reversion_precision))
+        recent_direction.append(float(summary['direction_metrics']['macro_f1']))
+        recent_hn.append(
+            0.5 * (
+                float(summary['breakout_metrics']['hard_negative_rate']) +
+                float(summary['reversion_metrics']['hard_negative_rate'])
+            )
+        )
+        recent_signal.append(
+            0.5 * (
+                float(summary['breakout_signal_frequency']) +
+                float(summary['reversion_signal_frequency'])
+            )
+        )
+        recent_public_violation.append(float(summary['public_below_directional_violation_rate']))
+        if breakout_precision < breakout_floor or reversion_precision < reversion_floor:
+            veto_reasons.append(f'{label}_precision_floor({breakout_precision:.3f},{reversion_precision:.3f})')
+        if float(summary['public_below_directional_violation_rate']) > public_violation_cap:
+            veto_reasons.append(f'{label}_public_violation({summary["public_below_directional_violation_rate"]:.3f})')
+
+    current_hn = float(np.mean(recent_hn)) if recent_hn else 1.0
+    baseline_hn = None
+    if baseline_reference:
+        overall = baseline_reference.get('overall', {})
+        baseline_hn_values = [overall.get('breakout_hard_negative_rate'), overall.get('reversion_hard_negative_rate')]
+        baseline_hn_values = [float(item) for item in baseline_hn_values if item is not None]
+        if baseline_hn_values:
+            baseline_hn = float(np.mean(baseline_hn_values))
+    if baseline_hn is not None and baseline_hn > 1e-6:
+        hard_negative_improvement = max((baseline_hn - current_hn) / baseline_hn, 0.0)
     else:
-        print("[RESUME] 未找到可恢复的断点，将从头开始训练。")
-    return start_epoch, best_val_loss, best_score, no_improve_epochs
+        hard_negative_improvement = max(1.0 - current_hn, 0.0)
+
+    current_signal = float(np.mean(recent_signal)) if recent_signal else 0.0
+    if signal_cap is not None and current_signal > signal_cap:
+        veto_reasons.append(f'signal_frequency({current_signal:.3f}>{signal_cap:.3f})')
+    if signal_cap is None:
+        signal_sparsity = max(0.0, 1.0 - current_signal)
+    else:
+        signal_sparsity = max(0.0, 1.0 - max(current_signal - signal_cap, 0.0) / max(signal_cap, 1e-6))
+
+    timeframe_60m = timeframe_summaries.get('60m')
+    timeframe_60m_min_precision = 0.0
+    if timeframe_60m:
+        timeframe_60m_min_precision = min(
+            float(timeframe_60m['breakout_metrics']['precision']),
+            float(timeframe_60m['reversion_metrics']['precision']),
+        )
+    components = {
+        'recent_min_precision': float(np.mean(recent_min_precision)) if recent_min_precision else 0.0,
+        'recent_avg_precision': float(np.mean(recent_avg_precision)) if recent_avg_precision else 0.0,
+        'timeframe_60m_min_precision': timeframe_60m_min_precision,
+        'hard_negative_improvement': hard_negative_improvement,
+        'signal_sparsity': signal_sparsity,
+        'direction_consistency': float(np.mean(recent_direction)) if recent_direction else 0.0,
+        'signal_frequency': current_signal,
+        'signal_cap': signal_cap,
+        'public_violation_recent_mean': float(np.mean(recent_public_violation)) if recent_public_violation else 0.0,
+    }
+    score = (
+        0.30 * components['recent_min_precision'] +
+        0.20 * components['recent_avg_precision'] +
+        0.20 * components['timeframe_60m_min_precision'] +
+        0.15 * components['hard_negative_improvement'] +
+        0.10 * components['signal_sparsity'] +
+        0.05 * components['direction_consistency']
+    )
+    return score, components, {'passed': len(veto_reasons) == 0, 'reasons': veto_reasons}
+
+
+def evaluate_dataset_loader(kan, eval_loader, criterion, args, device, use_debug_metrics):
+    file_bucket = build_metric_bucket()
+    amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    with torch.no_grad():
+        for batch in eval_loader:
+            features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags, horizon_payload = unpack_batch(batch, device)
+            psi_t = features_seq[:, -1, :]
+            with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=amp_dtype):
+                pred, aux_pred, debug_info = forward_model(
+                    kan,
+                    features_seq,
+                    args,
+                    horizon_payload=horizon_payload,
+                    return_debug=use_debug_metrics,
+                )
+                loss_unweighted, rank_loss, l_dict = criterion(
+                    pred,
+                    aux_pred,
+                    batch_y,
+                    batch_aux,
+                    psi_t,
+                    batch_flags,
+                    batch_sigma,
+                    debug_info=debug_info,
+                    horizon_payload=horizon_payload,
+                )
+                reg_loss = kan.get_regularization_loss(regularize_activation=1e-4, regularize_entropy=1e-4)
+                loss = (loss_unweighted * batch_weights).mean() + rank_loss + reg_loss
+            batch_log = dict(l_dict)
+            batch_log['total_loss'] = float(loss.item())
+            file_bucket['logs'].append(batch_log)
+            file_bucket['preds'].append(pred.detach().float().cpu().numpy())
+            file_bucket['targets'].append(batch_y.detach().cpu().numpy())
+            file_bucket['flags'].append(batch_flags.detach().cpu().numpy())
+            append_debug_batches(file_bucket, debug_info=debug_info, horizon_payload=horizon_payload)
+    return file_bucket
+
+
+def evaluate_final_holdout(
+    args,
+    base_records,
+    kan,
+    criterion,
+    device,
+    global_horizon_grid,
+    use_debug_metrics,
+    use_direction_metrics,
+):
+    if getattr(args, 'split_scheme', 'time') != 'rolling_recent_v1' or getattr(args, 'market', 'legacy_multiasset') != 'ashare':
+        return None
+    overall_bucket = build_metric_bucket()
+    timeframe_buckets = defaultdict(build_metric_bucket)
+    processed = 0
+    for record in base_records:
+        holdout_record = dict(record)
+        holdout_record['split_label'] = 'final_holdout'
+        try:
+            _, _, test_ds, dataset_meta = create_market_datasets(holdout_record, args, global_horizon_grid=global_horizon_grid)
+            if test_ds is None or len(test_ds) == 0:
+                continue
+            eval_loader = build_eval_loader(test_ds, args)
+            bucket = evaluate_dataset_loader(kan, eval_loader, criterion, args, device, use_debug_metrics)
+            merge_metric_bucket(overall_bucket, bucket)
+            timeframe = normalize_timeframe_label(dataset_meta.get('timeframe') or record.get('timeframe')) or 'unknown'
+            merge_metric_bucket(timeframe_buckets[timeframe], bucket)
+            processed += 1
+            del test_ds, eval_loader
+            gc.collect()
+            torch.cuda.empty_cache()
+        except Exception as exc:
+            print(f"[FINAL HOLDOUT] Failed on {record['path']}: {exc}")
+    if processed == 0:
+        return None
+    return {
+        'processed_files': processed,
+        'overall': summarize_metric_bucket(
+            overall_bucket,
+            score_profile=getattr(args, 'score_profile', 'default'),
+            use_direction_metrics=use_direction_metrics,
+        ),
+        'by_timeframe': {
+            timeframe: summarize_metric_bucket(
+                bucket,
+                score_profile=getattr(args, 'score_profile', 'default'),
+                use_direction_metrics=use_direction_metrics,
+            )
+            for timeframe, bucket in sorted(timeframe_buckets.items())
+        },
+    }
+
+
+# SECTION: HORIZON SUMMARY
+
+
+def update_horizon_registry(registry, dataset_meta):
+    horizon_profile = dataset_meta.get('horizon_profile')
+    split_label = dataset_meta.get('split_label')
+    timeframe = normalize_timeframe_label(dataset_meta.get('timeframe'))
+    asset_code = dataset_meta.get('asset_code')
+    if not horizon_profile or not split_label or not timeframe or not asset_code:
+        return
+    key = (asset_code, timeframe, split_label)
+    if key not in registry:
+        registry[key] = make_json_safe(horizon_profile)
+
+
+def summarize_horizon_registry(registry):
+    grouped = {}
+    for (_, timeframe, split_label), profile in registry.items():
+        for task_name, task_stats in profile.get('task_stats', {}).items():
+            grouped.setdefault((timeframe, task_name), {'distributions': [], 'mode_mass': [], 'iqr': [], 'h_mode': []})
+            distribution = {
+                int(item['horizon']): float(item['prob'])
+                for item in task_stats.get('distribution', [])
+            }
+            grouped[(timeframe, task_name)]['distributions'].append(distribution)
+            grouped[(timeframe, task_name)]['mode_mass'].append(float(task_stats.get('mode_mass', 0.0)))
+            grouped[(timeframe, task_name)]['iqr'].append(float(task_stats.get('iqr', 0.0)))
+            grouped[(timeframe, task_name)]['h_mode'].append(float(task_stats.get('h_mode', 0.0)))
+    summary = {}
+    for (timeframe, task_name), values in grouped.items():
+        all_horizons = sorted({h for dist in values['distributions'] for h in dist.keys()})
+        distribution_mean = [
+            {
+                'horizon': int(horizon),
+                'prob': float(np.mean([dist.get(horizon, 0.0) for dist in values['distributions']])),
+            }
+            for horizon in all_horizons
+        ]
+        h_mode_mean = float(np.mean(values['h_mode'])) if values['h_mode'] else 0.0
+        h_mode_std = float(np.std(values['h_mode'])) if values['h_mode'] else 0.0
+        mode_mass_mean = float(np.mean(values['mode_mass'])) if values['mode_mass'] else 0.0
+        iqr_mean = float(np.mean(values['iqr'])) if values['iqr'] else 0.0
+        summary.setdefault(timeframe, {})[task_name] = {
+            'distribution_mean': distribution_mean,
+            'mode_mass_mean': mode_mass_mean,
+            'iqr_mean': iqr_mean,
+            'h_mode_mean': h_mode_mean,
+            'h_mode_std': h_mode_std,
+            'recommended_family': recommend_horizon_family(
+                {
+                    'mode_mass': mode_mass_mean,
+                    'iqr': iqr_mean,
+                    'h_mode': h_mode_mean,
+                },
+                h_mode_std=h_mode_std,
+            ),
+            'fold_count': len(values['distributions']),
+        }
+    return summary
+
+
+# SECTION: TRAIN
+
 
 def train(args):
-    # Setup
     set_seed(args.seed, args.deterministic)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    print(f"Unified local physics window: {args.window_size}")
-    print(f"Short smoothing window reserved for visualization/stability: 2-3")
-    
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir)
-    
-    # 1. Prepare Data (Multi-Timeframe)
-    print("Preparing Multi-Timeframe Datasets...")
+    os.makedirs(args.save_dir, exist_ok=True)
+
     market = getattr(args, 'market', 'legacy_multiasset')
     training_subdir = getattr(args, 'training_subdir', None)
     train_data_dir = resolve_training_ready_dir(args.data_dir, market=market, training_subdir=training_subdir)
     os.makedirs(train_data_dir, exist_ok=True)
-
     ready_files = glob.glob(os.path.join(train_data_dir, '*.csv'))
     if len(ready_files) == 0 and market != 'ashare':
         processed_files = []
-        search_pattern = os.path.join(args.data_dir, '**', '*.csv')
-        raw_files = glob.glob(search_pattern, recursive=True)
-        print(f"Found {len(raw_files)} raw files.")
+        raw_files = glob.glob(os.path.join(args.data_dir, '**', '*.csv'), recursive=True)
         for file_path in raw_files:
-            if 'training_ready' in file_path:
-                continue
-            if os.path.getsize(file_path) < 1024:
+            if 'training_ready' in file_path or os.path.getsize(file_path) < 1024:
                 continue
             processed_files.extend(process_multi_timeframe(file_path, train_data_dir))
         print(f"Generated {len(processed_files)} processed files into {train_data_dir}.")
 
-    final_records = discover_runtime_files(args)
+    base_records = discover_runtime_files(args)
     if args.test_mode:
-        final_records = final_records[:1]
-        args.epochs = 1
-        print("!!! RUNNING IN FAST TEST MODE !!!")
-
-    print(f"Loading {len(final_records)} files into Global Memory...")
-    print(f"Assets included: {[os.path.basename(item['path']) for item in final_records]}")
-    if not final_records:
+        base_records = base_records[:1]
+        args.epochs = min(args.epochs, 1)
+        print("Running in test mode.")
+    if not base_records:
         raise RuntimeError(f'No training files found under {train_data_dir} for market={market}.')
-    
-    # =========================================================================
-    # WARNING: Windows has severe memory fragmentation issues with CUDA 
-    # when holding large tensors in a Dataset list across multiple files.
-    # To ensure stable training, we fall back to sequential file processing,
-    # but still utilize the massive speedup of Offline GPU Pre-computation.
-    # =========================================================================
-    
-    # FOR DEBUGGING WINDOWS MEMORY HANGS, ONLY PROCESS FIRST FILE
-    # In order to make it run full loop, we must clean memory aggressively 
-    # but to show you it works, we run on all files but clear GPU cache
-    
-    # We run on all filtered files as per user requirement (no truncation)
-    print(f"Loading {len(final_records)} files into Global Memory...")
-    print(f"Assets included: {[os.path.basename(item['path']) for item in final_records]}")
-    
-    # 3. Model Init
-    input_dim = len(PHYSICS_FEATURE_NAMES)
+
+    runtime_records = expand_runtime_records(base_records, args, include_final_holdout=False)
+    if args.test_mode and getattr(args, 'split_scheme', 'time') == 'rolling_recent_v1':
+        runtime_records = runtime_records[:min(len(runtime_records), 2)]
+    print(f"Loading {len(runtime_records)} runtime jobs from {len(base_records)} base files.")
+
+    global_horizon_grid = resolve_global_horizon_grid(args)
+    setattr(args, 'global_horizon_grid', global_horizon_grid)
+    if not getattr(args, 'config_fingerprint', None):
+        setattr(args, 'config_fingerprint', resolve_config_fingerprint(args, runtime_records, global_horizon_grid))
+    print(f"Config fingerprint: {args.config_fingerprint}")
+    if global_horizon_grid:
+        print(f"Global horizon grid size: {len(global_horizon_grid)}")
+    prewarm_runtime_dataset_cache(runtime_records, args, global_horizon_grid=global_horizon_grid)
+
     kan = KHAOS_KAN(
-        input_dim=input_dim, 
+        input_dim=len(PHYSICS_FEATURE_NAMES),
         hidden_dim=args.hidden_dim,
         output_dim=2,
-        layers=args.layers, 
+        layers=args.layers,
         grid_size=args.grid_size,
         arch_version=getattr(args, 'arch_version', 'iterA2_base'),
+        horizon_count=len(global_horizon_grid) if global_horizon_grid else 1,
+        horizon_family_mode=getattr(args, 'horizon_family_mode', 'legacy'),
     ).to(device)
-    
     optimizer = optim.AdamW(
         kan.parameters(),
         lr=args.lr,
         weight_decay=getattr(args, 'weight_decay', 1e-4),
     )
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=1)
-    constraint_profile = getattr(args, 'constraint_profile', 'default')
     criterion = PhysicsLoss(
         profile=getattr(args, 'loss_profile', 'default'),
-        constraint_profile=constraint_profile,
+        constraint_profile=getattr(args, 'constraint_profile', 'default'),
+        family_mode=getattr(args, 'horizon_family_mode', 'legacy'),
     )
     scaler = GradScaler('cuda', enabled=(device.type == 'cuda'))
-    use_direction_metrics = getattr(args, 'arch_version', 'iterA2_base') in {'iterA3_multiscale', 'iterA4_multiscale', 'iterA5_multiscale'}
-    use_debug_metrics = use_direction_metrics or constraint_profile != 'default'
+    use_direction_metrics = getattr(args, 'arch_version', 'iterA2_base') in {
+        'iterA3_multiscale',
+        'iterA4_multiscale',
+        'iterA5_multiscale',
+    }
+    use_debug_metrics = use_direction_metrics or getattr(args, 'constraint_profile', 'default') != 'default' or bool(global_horizon_grid)
     score_profile = getattr(args, 'score_profile', 'default')
     score_timeframes = resolve_normalized_timeframes(getattr(args, 'score_timeframes', None))
     score_timeframe_set = set(score_timeframes)
@@ -787,79 +1737,111 @@ def train(args):
     promotion_timeframe_thresholds = parse_timeframe_threshold_config(
         getattr(args, 'promotion_timeframe_composite_thresholds', None)
     )
-    
-    start_epoch, best_val_loss, best_score, no_improve_epochs = try_resume_training(
-        args, kan, optimizer, scheduler, scaler, device
-    )
+    baseline_reference = load_baseline_reference(getattr(args, 'baseline_reference_dir', None))
     resume_path = get_resume_path(args)
-    latest_metrics = None
+    best_raw_path = get_best_raw_path(args)
+    best_gate_path = get_best_gate_path(args)
     epoch_metrics_path = os.path.join(args.save_dir, getattr(args, 'epoch_metrics_name', 'epoch_metrics.jsonl'))
-    per_timeframe_metrics_path = os.path.join(
-        args.save_dir,
-        getattr(args, 'per_timeframe_metrics_name', 'per_timeframe_metrics.jsonl'),
-    )
+    per_timeframe_metrics_path = os.path.join(args.save_dir, getattr(args, 'per_timeframe_metrics_name', 'per_timeframe_metrics.jsonl'))
+    per_fold_metrics_path = os.path.join(args.save_dir, getattr(args, 'per_fold_metrics_name', 'per_fold_metrics.jsonl'))
+    final_holdout_metrics_path = os.path.join(args.save_dir, getattr(args, 'final_holdout_metrics_name', 'final_holdout_metrics.json'))
+    horizon_summary_path = os.path.join(args.save_dir, getattr(args, 'horizon_summary_name', 'horizon_discovery_summary.json'))
+    horizon_family_guard_passed = True
+    if bool(getattr(args, 'enforce_horizon_family_guard', False)) and getattr(args, 'horizon_family_mode', 'legacy') == 'single_cycle':
+        print('[HORIZON GUARD] Validating single_cycle against discovered horizon family recommendations...')
+        guard_registry = collect_horizon_guard_registry(runtime_records, args, global_horizon_grid)
+        guard_summary = write_horizon_summary_artifact(
+            horizon_summary_path,
+            guard_registry,
+            global_horizon_grid,
+            getattr(args, 'config_fingerprint', None),
+        )
+        guard_result = evaluate_single_cycle_family_guard(guard_registry, score_timeframes=score_timeframes)
+        horizon_family_guard_passed = guard_result['passed']
+        if not horizon_family_guard_passed:
+            violation_preview = ', '.join(
+                f"{item['asset_code']}/{item['timeframe']}/{item['split_label']}/{item['task']}->{item['recommended_family']}"
+                for item in guard_result['violations'][:6]
+            )
+            raise RuntimeError(
+                'single_cycle horizon family guard failed; use adaptive_resonance instead. '
+                f"checked_tasks={guard_result['checked_tasks']} violations={len(guard_result['violations'])} "
+                f"summary_path={horizon_summary_path} preview=[{violation_preview}]"
+            )
+        print(
+            f"[HORIZON GUARD] Passed. checked_records={guard_result['checked_records']} "
+            f"checked_tasks={guard_result['checked_tasks']}"
+        )
+        del guard_summary
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    resume_state = try_resume_training(args, kan, optimizer, scheduler, scaler, device)
+    start_epoch = resume_state['start_epoch']
+    best_raw_val_loss = resume_state['best_raw_val_loss']
+    best_raw_score = resume_state['best_raw_score']
+    best_gate_val_loss = resume_state['best_gate_val_loss']
+    best_gate_score = resume_state['best_gate_score']
+    no_improve_epochs = resume_state['no_improve_epochs']
     if start_epoch == 0:
-        for metric_path in (epoch_metrics_path, per_timeframe_metrics_path):
-            if os.path.exists(metric_path):
+        for metric_path in (epoch_metrics_path, per_timeframe_metrics_path, per_fold_metrics_path):
+            if metric_path and os.path.exists(metric_path):
                 os.remove(metric_path)
-    
-    print("\nStarting Accelerated Sequential Training...")
-    
-    if start_epoch >= args.epochs:
-        print(f"[RESUME] 当前断点 epoch={start_epoch} 已达到目标 epochs={args.epochs}，无需继续训练。")
-    
+
+    latest_metrics = None
+    horizon_registry = {}
     for epoch in range(start_epoch, args.epochs):
-        print(f"\n========== EPOCH {epoch+1}/{args.epochs} ==========")
+        print(f"\n========== EPOCH {epoch + 1}/{args.epochs} ==========")
         epoch_train_loss_total = 0.0
         epoch_train_batches = 0
         epoch_train_logs = []
+        epoch_effective_train_samples_by_timeframe = defaultdict(int)
         epoch_all_bucket = build_metric_bucket()
         epoch_timeframe_buckets = defaultdict(build_metric_bucket)
-        processed_files = 0
-        for file_idx, record in enumerate(final_records):
-            data_path = record['path']
-            print(f"\n[{file_idx+1}/{len(final_records)}] Processing: {os.path.basename(data_path)}")
-            
-            try:
-                train_ds, eval_ds, _, dataset_meta = create_market_datasets(record, args)
-                
-                if train_ds is None or eval_ds is None:
-                    print("  -> Split generation returned empty train/validation dataset, skipping.")
-                    continue
+        epoch_fold_buckets = defaultdict(build_metric_bucket)
+        processed_jobs = 0
 
-                if len(train_ds) < args.batch_size or len(eval_ds) == 0:
-                    print("  -> Dataset too small for this configuration, skipping.")
+        for job_idx, record in enumerate(runtime_records):
+            data_path = record['path']
+            split_label = record.get('split_label')
+            try:
+                train_ds, val_ds, test_ds, dataset_meta = create_market_datasets(
+                    record,
+                    args,
+                    global_horizon_grid=global_horizon_grid,
+                )
+                update_horizon_registry(horizon_registry, dataset_meta)
+                eval_ds = val_ds if val_ds is not None else test_ds
+                if train_ds is None or eval_ds is None or len(eval_ds) == 0:
+                    print(f"  -> Skipping {os.path.basename(data_path)} split={split_label}: empty dataset.")
+                    continue
+                if len(train_ds) < max(1, min(args.batch_size, 8)):
+                    print(f"  -> Skipping {os.path.basename(data_path)} split={split_label}: train dataset too small.")
                     continue
 
                 timeframe_label = normalize_timeframe_label(dataset_meta.get('timeframe') or record.get('timeframe')) or 'unknown'
                 train_loader = build_train_loader(train_ds, args, timeframe_label)
-                test_loader = build_eval_loader(eval_ds, args)
-                
+                eval_loader = build_eval_loader(eval_ds, args)
                 kan.train()
-                total_loss = 0
+                total_loss = 0.0
                 loss_logs = []
-                
-                for batch_idx, (features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags) in enumerate(train_loader):
-                    features_seq = features_seq.to(device, non_blocking=True)
-                    batch_y = batch_y.to(device, non_blocking=True)
-                    batch_aux = batch_aux.to(device, non_blocking=True)
-                    batch_sigma = batch_sigma.to(device, non_blocking=True)
-                    batch_weights = batch_weights.to(device, non_blocking=True).unsqueeze(1)
-                    batch_flags = batch_flags.to(device, non_blocking=True)
-                    
+                job_effective_train_samples = 0
+                amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+                for batch_idx, batch in enumerate(train_loader):
+                    features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags, horizon_payload = unpack_batch(batch, device)
                     psi_t = features_seq[:, -1, :]
-                    
                     optimizer.zero_grad(set_to_none=True)
-                    
-                    # Use bfloat16 if supported for better numerical stability
-                    amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
                     with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=amp_dtype):
-                        pred, aux_pred, debug_info = forward_model(kan, features_seq, return_debug=use_debug_metrics)
-                        
+                        pred, aux_pred, debug_info = forward_model(
+                            kan,
+                            features_seq,
+                            args,
+                            horizon_payload=horizon_payload,
+                            return_debug=use_debug_metrics,
+                        )
                         if torch.isnan(pred).any():
-                            print("NaN in pred! Skipping batch.")
+                            print("NaN in predictions. Skipping batch.")
                             continue
-                            
                         loss_unweighted, rank_loss, l_dict = criterion(
                             pred,
                             aux_pred,
@@ -869,144 +1851,77 @@ def train(args):
                             batch_flags,
                             batch_sigma,
                             debug_info=debug_info,
+                            horizon_payload=horizon_payload,
                         )
                         reg_loss = kan.get_regularization_loss(regularize_activation=1e-4, regularize_entropy=1e-4)
                         loss = (loss_unweighted * batch_weights).mean() + rank_loss + reg_loss
-                    
                     if torch.isnan(loss) or torch.isinf(loss):
-                        print("NaN/Inf in loss! Skipping batch.")
+                        print("NaN/Inf loss. Skipping batch.")
                         continue
-                        
                     scaler.scale(loss).backward()
-                    
-                    # Gradient clipping to prevent explosion
                     scaler.unscale_(optimizer)
-                    
-                    # Check for NaN/Inf in gradients before clipping
-                    has_nan_inf = False
-                    for param in kan.parameters():
-                        if param.grad is not None:
-                            if not torch.isfinite(param.grad).all():
-                                has_nan_inf = True
-                                break
-                                
-                    if not has_nan_inf:
+                    has_bad_grad = any(
+                        param.grad is not None and not torch.isfinite(param.grad).all()
+                        for param in kan.parameters()
+                    )
+                    if not has_bad_grad:
                         torch.nn.utils.clip_grad_norm_(kan.parameters(), max_norm=getattr(args, 'grad_clip', 1.0))
                         scaler.step(optimizer)
                     else:
-                        print("NaN/Inf in gradients! Skipping optimizer step.")
-                        
+                        print("Invalid gradients detected. Skipping optimizer step.")
                     scaler.update()
-                    
-                    total_loss += loss.item()
+                    total_loss += float(loss.item())
                     loss_logs.append(l_dict)
-                    
+                    job_effective_train_samples += int(batch_y.size(0))
                     if batch_idx % 100 == 0:
                         print(
-                            f"    [Batch {batch_idx}/{len(train_loader)}] "
-                            f"Loss: {loss.item():.6f} | Main: {l_dict['main']:.4f} | Aux: {l_dict['aux']:.4f} | Rank: {l_dict['rank']:.4f}"
+                            f"  [{job_idx + 1}/{len(runtime_records)}][{split_label or 'default'}][{timeframe_label}] "
+                            f"batch {batch_idx}/{len(train_loader)} loss={loss.item():.6f}"
                         )
-                        
-                avg_loss = total_loss / max(len(train_loader), 1)
-                
-                # Validation
-                kan.eval()
-                file_bucket = build_metric_bucket()
-                with torch.no_grad():
-                    for features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags in test_loader:
-                        features_seq = features_seq.to(device, non_blocking=True)
-                        batch_y = batch_y.to(device, non_blocking=True)
-                        batch_aux = batch_aux.to(device, non_blocking=True)
-                        batch_sigma = batch_sigma.to(device, non_blocking=True)
-                        batch_weights = batch_weights.to(device, non_blocking=True).unsqueeze(1)
-                        batch_flags = batch_flags.to(device, non_blocking=True)
-                        
-                        psi_t = features_seq[:, -1, :]
-                        
-                        amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-                        with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=amp_dtype):
-                            pred, aux_pred, debug_info = forward_model(kan, features_seq, return_debug=use_debug_metrics)
-                            loss_unweighted, rank_loss, l_dict = criterion(
-                                pred,
-                                aux_pred,
-                                batch_y,
-                                batch_aux,
-                                psi_t,
-                                batch_flags,
-                                batch_sigma,
-                                debug_info=debug_info,
-                            )
-                            reg_loss = kan.get_regularization_loss(regularize_activation=1e-4, regularize_entropy=1e-4)
-                            loss = (loss_unweighted * batch_weights).mean() + rank_loss + reg_loss
-                            
-                        batch_log = dict(l_dict)
-                        batch_log['total_loss'] = float(loss.item())
-                        file_bucket['logs'].append(batch_log)
-                        file_bucket['preds'].append(pred.detach().float().cpu().numpy())
-                        file_bucket['targets'].append(batch_y.detach().cpu().numpy())
-                        file_bucket['flags'].append(batch_flags.detach().cpu().numpy())
-                        if debug_info is not None:
-                            for debug_key in DEBUG_BATCH_KEYS:
-                                debug_value = debug_info.get(debug_key)
-                                if debug_value is None:
-                                    continue
-                                if isinstance(debug_value, torch.Tensor):
-                                    debug_value = debug_value.detach().float().cpu().numpy()
-                                else:
-                                    debug_value = np.asarray(debug_value, dtype=np.float32)
-                                file_bucket['debug_batches'][debug_key].append(debug_value)
 
+                kan.eval()
+                file_bucket = evaluate_dataset_loader(
+                    kan=kan,
+                    eval_loader=eval_loader,
+                    criterion=criterion,
+                    args=args,
+                    device=device,
+                    use_debug_metrics=use_debug_metrics,
+                )
                 file_summary = summarize_metric_bucket(
                     file_bucket,
                     score_profile=score_profile,
                     use_direction_metrics=use_direction_metrics,
                 )
-                train_main = float(np.mean([x['main'] for x in loss_logs])) if loss_logs else 0.0
-                train_aux = float(np.mean([x['aux'] for x in loss_logs])) if loss_logs else 0.0
+                avg_loss = total_loss / max(len(train_loader), 1)
                 print(
-                    f"  -> Train Loss: {avg_loss:.6f} | Val Loss: {file_summary['avg_val_loss']:.6f} | "
-                    f"Train Main/Aux: {train_main:.4f}/{train_aux:.4f} | "
-                    f"Val Main/Aux: {file_summary['loss_main']:.4f}/{file_summary['loss_aux']:.4f}"
-                )
-                print(
-                    f"  -> Val Corr Breakout/Reversion: {file_summary['breakout_corr']:.4f}/{file_summary['reversion_corr']:.4f} | "
-                    f"Event Mean: {file_summary['breakout_event_mean']:.4f}/{file_summary['reversion_event_mean']:.4f} | "
-                    f"HardNeg Mean: {file_summary['breakout_hard_negative_mean']:.4f}/{file_summary['reversion_hard_negative_mean']:.4f} | "
-                    f"Gap: {file_summary['breakout_gap']:.4f}/{file_summary['reversion_gap']:.4f} | "
-                    f"Composite: {file_summary['composite_score']:.4f}"
-                )
-                print(
-                    f"  -> Event F1 Breakout/Reversion: {file_summary['breakout_metrics']['f1']:.4f}/{file_summary['reversion_metrics']['f1']:.4f} | "
-                    f"HardNeg: {file_summary['breakout_metrics']['hard_negative_rate']:.4f}/{file_summary['reversion_metrics']['hard_negative_rate']:.4f} | "
-                    f"Direction MacroF1: {file_summary['direction_metrics']['macro_f1']:.4f}"
-                )
-                print(
-                    f"  -> Gate Mean Dir/Public/Break: "
-                    f"{file_summary['direction_gate_mean']:.4f}/{file_summary['public_reversion_gate_mean']:.4f}/{file_summary['breakout_residual_gate_mean']:.4f} | "
-                    f"Floor: {file_summary['directional_floor_mean']:.4f} | "
-                    f"Constraint B/P/Pub/Cont: "
-                    f"{file_summary['blue_over_purple_violation']:.4f}/"
-                    f"{file_summary['purple_over_blue_violation']:.4f}/"
-                    f"{file_summary['public_below_directional_violation']:.4f}/"
-                    f"{file_summary['continuation_public_violation']:.4f}"
+                    f"  -> {os.path.basename(data_path)} [{split_label or 'default'}|{timeframe_label}] "
+                    f"train={avg_loss:.6f} val={file_summary['avg_val_loss']:.6f} "
+                    f"precision={file_summary['breakout_metrics']['precision']:.4f}/{file_summary['reversion_metrics']['precision']:.4f} "
+                    f"composite={file_summary['composite_score']:.4f} "
+                    f"train_samples={job_effective_train_samples}"
                 )
                 epoch_train_loss_total += total_loss
                 epoch_train_batches += len(train_loader)
                 epoch_train_logs.extend(loss_logs)
+                epoch_effective_train_samples_by_timeframe[timeframe_label] += job_effective_train_samples
                 merge_metric_bucket(epoch_all_bucket, file_bucket)
                 merge_metric_bucket(epoch_timeframe_buckets[timeframe_label], file_bucket)
-                processed_files += 1
-                    
-                # Cleanup to avoid memory leaks
-                del train_ds, eval_ds, train_loader, test_loader
+                if split_label:
+                    merge_metric_bucket(epoch_fold_buckets[split_label], file_bucket)
+                processed_jobs += 1
+                del train_ds, val_ds, test_ds, train_loader, eval_loader
                 gc.collect()
                 torch.cuda.empty_cache()
-                
-            except Exception as e:
+            except Exception as exc:
                 import traceback
                 traceback.print_exc()
-                print(f"Error processing {data_path}: {e}")
+                print(f"Error processing {data_path} split={split_label}: {exc}")
                 continue
+
+        if processed_jobs == 0 or not epoch_all_bucket['preds']:
+            print("No valid runtime jobs processed in this epoch.")
+            continue
 
         timeframe_summaries = {
             timeframe: summarize_metric_bucket(
@@ -1016,7 +1931,15 @@ def train(args):
             )
             for timeframe, bucket in sorted(epoch_timeframe_buckets.items())
         }
-        overall_all_summary = summarize_metric_bucket(
+        fold_summaries = {
+            fold: summarize_metric_bucket(
+                bucket,
+                score_profile=score_profile,
+                use_direction_metrics=use_direction_metrics,
+            )
+            for fold, bucket in sorted(epoch_fold_buckets.items())
+        }
+        overall_summary = summarize_metric_bucket(
             epoch_all_bucket,
             score_profile=score_profile,
             use_direction_metrics=use_direction_metrics,
@@ -1026,118 +1949,43 @@ def train(args):
             for timeframe, bucket in epoch_timeframe_buckets.items():
                 if timeframe in score_timeframe_set:
                     merge_metric_bucket(score_bucket, bucket)
-            if not score_bucket['preds']:
-                score_bucket = epoch_all_bucket
+            if score_bucket['preds']:
+                epoch_score_summary = summarize_metric_bucket(
+                    score_bucket,
+                    score_profile=score_profile,
+                    use_direction_metrics=use_direction_metrics,
+                )
+            else:
+                epoch_score_summary = overall_summary
         else:
-            score_bucket = epoch_all_bucket
-        epoch_score_summary = summarize_metric_bucket(
-            score_bucket,
-            score_profile=score_profile,
-            use_direction_metrics=use_direction_metrics,
-        )
-        epoch_val_batches = len(score_bucket['logs'])
-        epoch_val_loss_total = float(sum(item.get('total_loss', 0.0) for item in score_bucket['logs']))
-        epoch_val_logs = list(score_bucket['logs'])
-        epoch_val_preds = list(score_bucket['preds'])
-        epoch_val_targets = list(score_bucket['targets'])
-        epoch_val_flags = list(score_bucket['flags'])
-        epoch_val_blue = list(score_bucket['debug_batches']['blue_score'])
-        epoch_val_purple = list(score_bucket['debug_batches']['purple_score'])
+            epoch_score_summary = overall_summary
 
-        if processed_files == 0 or epoch_val_batches == 0:
-            print("No valid files processed in this epoch.")
-            continue
+        if getattr(args, 'split_scheme', 'time') == 'rolling_recent_v1':
+            composite_score, recent_score_components, score_veto = compute_recent_precision_score(
+                fold_summaries=fold_summaries,
+                timeframe_summaries=timeframe_summaries,
+                baseline_reference=baseline_reference,
+                args=args,
+            )
+        else:
+            composite_score = epoch_score_summary['composite_score']
+            recent_score_components = {'mode': 'standard'}
+            score_veto = {'passed': True, 'reasons': []}
 
         epoch_avg_loss = epoch_train_loss_total / max(epoch_train_batches, 1)
-        epoch_avg_val_loss = epoch_val_loss_total / max(epoch_val_batches, 1)
+        epoch_avg_val_loss = epoch_score_summary['avg_val_loss']
         epoch_train_main = float(np.mean([x['main'] for x in epoch_train_logs])) if epoch_train_logs else 0.0
         epoch_train_aux = float(np.mean([x['aux'] for x in epoch_train_logs])) if epoch_train_logs else 0.0
-        epoch_val_main = float(np.mean([x['main'] for x in epoch_val_logs])) if epoch_val_logs else 0.0
-        epoch_val_aux = float(np.mean([x['aux'] for x in epoch_val_logs])) if epoch_val_logs else 0.0
-        pred_np = np.vstack(epoch_val_preds)
-        target_np = np.vstack(epoch_val_targets)
-        flags_np = np.vstack(epoch_val_flags)
-        pred_rev_np = np.maximum(pred_np[:, 1], 0.0)
-        breakout_corr = safe_corr(pred_np[:, 0], target_np[:, 0])
-        reversion_corr = safe_corr(pred_rev_np, target_np[:, 1])
-        breakout_event_mean = float(pred_np[flags_np[:, 0] > 0.5, 0].mean()) if np.any(flags_np[:, 0] > 0.5) else 0.0
-        reversion_event_mean = float(pred_rev_np[flags_np[:, 1] > 0.5].mean()) if np.any(flags_np[:, 1] > 0.5) else 0.0
-        breakout_hn_mean = float(pred_np[flags_np[:, 2] > 0.5, 0].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
-        reversion_hn_mean = float(pred_rev_np[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
-        breakout_metrics = compute_event_metrics(pred_np[:, 0], flags_np[:, 0] > 0.5, flags_np[:, 2] > 0.5)
-        reversion_metrics = compute_event_metrics(pred_rev_np, flags_np[:, 1] > 0.5, flags_np[:, 3] > 0.5)
-        direction_metrics = compute_direction_metrics(
-            np.vstack(epoch_val_blue).reshape(-1),
-            np.vstack(epoch_val_purple).reshape(-1),
-            flags_np,
-        ) if epoch_val_blue and epoch_val_purple else {
-            'accuracy': 0.0,
-            'macro_f1': 0.0,
-            'blue_f1': 0.0,
-            'purple_f1': 0.0,
-            'support': 0,
-        }
-        breakout_gap = breakout_event_mean - breakout_hn_mean
-        reversion_gap = reversion_event_mean - reversion_hn_mean
-        composite_score = compute_checkpoint_score(
-            breakout_metrics,
-            reversion_metrics,
-            breakout_corr,
-            reversion_corr,
-            direction_metrics['macro_f1'] if use_direction_metrics else None,
-            profile=score_profile,
+        print(
+            f"[EPOCH {epoch + 1}] train_loss={epoch_avg_loss:.6f} val_loss={epoch_avg_val_loss:.6f} "
+            f"score={composite_score:.4f} veto={score_veto['passed']}"
         )
         print(
-            f"\n[EPOCH {epoch+1} SUMMARY] Train Loss: {epoch_avg_loss:.6f} | Val Loss: {epoch_avg_val_loss:.6f} | "
-            f"Train Main/Aux: {epoch_train_main:.4f}/{epoch_train_aux:.4f} | "
-            f"Val Main/Aux: {epoch_val_main:.4f}/{epoch_val_aux:.4f}"
+            f"[EPOCH {epoch + 1}] effective_train_samples_by_timeframe="
+            f"{dict(sorted(epoch_effective_train_samples_by_timeframe.items()))}"
         )
-        print(
-            f"[EPOCH {epoch+1} SUMMARY] Val Corr Breakout/Reversion: {breakout_corr:.4f}/{reversion_corr:.4f} | "
-            f"Event Mean: {breakout_event_mean:.4f}/{reversion_event_mean:.4f} | "
-            f"HardNeg Mean: {breakout_hn_mean:.4f}/{reversion_hn_mean:.4f} | "
-            f"Gap: {breakout_gap:.4f}/{reversion_gap:.4f} | "
-            f"Composite: {composite_score:.4f}"
-        )
-        print(
-            f"[EPOCH {epoch+1} SUMMARY] Breakout Acc/P/R/F1: "
-            f"{breakout_metrics['accuracy']:.4f}/{breakout_metrics['precision']:.4f}/"
-            f"{breakout_metrics['recall']:.4f}/{breakout_metrics['f1']:.4f} | "
-            f"阈值: {breakout_metrics['threshold']:.4f} | "
-            f"事件命中率/伪信号率: {breakout_metrics['event_rate']:.4f}/{breakout_metrics['hard_negative_rate']:.4f} | "
-            f"信号频次/标签频次: {breakout_metrics['signal_frequency']:.4f}/{breakout_metrics['label_frequency']:.4f}"
-        )
-        print(
-            f"[EPOCH {epoch+1} SUMMARY] Reversion Acc/P/R/F1: "
-            f"{reversion_metrics['accuracy']:.4f}/{reversion_metrics['precision']:.4f}/"
-            f"{reversion_metrics['recall']:.4f}/{reversion_metrics['f1']:.4f} | "
-            f"阈值: {reversion_metrics['threshold']:.4f} | "
-            f"事件命中率/伪信号率: {reversion_metrics['event_rate']:.4f}/{reversion_metrics['hard_negative_rate']:.4f} | "
-            f"信号频次/标签频次: {reversion_metrics['signal_frequency']:.4f}/{reversion_metrics['label_frequency']:.4f}"
-        )
-        print(
-            f"[EPOCH {epoch+1} SUMMARY] Direction Acc/MacroF1/BlueF1/PurpleF1: "
-            f"{direction_metrics['accuracy']:.4f}/{direction_metrics['macro_f1']:.4f}/"
-            f"{direction_metrics['blue_f1']:.4f}/{direction_metrics['purple_f1']:.4f} | "
-            f"Support: {direction_metrics['support']}"
-        )
-        print(
-            f"[EPOCH {epoch+1} SUMMARY] Gate Mean Dir/Public/Break: "
-            f"{epoch_score_summary['direction_gate_mean']:.4f}/"
-            f"{epoch_score_summary['public_reversion_gate_mean']:.4f}/"
-            f"{epoch_score_summary['breakout_residual_gate_mean']:.4f} | "
-            f"Floor: {epoch_score_summary['directional_floor_mean']:.4f} | "
-            f"Constraint B/P/Pub/Cont: "
-            f"{epoch_score_summary['blue_over_purple_violation']:.4f}/"
-            f"{epoch_score_summary['purple_over_blue_violation']:.4f}/"
-            f"{epoch_score_summary['public_below_directional_violation']:.4f}/"
-            f"{epoch_score_summary['continuation_public_violation']:.4f}"
-        )
-        if score_timeframe_set:
-            print(
-                f"[EPOCH {epoch+1} SUMMARY] Score Timeframes: {sorted(score_timeframe_set)} | "
-                f"All-Timeframe Composite: {overall_all_summary['composite_score']:.4f}"
-            )
+        if score_veto['reasons']:
+            print(f"[EPOCH {epoch + 1}] veto_reasons={score_veto['reasons']}")
 
         promotion_scoreboard = {}
         if promotion_overall_threshold is not None:
@@ -1157,41 +2005,15 @@ def train(args):
                 'passed': bool(actual is not None and actual >= threshold),
             }
 
-        if promotion_scoreboard:
-            overall_text = promotion_scoreboard.get('overall_model_composite')
-            parts = []
-            if overall_text:
-                parts.append(
-                    f"overall={overall_text['actual']:.4f} (Δ={overall_text['delta']:+.4f}, th={overall_text['threshold']:.4f})"
-                )
-            for key, item in promotion_scoreboard.items():
-                if not key.startswith('timeframe_'):
-                    continue
-                tf = key.replace('timeframe_', '').replace('_composite', '')
-                if item['actual'] is None:
-                    parts.append(f"{tf}=None (th={item['threshold']:.4f})")
-                else:
-                    parts.append(
-                        f"{tf}={item['actual']:.4f} (Δ={item['delta']:+.4f}, th={item['threshold']:.4f})"
-                    )
-            print(f"[EPOCH {epoch+1} PROMOTION] " + " | ".join(parts))
-
         for timeframe, summary in timeframe_summaries.items():
-            score_included = timeframe in score_timeframe_set if score_timeframe_set else True
-            print(
-                f"[EPOCH {epoch+1}][{timeframe}] Composite: {summary['composite_score']:.4f} | "
-                f"Breakout/Reversion F1: {summary['breakout_metrics']['f1']:.4f}/{summary['reversion_metrics']['f1']:.4f} | "
-                f"DirectionF1: {summary['direction_metrics']['macro_f1']:.4f} | "
-                f"ScoreIncluded: {score_included}"
-            )
             append_jsonl(
                 per_timeframe_metrics_path,
                 {
                     'epoch': epoch + 1,
                     'timeframe': timeframe,
-                    'score_included': score_included,
+                    'score_included': timeframe in score_timeframe_set if score_timeframe_set else True,
                     'aux_timeframe': timeframe in aux_timeframe_set,
-                    'constraint_profile': constraint_profile,
+                    'constraint_profile': getattr(args, 'constraint_profile', 'default'),
                     'arch_version': getattr(args, 'arch_version', 'iterA2_base'),
                     'dataset_profile': getattr(args, 'dataset_profile', 'iterA2'),
                     'loss_profile': getattr(args, 'loss_profile', 'default'),
@@ -1199,210 +2021,220 @@ def train(args):
                     'sample_count': summary['sample_count'],
                     'breakout_f1': summary['breakout_metrics']['f1'],
                     'reversion_f1': summary['reversion_metrics']['f1'],
+                    'breakout_precision': summary['breakout_metrics']['precision'],
+                    'reversion_precision': summary['reversion_metrics']['precision'],
                     'breakout_hard_negative_rate': summary['breakout_metrics']['hard_negative_rate'],
                     'reversion_hard_negative_rate': summary['reversion_metrics']['hard_negative_rate'],
-                    'breakout_gap': summary['breakout_gap'],
-                    'reversion_gap': summary['reversion_gap'],
-                    'composite_score': summary['composite_score'],
                     'direction_macro_f1': summary['direction_metrics']['macro_f1'],
                     'signal_frequency': summary['signal_frequency'],
-                    'label_frequency': summary['label_frequency'],
-                    'breakout_signal_frequency': summary['breakout_signal_frequency'],
-                    'reversion_signal_frequency': summary['reversion_signal_frequency'],
-                    'breakout_label_frequency': summary['breakout_label_frequency'],
-                    'reversion_label_frequency': summary['reversion_label_frequency'],
-                    'direction_gate_mean': summary['direction_gate_mean'],
-                    'direction_gate_std': summary['direction_gate_std'],
-                    'public_reversion_gate_mean': summary['public_reversion_gate_mean'],
-                    'public_reversion_gate_std': summary['public_reversion_gate_std'],
-                    'breakout_residual_gate_mean': summary['breakout_residual_gate_mean'],
-                    'breakout_residual_gate_std': summary['breakout_residual_gate_std'],
+                    'pred_rev_mean': summary['pred_rev_mean'],
+                    'pred_rev_event_mean': summary['pred_rev_event_mean'],
                     'directional_floor_mean': summary['directional_floor_mean'],
-                    'blue_over_purple_violation': summary['blue_over_purple_violation'],
-                    'blue_over_purple_violation_rate': summary['blue_over_purple_violation_rate'],
-                    'purple_over_blue_violation': summary['purple_over_blue_violation'],
-                    'purple_over_blue_violation_rate': summary['purple_over_blue_violation_rate'],
-                    'public_below_directional_violation': summary['public_below_directional_violation'],
+                    'directional_floor_reversion_event_mean': summary['directional_floor_reversion_event_mean'],
+                    'reversion_event_count': summary['reversion_event_count'],
+                    'selected_horizon_breakout_value_mean': summary['selected_horizon_breakout_value_mean'],
+                    'selected_horizon_reversion_value_mean': summary['selected_horizon_reversion_value_mean'],
+                    'horizon_entropy_breakout_mean': summary['horizon_entropy_breakout_mean'],
+                    'horizon_entropy_reversion_mean': summary['horizon_entropy_reversion_mean'],
                     'public_below_directional_violation_rate': summary['public_below_directional_violation_rate'],
-                    'continuation_public_violation': summary['continuation_public_violation'],
-                    'continuation_public_violation_rate': summary['continuation_public_violation_rate'],
+                    'composite_score': summary['composite_score'],
                 },
             )
-        append_jsonl(
-            epoch_metrics_path,
-            {
-                'epoch': epoch + 1,
-                'processed_files': processed_files,
-                'constraint_profile': constraint_profile,
-                'arch_version': getattr(args, 'arch_version', 'iterA2_base'),
-                'dataset_profile': getattr(args, 'dataset_profile', 'iterA2'),
-                'loss_profile': getattr(args, 'loss_profile', 'default'),
-                'score_profile': score_profile,
-                'score_timeframes': score_timeframes or sorted(timeframe_summaries.keys()),
-                'aux_timeframes': aux_timeframes,
-                'train_loss': epoch_avg_loss,
-                'val_loss': epoch_avg_val_loss,
-                'train_main': epoch_train_main,
-                'train_aux': epoch_train_aux,
-                'val_main': epoch_val_main,
-                'val_aux': epoch_val_aux,
-                'sample_count': epoch_score_summary['sample_count'],
-                'breakout_corr': epoch_score_summary['breakout_corr'],
-                'reversion_corr': epoch_score_summary['reversion_corr'],
-                'breakout_gap': epoch_score_summary['breakout_gap'],
-                'reversion_gap': epoch_score_summary['reversion_gap'],
-                'composite_score': composite_score,
-                'direction_macro_f1': epoch_score_summary['direction_metrics']['macro_f1'],
-                'breakout_f1': epoch_score_summary['breakout_metrics']['f1'],
-                'reversion_f1': epoch_score_summary['reversion_metrics']['f1'],
-                'breakout_hard_negative_rate': epoch_score_summary['breakout_metrics']['hard_negative_rate'],
-                'reversion_hard_negative_rate': epoch_score_summary['reversion_metrics']['hard_negative_rate'],
-                'signal_frequency': epoch_score_summary['signal_frequency'],
-                'label_frequency': epoch_score_summary['label_frequency'],
-                'direction_gate_mean': epoch_score_summary['direction_gate_mean'],
-                'direction_gate_std': epoch_score_summary['direction_gate_std'],
-                'public_reversion_gate_mean': epoch_score_summary['public_reversion_gate_mean'],
-                'public_reversion_gate_std': epoch_score_summary['public_reversion_gate_std'],
-                'breakout_residual_gate_mean': epoch_score_summary['breakout_residual_gate_mean'],
-                'breakout_residual_gate_std': epoch_score_summary['breakout_residual_gate_std'],
-                'directional_floor_mean': epoch_score_summary['directional_floor_mean'],
-                'blue_over_purple_violation': epoch_score_summary['blue_over_purple_violation'],
-                'blue_over_purple_violation_rate': epoch_score_summary['blue_over_purple_violation_rate'],
-                'purple_over_blue_violation': epoch_score_summary['purple_over_blue_violation'],
-                'purple_over_blue_violation_rate': epoch_score_summary['purple_over_blue_violation_rate'],
-                'public_below_directional_violation': epoch_score_summary['public_below_directional_violation'],
-                'public_below_directional_violation_rate': epoch_score_summary['public_below_directional_violation_rate'],
-                'continuation_public_violation': epoch_score_summary['continuation_public_violation'],
-                'continuation_public_violation_rate': epoch_score_summary['continuation_public_violation_rate'],
-                'all_timeframes_composite_score': overall_all_summary['composite_score'],
-                'promotion_scoreboard': promotion_scoreboard,
-            },
+        for fold, summary in fold_summaries.items():
+            append_jsonl(
+                per_fold_metrics_path,
+                {
+                    'epoch': epoch + 1,
+                    'split_label': fold,
+                    'breakout_f1': summary['breakout_metrics']['f1'],
+                    'reversion_f1': summary['reversion_metrics']['f1'],
+                    'breakout_precision': summary['breakout_metrics']['precision'],
+                    'reversion_precision': summary['reversion_metrics']['precision'],
+                    'breakout_hard_negative_rate': summary['breakout_metrics']['hard_negative_rate'],
+                    'reversion_hard_negative_rate': summary['reversion_metrics']['hard_negative_rate'],
+                    'direction_macro_f1': summary['direction_metrics']['macro_f1'],
+                    'signal_frequency': summary['signal_frequency'],
+                    'pred_rev_mean': summary['pred_rev_mean'],
+                    'pred_rev_event_mean': summary['pred_rev_event_mean'],
+                    'directional_floor_mean': summary['directional_floor_mean'],
+                    'directional_floor_reversion_event_mean': summary['directional_floor_reversion_event_mean'],
+                    'reversion_event_count': summary['reversion_event_count'],
+                    'selected_horizon_breakout_value_mean': summary['selected_horizon_breakout_value_mean'],
+                    'selected_horizon_reversion_value_mean': summary['selected_horizon_reversion_value_mean'],
+                    'public_below_directional_violation_rate': summary['public_below_directional_violation_rate'],
+                    'composite_score': summary['composite_score'],
+                },
+            )
+
+        horizon_summary = write_horizon_summary_artifact(
+            horizon_summary_path,
+            horizon_registry,
+            global_horizon_grid,
+            getattr(args, 'config_fingerprint', None),
         )
+        best_raw_updated = False
+        best_gate_updated = False
+        review_result = None
+        if int(getattr(args, 'kill_keep_review_epoch', 0) or 0) == epoch + 1:
+            review_result = evaluate_kill_keep_review(
+                epoch_score_summary=epoch_score_summary,
+                timeframe_summaries=timeframe_summaries,
+                args=args,
+            )
+            if review_result is not None:
+                print(f"[EPOCH {epoch + 1}] kill_keep_review={review_result}")
 
         scheduler.step(epoch_avg_val_loss)
-
-        improved = (
-            composite_score > best_score + args.early_stop_min_delta or
-            (
-                abs(composite_score - best_score) <= args.early_stop_min_delta and
-                epoch_avg_val_loss < best_val_loss - args.early_stop_min_delta
-            )
+        raw_improved = should_update_checkpoint(
+            composite_score,
+            epoch_avg_val_loss,
+            best_raw_score,
+            best_raw_val_loss,
+            args.early_stop_min_delta,
         )
-
-        if improved:
-            best_score = composite_score
-            best_val_loss = epoch_avg_val_loss
+        gate_improved = score_veto['passed'] and should_update_checkpoint(
+            composite_score,
+            epoch_avg_val_loss,
+            best_gate_score,
+            best_gate_val_loss,
+            args.early_stop_min_delta,
+        )
+        if raw_improved:
+            best_raw_score = composite_score
+            best_raw_val_loss = epoch_avg_val_loss
             no_improve_epochs = 0
-            save_path = os.path.join(args.save_dir, getattr(args, 'best_name', 'khaos_kan_best.pth'))
-            torch.save({
+            best_raw_updated = True
+            raw_checkpoint_payload = {
                 'model_state_dict': kan.state_dict(),
                 'args': vars(args),
-                'dataset_manifest': final_records,
-                'val_loss': best_val_loss,
-                'best_score': best_score,
+                'dataset_manifest': base_records,
+                'runtime_manifest': runtime_records,
+                'val_loss': best_raw_val_loss,
+                'best_score': best_raw_score,
+                'selection_mode': 'best_raw',
+                'config_fingerprint': getattr(args, 'config_fingerprint', None),
+                'global_horizon_grid': global_horizon_grid,
                 'metrics': {
-                    'breakout_corr': breakout_corr,
-                    'reversion_corr': reversion_corr,
-                    'direction_macro_f1': direction_metrics['macro_f1'],
-                    'breakout_event_mean': breakout_event_mean,
-                    'reversion_event_mean': reversion_event_mean,
-                    'breakout_hard_negative_mean': breakout_hn_mean,
-                    'reversion_hard_negative_mean': reversion_hn_mean,
-                    'breakout_gap': breakout_gap,
-                    'reversion_gap': reversion_gap,
-                    'composite_score': composite_score,
-                    'processed_files': processed_files,
                     'epoch': epoch + 1,
-                    'breakout_eval': breakout_metrics,
-                    'reversion_eval': reversion_metrics,
-                    'direction_eval': epoch_score_summary['direction_metrics'],
-                    'gate_stats': {
-                        'direction_gate_mean': epoch_score_summary['direction_gate_mean'],
-                        'direction_gate_std': epoch_score_summary['direction_gate_std'],
-                        'public_reversion_gate_mean': epoch_score_summary['public_reversion_gate_mean'],
-                        'public_reversion_gate_std': epoch_score_summary['public_reversion_gate_std'],
-                        'breakout_residual_gate_mean': epoch_score_summary['breakout_residual_gate_mean'],
-                        'breakout_residual_gate_std': epoch_score_summary['breakout_residual_gate_std'],
-                        'directional_floor_mean': epoch_score_summary['directional_floor_mean'],
-                    },
-                    'constraint_stats': {
-                        key: epoch_score_summary[key]
-                        for key in CONSTRAINT_STAT_BASE_KEYS
-                    },
-                    'constraint_rates': {
-                        f'{key}_rate': epoch_score_summary[f'{key}_rate']
-                        for key in CONSTRAINT_STAT_BASE_KEYS
-                    },
-                    'score_timeframes': score_timeframes or sorted(timeframe_summaries.keys()),
-                    'aux_timeframes': aux_timeframes,
-                    'per_timeframe_metrics': {
-                        timeframe: {
-                            'composite_score': summary['composite_score'],
-                            'breakout_f1': summary['breakout_metrics']['f1'],
-                            'reversion_f1': summary['reversion_metrics']['f1'],
-                            'direction_macro_f1': summary['direction_metrics']['macro_f1'],
-                        }
-                        for timeframe, summary in timeframe_summaries.items()
-                    },
-                    'all_timeframes_composite_score': overall_all_summary['composite_score'],
+                    'overall_summary': epoch_score_summary,
+                    'timeframe_summaries': timeframe_summaries,
+                    'fold_summaries': fold_summaries,
+                    'recent_score_components': recent_score_components,
+                    'score_veto': score_veto,
+                    'horizon_summary': horizon_summary,
                 },
                 'feature_names': PHYSICS_FEATURE_NAMES,
                 'env': {
                     'torch': torch.__version__,
                     'cuda': torch.version.cuda if torch.cuda.is_available() else None,
-                    'device': str(device)
-                }
-            }, save_path)
+                    'device': str(device),
+                },
+            }
+            torch.save(raw_checkpoint_payload, best_raw_path)
+            torch.save(raw_checkpoint_payload, os.path.join(args.save_dir, getattr(args, 'best_name', 'khaos_kan_best.pth')))
         else:
             no_improve_epochs += 1
-            print(
-                f"[EPOCH {epoch+1} SUMMARY] 未超过最优，连续未改进轮数: "
-                f"{no_improve_epochs}/{args.early_stop_patience}"
+            print(f"[EPOCH {epoch + 1}] no improvement {no_improve_epochs}/{args.early_stop_patience}")
+
+        if gate_improved:
+            best_gate_score = composite_score
+            best_gate_val_loss = epoch_avg_val_loss
+            best_gate_updated = True
+            torch.save(
+                {
+                    'model_state_dict': kan.state_dict(),
+                    'args': vars(args),
+                    'dataset_manifest': base_records,
+                    'runtime_manifest': runtime_records,
+                    'val_loss': best_gate_val_loss,
+                    'best_score': best_gate_score,
+                    'selection_mode': 'best_gate',
+                    'config_fingerprint': getattr(args, 'config_fingerprint', None),
+                    'global_horizon_grid': global_horizon_grid,
+                    'metrics': {
+                        'epoch': epoch + 1,
+                        'overall_summary': epoch_score_summary,
+                        'timeframe_summaries': timeframe_summaries,
+                        'fold_summaries': fold_summaries,
+                        'recent_score_components': recent_score_components,
+                        'score_veto': score_veto,
+                        'horizon_summary': horizon_summary,
+                    },
+                    'feature_names': PHYSICS_FEATURE_NAMES,
+                    'env': {
+                        'torch': torch.__version__,
+                        'cuda': torch.version.cuda if torch.cuda.is_available() else None,
+                        'device': str(device),
+                    },
+                },
+                best_gate_path,
             )
 
-        latest_metrics = {
-            'breakout_corr': breakout_corr,
-            'reversion_corr': reversion_corr,
-            'direction_macro_f1': direction_metrics['macro_f1'],
-            'breakout_gap': breakout_gap,
-            'reversion_gap': reversion_gap,
-            'composite_score': composite_score,
-            'val_loss': epoch_avg_val_loss,
-            'processed_files': processed_files,
+        epoch_metric_payload = {
             'epoch': epoch + 1,
-            'breakout_eval': breakout_metrics,
-            'reversion_eval': reversion_metrics,
-            'direction_eval': epoch_score_summary['direction_metrics'],
-            'gate_stats': {
-                'direction_gate_mean': epoch_score_summary['direction_gate_mean'],
-                'direction_gate_std': epoch_score_summary['direction_gate_std'],
-                'public_reversion_gate_mean': epoch_score_summary['public_reversion_gate_mean'],
-                'public_reversion_gate_std': epoch_score_summary['public_reversion_gate_std'],
-                'breakout_residual_gate_mean': epoch_score_summary['breakout_residual_gate_mean'],
-                'breakout_residual_gate_std': epoch_score_summary['breakout_residual_gate_std'],
-                'directional_floor_mean': epoch_score_summary['directional_floor_mean'],
-            },
-            'constraint_stats': {
-                key: epoch_score_summary[key]
-                for key in CONSTRAINT_STAT_BASE_KEYS
-            },
-            'constraint_rates': {
-                f'{key}_rate': epoch_score_summary[f'{key}_rate']
-                for key in CONSTRAINT_STAT_BASE_KEYS
-            },
+            'processed_jobs': processed_jobs,
+            'constraint_profile': getattr(args, 'constraint_profile', 'default'),
+            'arch_version': getattr(args, 'arch_version', 'iterA2_base'),
+            'dataset_profile': getattr(args, 'dataset_profile', 'iterA2'),
+            'loss_profile': getattr(args, 'loss_profile', 'default'),
+            'score_profile': score_profile,
+            'split_scheme': getattr(args, 'split_scheme', 'time'),
             'score_timeframes': score_timeframes or sorted(timeframe_summaries.keys()),
             'aux_timeframes': aux_timeframes,
-            'per_timeframe_metrics': {
-                timeframe: {
-                    'composite_score': summary['composite_score'],
-                    'breakout_f1': summary['breakout_metrics']['f1'],
-                    'reversion_f1': summary['reversion_metrics']['f1'],
-                    'direction_macro_f1': summary['direction_metrics']['macro_f1'],
-                }
-                for timeframe, summary in timeframe_summaries.items()
-            },
-            'all_timeframes_composite_score': overall_all_summary['composite_score'],
+            'train_loss': epoch_avg_loss,
+            'val_loss': epoch_avg_val_loss,
+            'train_main': epoch_train_main,
+            'train_aux': epoch_train_aux,
+            'effective_train_samples_by_timeframe': dict(sorted(epoch_effective_train_samples_by_timeframe.items())),
+            'horizon_family_guard_passed': horizon_family_guard_passed,
+            'best_raw_updated': best_raw_updated,
+            'best_gate_updated': best_gate_updated,
+            'sample_count': epoch_score_summary['sample_count'],
+            'breakout_f1': epoch_score_summary['breakout_metrics']['f1'],
+            'reversion_f1': epoch_score_summary['reversion_metrics']['f1'],
+            'breakout_precision': epoch_score_summary['breakout_metrics']['precision'],
+            'reversion_precision': epoch_score_summary['reversion_metrics']['precision'],
+            'breakout_hard_negative_rate': epoch_score_summary['breakout_metrics']['hard_negative_rate'],
+            'reversion_hard_negative_rate': epoch_score_summary['reversion_metrics']['hard_negative_rate'],
+            'direction_macro_f1': epoch_score_summary['direction_metrics']['macro_f1'],
+            'signal_frequency': epoch_score_summary['signal_frequency'],
+            'pred_rev_mean': epoch_score_summary['pred_rev_mean'],
+            'pred_rev_event_mean': epoch_score_summary['pred_rev_event_mean'],
+            'directional_floor_mean': epoch_score_summary['directional_floor_mean'],
+            'directional_floor_reversion_event_mean': epoch_score_summary['directional_floor_reversion_event_mean'],
+            'reversion_event_count': epoch_score_summary['reversion_event_count'],
+            'public_below_directional_violation_rate': epoch_score_summary['public_below_directional_violation_rate'],
+            'selected_horizon_breakout_value_mean': epoch_score_summary['selected_horizon_breakout_value_mean'],
+            'selected_horizon_reversion_value_mean': epoch_score_summary['selected_horizon_reversion_value_mean'],
+            'horizon_entropy_breakout_mean': epoch_score_summary['horizon_entropy_breakout_mean'],
+            'horizon_entropy_reversion_mean': epoch_score_summary['horizon_entropy_reversion_mean'],
+            'composite_score': composite_score,
+            'all_timeframes_composite_score': overall_summary['composite_score'],
+            'recent_score_components': recent_score_components,
+            'score_veto': score_veto,
+            'promotion_scoreboard': promotion_scoreboard,
         }
+        if review_result is not None:
+            epoch_metric_payload['kill_keep_review'] = review_result
+        append_jsonl(epoch_metrics_path, epoch_metric_payload)
+
+        latest_metrics = {
+            'epoch': epoch + 1,
+            'composite_score': composite_score,
+            'val_loss': epoch_avg_val_loss,
+            'overall_summary': epoch_score_summary,
+            'timeframe_summaries': timeframe_summaries,
+            'fold_summaries': fold_summaries,
+            'recent_score_components': recent_score_components,
+            'score_veto': score_veto,
+            'horizon_summary': horizon_summary,
+            'effective_train_samples_by_timeframe': dict(sorted(epoch_effective_train_samples_by_timeframe.items())),
+            'horizon_family_guard_passed': horizon_family_guard_passed,
+            'best_raw_updated': best_raw_updated,
+            'best_gate_updated': best_gate_updated,
+        }
+        if review_result is not None:
+            latest_metrics['kill_keep_review'] = review_result
         save_resume_checkpoint(
             resume_path=resume_path,
             kan=kan,
@@ -1411,35 +2243,71 @@ def train(args):
             scaler=scaler,
             args=args,
             epoch=epoch + 1,
-            best_val_loss=best_val_loss,
-            best_score=best_score,
+            best_val_loss=best_raw_val_loss,
+            best_score=best_raw_score,
+            best_gate_val_loss=best_gate_val_loss,
+            best_gate_score=best_gate_score,
             no_improve_epochs=no_improve_epochs,
             latest_metrics=latest_metrics,
             device=device,
-            completed=False
+            completed=False,
         )
-
+        if review_result is not None and not review_result['passed']:
+            print(f"[KILL/KEEP] Review failed at epoch {epoch + 1}; stopping run for label/constraint rebuild.")
+            break
         if no_improve_epochs >= args.early_stop_patience:
             print(
-                f"[EARLY STOP] 连续 {args.early_stop_patience} 个 epoch 未达到最小改进 "
-                f"{args.early_stop_min_delta:.4f}，提前停止。"
+                f"[EARLY STOP] No improvement for {args.early_stop_patience} epochs "
+                f"(delta={args.early_stop_min_delta:.4f})."
             )
             break
 
-    # Save Final Model
-    save_path = os.path.join(args.save_dir, getattr(args, 'final_name', 'khaos_kan_model_final.pth'))
-    torch.save({
-        'model_state_dict': kan.state_dict(),
-        'args': vars(args),
-        'dataset_manifest': final_records,
-        'feature_names': PHYSICS_FEATURE_NAMES,
-        'latest_metrics': latest_metrics,
-        'env': {
-            'torch': torch.__version__,
-            'cuda': torch.version.cuda if torch.cuda.is_available() else None,
-            'device': str(device)
-        }
-    }, save_path)
+    best_path = best_raw_path if os.path.exists(best_raw_path) else os.path.join(
+        args.save_dir,
+        getattr(args, 'best_name', 'khaos_kan_best.pth'),
+    )
+    if os.path.exists(best_path):
+        try:
+            checkpoint = torch.load(best_path, map_location=device, weights_only=False)
+            kan.load_state_dict(checkpoint['model_state_dict'])
+        except Exception as exc:
+            print(f"[FINAL HOLDOUT] Failed to load best checkpoint: {exc}")
+
+    final_holdout_metrics = evaluate_final_holdout(
+        args=args,
+        base_records=base_records,
+        kan=kan,
+        criterion=criterion,
+        device=device,
+        global_horizon_grid=global_horizon_grid,
+        use_debug_metrics=use_debug_metrics,
+        use_direction_metrics=use_direction_metrics,
+    )
+    if final_holdout_metrics is not None:
+        with open(final_holdout_metrics_path, 'w', encoding='utf-8') as handle:
+            json.dump(make_json_safe(final_holdout_metrics), handle, ensure_ascii=False, indent=2)
+        if latest_metrics is None:
+            latest_metrics = {}
+        latest_metrics['final_holdout'] = final_holdout_metrics
+
+    torch.save(
+        {
+            'model_state_dict': kan.state_dict(),
+            'args': vars(args),
+            'dataset_manifest': base_records,
+            'runtime_manifest': runtime_records,
+            'feature_names': PHYSICS_FEATURE_NAMES,
+            'latest_metrics': latest_metrics,
+            'config_fingerprint': getattr(args, 'config_fingerprint', None),
+            'global_horizon_grid': global_horizon_grid,
+            'env': {
+                'torch': torch.__version__,
+                'cuda': torch.version.cuda if torch.cuda.is_available() else None,
+                'device': str(device),
+            },
+        },
+        os.path.join(args.save_dir, getattr(args, 'final_name', 'khaos_kan_model_final.pth')),
+    )
     save_resume_checkpoint(
         resume_path=resume_path,
         kan=kan,
@@ -1448,37 +2316,52 @@ def train(args):
         scaler=scaler,
         args=args,
         epoch=args.epochs,
-        best_val_loss=best_val_loss,
-        best_score=best_score,
+        best_val_loss=best_raw_val_loss,
+        best_score=best_raw_score,
+        best_gate_val_loss=best_gate_val_loss,
+        best_gate_score=best_gate_score,
         no_improve_epochs=no_improve_epochs,
         latest_metrics=latest_metrics,
         device=device,
-        completed=True
+        completed=True,
     )
-    print(f"\nTraining Complete. Final model saved to {save_path}")
+    print(f"Training complete. Final model saved to {os.path.join(args.save_dir, getattr(args, 'final_name', 'khaos_kan_model_final.pth'))}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_dir', type=str, default=r'd:\《基于物理信息增强神经网络（PI-KAN）的金融时间序列相变探测研究》\Finance\01_数据中心\03_研究数据\research_processed')
-    parser.add_argument('--save_dir', type=str, default=r'd:\《基于物理信息增强神经网络（PI-KAN）的金融时间序列相变探测研究》\Finance\02_核心代码\模型权重备份')
+    parser.add_argument('--data_dir', type=str, default='.')
+    parser.add_argument('--save_dir', type=str, default='./weights')
     parser.add_argument('--market', type=str, default='legacy_multiasset')
     parser.add_argument('--training_subdir', type=str, default=None)
     parser.add_argument('--assets', type=str, default=None)
     parser.add_argument('--timeframes', type=str, default=None)
     parser.add_argument('--split_mode', type=str, default='ratio')
+    parser.add_argument('--split_scheme', type=str, default='time')
+    parser.add_argument('--split_label', type=str, default=None)
+    parser.add_argument('--split_labels', type=str, default=None)
     parser.add_argument('--train_end', type=str, default=None)
     parser.add_argument('--val_end', type=str, default=None)
     parser.add_argument('--test_start', type=str, default=None)
     parser.add_argument('--per_timeframe_train_cap', type=str, default=None)
     parser.add_argument('--max_files', type=int, default=None)
     parser.add_argument('--best_name', type=str, default='khaos_kan_best.pth')
+    parser.add_argument('--best_raw_name', type=str, default='khaos_kan_best_raw.pth')
+    parser.add_argument('--best_gate_name', type=str, default='khaos_kan_best_gate.pth')
     parser.add_argument('--final_name', type=str, default='khaos_kan_model_final.pth')
     parser.add_argument('--resume_name', type=str, default='khaos_kan_resume.pth')
-    parser.add_argument('--epochs', type=int, default=3) 
-    parser.add_argument('--batch_size', type=int, default=256) 
+    parser.add_argument('--epoch_metrics_name', type=str, default='epoch_metrics.jsonl')
+    parser.add_argument('--per_timeframe_metrics_name', type=str, default='per_timeframe_metrics.jsonl')
+    parser.add_argument('--per_fold_metrics_name', type=str, default='per_fold_metrics.jsonl')
+    parser.add_argument('--final_holdout_metrics_name', type=str, default='final_holdout_metrics.json')
+    parser.add_argument('--horizon_summary_name', type=str, default='horizon_discovery_summary.json')
+    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--window_size', type=int, default=20)
     parser.add_argument('--horizon', type=int, default=4)
+    parser.add_argument('--horizon_search_spec', type=str, default=None)
+    parser.add_argument('--horizon_family_mode', type=str, default='legacy')
     parser.add_argument('--hidden_dim', type=int, default=64)
     parser.add_argument('--layers', type=int, default=3)
     parser.add_argument('--grid_size', type=int, default=10)
@@ -1489,8 +2372,6 @@ if __name__ == "__main__":
     parser.add_argument('--score_profile', type=str, default='default')
     parser.add_argument('--score_timeframes', type=str, default=None)
     parser.add_argument('--aux_timeframes', type=str, default=None)
-    parser.add_argument('--epoch_metrics_name', type=str, default='epoch_metrics.jsonl')
-    parser.add_argument('--per_timeframe_metrics_name', type=str, default='per_timeframe_metrics.jsonl')
     parser.add_argument('--promotion_overall_composite_threshold', type=float, default=None)
     parser.add_argument('--promotion_timeframe_composite_thresholds', type=str, default=None)
     parser.add_argument('--seed', type=int, default=42)
@@ -1503,6 +2384,23 @@ if __name__ == "__main__":
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--resume', action='store_true', default=False)
     parser.add_argument('--resume_path', type=str, default=None)
-    
-    args = parser.parse_args()
-    train(args)
+    parser.add_argument('--warm_start_weights_only', action='store_true', default=False)
+    parser.add_argument('--warm_start_path', type=str, default=None)
+    parser.add_argument('--dataset_cache_dir', type=str, default=None)
+    parser.add_argument('--disable_dataset_cache', action='store_true', default=False)
+    parser.add_argument('--skip_dataset_cache_prewarm', action='store_true', default=False)
+    parser.add_argument('--config_fingerprint', type=str, default=None)
+    parser.add_argument('--baseline_reference_dir', type=str, default=None)
+    parser.add_argument('--enforce_horizon_family_guard', action='store_true', default=False)
+    parser.add_argument('--signal_frequency_cap_ratio', type=float, default=0.70)
+    parser.add_argument('--signal_frequency_cap', type=float, default=None)
+    parser.add_argument('--public_violation_cap', type=float, default=0.20)
+    parser.add_argument('--breakout_precision_floor', type=float, default=0.0)
+    parser.add_argument('--reversion_precision_floor', type=float, default=0.0)
+    parser.add_argument('--kill_keep_review_epoch', type=int, default=0)
+    parser.add_argument('--kill_keep_public_violation_rate_max', type=float, default=1.0)
+    parser.add_argument('--kill_keep_signal_frequency_max', type=float, default=1.0)
+    parser.add_argument('--kill_keep_timeframe_60m_composite_min', type=float, default=0.0)
+    parser.add_argument('--kill_keep_horizon_entropy_min', type=float, default=0.0)
+    parser.add_argument('--kill_keep_horizon_entropy_timeframes', type=str, default=None)
+    train(parser.parse_args())

@@ -1,5 +1,0 @@
-- [x] Python 中的物理特征计算逻辑（MLE、Entropy）与 Pine Script 代理算法实现 1:1 数值对齐。
-- [x] 模型中已集成 RevIN 等自适应实例归一化机制。
-- [x] KAN 架构已添加稀疏正则化，且能够通过 `symbolic_extractor.py` 成功提取出人类可读的解析数学公式（Symbolic Formula）。
-- [x] Attention 模块成功输出注意力权重，并被用于解释和提取时序维度的延迟规则。
-- [x] 损失函数中已包含物理先验约束项，且所有标签计算不存在前视偏差。

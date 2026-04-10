@@ -159,16 +159,16 @@ class KANLinear(nn.Module):
         return regularize_activation * l1_fake + regularize_entropy * entropy
 
 class KANHead(nn.Module):
-    def __init__(self, input_dim, hidden_dim, depth, grid_size):
+    def __init__(self, input_dim, hidden_dim, depth, grid_size, output_dim=1):
         super().__init__()
         self.layers = nn.ModuleList()
         if depth <= 1:
-            self.layers.append(KANLinear(input_dim, 1, grid_size=grid_size))
+            self.layers.append(KANLinear(input_dim, output_dim, grid_size=grid_size))
         else:
             self.layers.append(KANLinear(input_dim, hidden_dim, grid_size=grid_size))
             for _ in range(max(0, depth - 2)):
                 self.layers.append(KANLinear(hidden_dim, hidden_dim, grid_size=grid_size))
-            self.layers.append(KANLinear(hidden_dim, 1, grid_size=grid_size))
+            self.layers.append(KANLinear(hidden_dim, output_dim, grid_size=grid_size))
 
     def forward(self, x):
         for idx, layer in enumerate(self.layers):
@@ -226,9 +226,13 @@ class KHAOS_KAN(nn.Module):
         grid_size=5,
         num_heads=4,
         arch_version='iterA2_base',
+        horizon_count=1,
+        horizon_family_mode='legacy',
     ):
         super().__init__()
         self.arch_version = arch_version
+        self.horizon_count = max(int(horizon_count), 1)
+        self.horizon_family_mode = str(horizon_family_mode or 'legacy')
         self.multiscale_versions = {'iterA3_multiscale', 'iterA4_multiscale', 'iterA5_multiscale'}
         self.input_norm = RevIN(num_features=input_dim, affine=True)
         self.d_model = input_dim
@@ -280,16 +284,35 @@ class KHAOS_KAN(nn.Module):
                     nn.GELU(),
                     nn.Linear(self.d_model, 1),
                 )
-            self.breakout_head = KANHead(self.d_model, hidden_dim, head_depth, grid_size)
-            self.blue_reversion_head = KANHead(self.d_model, hidden_dim, head_depth, grid_size)
-            self.purple_reversion_head = KANHead(self.d_model, hidden_dim, head_depth, grid_size)
+            self.breakout_head = KANHead(
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
+            self.blue_reversion_head = KANHead(
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
+            self.purple_reversion_head = KANHead(
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
             if self.arch_version == 'iterA5_multiscale':
-                self.public_reversion_head = KANHead(self.d_model, hidden_dim, head_depth, grid_size)
+                self.public_reversion_head = KANHead(
+                    self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+                )
             self.aux_head = nn.Sequential(
                 nn.Linear(self.d_model * 2, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, 2)
+                nn.Linear(hidden_dim, 2 * self.horizon_count)
             )
+            if self.horizon_count > 1:
+                self.breakout_horizon_head = nn.Sequential(
+                    nn.Linear(self.d_model * 3, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.horizon_count),
+                )
+                self.reversion_horizon_head = nn.Sequential(
+                    nn.Linear(self.d_model * 3, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.horizon_count),
+                )
         else:
             self.temporal_pool = nn.Linear(self.d_model, 1)
             self.breakout_local_pool = nn.Linear(self.d_model, 1)
@@ -309,15 +332,117 @@ class KHAOS_KAN(nn.Module):
                 nn.GELU(),
                 nn.Linear(self.d_model, self.d_model)
             )
-            self.breakout_head = KANHead(self.d_model, hidden_dim, head_depth, grid_size)
-            self.reversion_head = KANHead(self.d_model, hidden_dim, head_depth, grid_size)
+            self.breakout_head = KANHead(
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
+            self.reversion_head = KANHead(
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
             self.aux_head = nn.Sequential(
                 nn.Linear(self.d_model * 2, hidden_dim),
                 nn.GELU(),
-                nn.Linear(hidden_dim, 2)
+                nn.Linear(hidden_dim, 2 * self.horizon_count)
             )
+            if self.horizon_count > 1:
+                self.breakout_horizon_head = nn.Sequential(
+                    nn.Linear(self.d_model * 2, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.horizon_count),
+                )
+                self.reversion_horizon_head = nn.Sequential(
+                    nn.Linear(self.d_model * 2, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.horizon_count),
+                )
 
-    def _forward_itera2(self, x, attn_weights):
+    def _resolve_horizon_prior(self, horizon_prior, batch_size, device, dtype):
+        if self.horizon_count <= 1:
+            return torch.ones(batch_size, 2, 1, device=device, dtype=dtype)
+        if horizon_prior is None:
+            return None
+        if horizon_prior.dim() == 2:
+            horizon_prior = horizon_prior.unsqueeze(1).expand(-1, 2, -1)
+        prior = horizon_prior.to(device=device, dtype=dtype)
+        denom = prior.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        return prior / denom
+
+    def _reshape_aux_logits(self, aux_logits):
+        if self.horizon_count <= 1:
+            return aux_logits.unsqueeze(-1)
+        return aux_logits.view(aux_logits.size(0), 2, self.horizon_count)
+
+    def _aggregate_horizon_outputs(
+        self,
+        breakout_event_logits,
+        reversion_event_logits,
+        aux_logits_by_horizon,
+        breakout_horizon_logits=None,
+        reversion_horizon_logits=None,
+        horizon_prior=None,
+        family_mode=None,
+        valid_horizon_mask=None,
+        reversion_extras=None,
+    ):
+        batch_size = breakout_event_logits.size(0)
+        device = breakout_event_logits.device
+        dtype = breakout_event_logits.dtype
+        family_mode = str(family_mode or self.horizon_family_mode)
+        prior = self._resolve_horizon_prior(horizon_prior, batch_size, device, dtype)
+        valid_mask = None
+        if valid_horizon_mask is not None:
+            valid_mask = valid_horizon_mask.to(device=device, dtype=dtype)
+            if valid_mask.dim() == 1:
+                valid_mask = valid_mask.unsqueeze(0).expand(batch_size, -1)
+            valid_mask = (valid_mask > 0.5).to(dtype=dtype)
+
+        if self.horizon_count <= 1:
+            breakout_weights = torch.ones_like(breakout_event_logits)
+            reversion_weights = torch.ones_like(reversion_event_logits)
+            breakout_horizon_logits = torch.zeros_like(breakout_event_logits)
+            reversion_horizon_logits = torch.zeros_like(reversion_event_logits)
+        else:
+            if family_mode == 'single_cycle' and prior is not None:
+                breakout_weights = prior[:, 0, :]
+                reversion_weights = prior[:, 1, :]
+            else:
+                if breakout_horizon_logits is None:
+                    breakout_horizon_logits = torch.zeros_like(breakout_event_logits)
+                if reversion_horizon_logits is None:
+                    reversion_horizon_logits = torch.zeros_like(reversion_event_logits)
+                if valid_mask is not None:
+                    invalid_fill = torch.finfo(breakout_event_logits.dtype).min
+                    breakout_horizon_logits = breakout_horizon_logits.masked_fill(valid_mask <= 0.5, invalid_fill)
+                    reversion_horizon_logits = reversion_horizon_logits.masked_fill(valid_mask <= 0.5, invalid_fill)
+                breakout_weights = torch.softmax(breakout_horizon_logits, dim=-1)
+                reversion_weights = torch.softmax(reversion_horizon_logits, dim=-1)
+
+        breakout_pred = torch.sum(breakout_weights * breakout_event_logits, dim=-1, keepdim=True)
+        reversion_pred = torch.sum(reversion_weights * reversion_event_logits, dim=-1, keepdim=True)
+        aux_pred = torch.stack(
+            [
+                torch.sum(breakout_weights * aux_logits_by_horizon[:, 0, :], dim=-1),
+                torch.sum(reversion_weights * aux_logits_by_horizon[:, 1, :], dim=-1),
+            ],
+            dim=1,
+        )
+        info = {
+            'event_logits_by_horizon': torch.stack([breakout_event_logits, reversion_event_logits], dim=1),
+            'aux_logits_by_horizon': aux_logits_by_horizon,
+            'horizon_logits': torch.stack([breakout_horizon_logits, reversion_horizon_logits], dim=1),
+            'horizon_weights': torch.stack([breakout_weights, reversion_weights], dim=1),
+            'selected_horizon_breakout': breakout_weights.argmax(dim=-1).to(dtype=torch.float32),
+            'selected_horizon_reversion': reversion_weights.argmax(dim=-1).to(dtype=torch.float32),
+            'horizon_entropy_breakout': (-breakout_weights.clamp_min(1e-8).log() * breakout_weights).sum(dim=-1),
+            'horizon_entropy_reversion': (-reversion_weights.clamp_min(1e-8).log() * reversion_weights).sum(dim=-1),
+        }
+        if reversion_extras:
+            for key, value in reversion_extras.items():
+                if value is None:
+                    continue
+                info[key] = torch.sum(reversion_weights * value, dim=-1, keepdim=True)
+        return breakout_pred, reversion_pred, aux_pred, info
+
+    def _forward_itera2(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
         pool_scores = self.temporal_pool(x).squeeze(-1)
         pool_weights = torch.softmax(pool_scores, dim=1)
         pooled = torch.sum(x * pool_weights.unsqueeze(-1), dim=1)
@@ -336,17 +461,39 @@ class KHAOS_KAN(nn.Module):
         reversion_local_pooled = torch.sum(local_x * reversion_weights.unsqueeze(-1), dim=1)
         reversion_gate = torch.sigmoid(self.reversion_local_gate(torch.cat([shared_state, reversion_local_pooled], dim=1)))
         reversion_state = torch.tanh(reversion_gate * reversion_local_pooled + (1.0 - reversion_gate) * shared_state)
-        breakout_pred = self.breakout_head(breakout_state)
-        reversion_pred = self.reversion_head(reversion_state)
+        breakout_event_logits = self.breakout_head(breakout_state)
+        reversion_event_logits = self.reversion_head(reversion_state)
+        aux_logits_by_horizon = self._reshape_aux_logits(
+            self.aux_head(torch.cat([shared_state, pooled - last_state], dim=1))
+        )
+        breakout_horizon_logits = None
+        reversion_horizon_logits = None
+        if self.horizon_count > 1:
+            breakout_horizon_logits = self.breakout_horizon_head(torch.cat([shared_state, local_pooled], dim=1))
+            reversion_horizon_logits = self.reversion_horizon_head(
+                torch.cat([shared_state, reversion_local_pooled], dim=1)
+            )
+        breakout_pred, reversion_pred, aux_pred, horizon_info = self._aggregate_horizon_outputs(
+            breakout_event_logits=breakout_event_logits,
+            reversion_event_logits=reversion_event_logits,
+            aux_logits_by_horizon=aux_logits_by_horizon,
+            breakout_horizon_logits=breakout_horizon_logits,
+            reversion_horizon_logits=reversion_horizon_logits,
+            horizon_prior=horizon_prior,
+            family_mode=family_mode,
+            valid_horizon_mask=valid_horizon_mask,
+            reversion_extras={
+                'blue_score': torch.relu(reversion_event_logits),
+                'purple_score': torch.relu(reversion_event_logits),
+                'public_reversion_score': torch.relu(reversion_event_logits),
+                'directional_reversion': torch.relu(reversion_event_logits),
+                'directional_floor': torch.relu(reversion_event_logits),
+            },
+        )
         direction_gate = torch.full_like(breakout_pred, 0.5)
         public_reversion_gate = torch.zeros_like(direction_gate)
         breakout_residual_gate = torch.zeros_like(direction_gate)
-        blue_score = torch.relu(reversion_pred)
-        purple_score = torch.relu(reversion_pred)
-        directional_reversion = torch.relu(reversion_pred)
-        directional_floor = directional_reversion
         main_pred = torch.cat([breakout_pred, reversion_pred], dim=1)
-        aux_pred = self.aux_head(torch.cat([shared_state, pooled - last_state], dim=1))
         info = {
             'attn': attn_weights,
             'pool': pool_weights,
@@ -355,24 +502,25 @@ class KHAOS_KAN(nn.Module):
             'direction_gate': direction_gate,
             'public_reversion_gate': public_reversion_gate,
             'breakout_residual_gate': breakout_residual_gate,
-            'blue_score': blue_score,
-            'purple_score': purple_score,
-            'public_reversion_score': directional_reversion,
-            'directional_reversion': directional_reversion,
-            'directional_floor': directional_floor,
+            'blue_score': horizon_info['blue_score'],
+            'purple_score': horizon_info['purple_score'],
+            'public_reversion_score': horizon_info['public_reversion_score'],
+            'directional_reversion': horizon_info['directional_reversion'],
+            'directional_floor': horizon_info['directional_floor'],
             'direction_gate_mean': direction_gate.mean(),
             'direction_gate_std': direction_gate.std(unbiased=False),
             'public_reversion_gate_mean': public_reversion_gate.mean(),
             'public_reversion_gate_std': public_reversion_gate.std(unbiased=False),
             'breakout_residual_gate_mean': breakout_residual_gate.mean(),
             'breakout_residual_gate_std': breakout_residual_gate.std(unbiased=False),
-            'directional_floor_mean': directional_floor.mean(),
+            'directional_floor_mean': horizon_info['directional_floor'].mean(),
             'transition_context_score': torch.sigmoid(breakout_pred),
             'reversion_context_score': torch.sigmoid(reversion_pred),
         }
+        info.update(horizon_info)
         return main_pred, aux_pred, info
 
-    def _forward_itera3(self, x, attn_weights):
+    def _forward_itera3(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
         last_state = x[:, -1, :]
         global_state, global_weights = self.global_pool(x)
 
@@ -417,18 +565,19 @@ class KHAOS_KAN(nn.Module):
                 )
             )
             breakout_state = torch.tanh(transition_context + breakout_residual_gate * (short_state - mid_state))
-        breakout_pred = self.breakout_head(breakout_state)
-        blue_score = self.blue_reversion_head(blue_state)
-        purple_score = self.purple_reversion_head(purple_state)
-        directional_reversion = direction_gate * blue_score + (1.0 - direction_gate) * purple_score
-        directional_floor = torch.maximum(
-            directional_reversion,
-            torch.maximum(blue_score, purple_score) - 0.08,
+        breakout_event_logits = self.breakout_head(breakout_state)
+        blue_score_h = self.blue_reversion_head(blue_state)
+        purple_score_h = self.purple_reversion_head(purple_state)
+        directional_reversion_h = direction_gate * blue_score_h + (1.0 - direction_gate) * purple_score_h
+        directional_floor_h = torch.maximum(
+            directional_reversion_h,
+            torch.maximum(blue_score_h, purple_score_h) - 0.08,
         )
-        public_reversion_score = torch.maximum(blue_score, purple_score)
+        public_reversion_score_h = torch.maximum(blue_score_h, purple_score_h)
         if self.arch_version == 'iterA5_multiscale':
             public_reversion_score = self.public_reversion_head(public_reversion_state)
             
+            public_reversion_score_h = self.public_reversion_head(public_reversion_state)
         public_reversion_gate = torch.zeros_like(direction_gate)
         
         if self.arch_version in {'iterA4_multiscale', 'iterA5_multiscale'}:
@@ -447,11 +596,42 @@ class KHAOS_KAN(nn.Module):
             # 确保 reversion_pred 能够突破 max(blue, purple) 的上限限制，满足 loss.py 中的可行域约束。
             reversion_pred = directional_reversion + public_reversion_gate * torch.relu(
                 public_reversion_score - directional_reversion + 0.15
+            reversion_event_logits = (
+                public_reversion_gate * public_reversion_score_h +
+                (1.0 - public_reversion_gate) * directional_reversion_h
             )
         else:
-            reversion_pred = directional_reversion
+            reversion_event_logits = directional_reversion_h
+        aux_logits_by_horizon = self._reshape_aux_logits(
+            self.aux_head(torch.cat([shared_state, transition_context - reversion_context], dim=1))
+        )
+        breakout_horizon_logits = None
+        reversion_horizon_logits = None
+        if self.horizon_count > 1:
+            breakout_horizon_logits = self.breakout_horizon_head(
+                torch.cat([breakout_state, short_state - mid_state, last_state - shared_state], dim=1)
+            )
+            reversion_horizon_logits = self.reversion_horizon_head(
+                torch.cat([reversion_context, (short_state - mid_state).abs(), (last_state - global_state).abs()], dim=1)
+            )
+        breakout_pred, reversion_pred, aux_pred, horizon_info = self._aggregate_horizon_outputs(
+            breakout_event_logits=breakout_event_logits,
+            reversion_event_logits=reversion_event_logits,
+            aux_logits_by_horizon=aux_logits_by_horizon,
+            breakout_horizon_logits=breakout_horizon_logits,
+            reversion_horizon_logits=reversion_horizon_logits,
+            horizon_prior=horizon_prior,
+            family_mode=family_mode,
+            valid_horizon_mask=valid_horizon_mask,
+            reversion_extras={
+                'blue_score': blue_score_h,
+                'purple_score': purple_score_h,
+                'public_reversion_score': public_reversion_score_h,
+                'directional_reversion': directional_reversion_h,
+                'directional_floor': directional_floor_h,
+            },
+        )
         main_pred = torch.cat([breakout_pred, reversion_pred], dim=1)
-        aux_pred = self.aux_head(torch.cat([shared_state, transition_context - reversion_context], dim=1))
         info = {
             'attn': attn_weights,
             'global_pool': global_weights,
@@ -466,24 +646,34 @@ class KHAOS_KAN(nn.Module):
             'direction_gate': direction_gate,
             'public_reversion_gate': public_reversion_gate,
             'breakout_residual_gate': breakout_residual_gate,
-            'blue_score': blue_score,
-            'purple_score': purple_score,
-            'public_reversion_score': public_reversion_score,
-            'directional_reversion': directional_reversion,
-            'directional_floor': directional_floor,
+            'blue_score': horizon_info['blue_score'],
+            'purple_score': horizon_info['purple_score'],
+            'public_reversion_score': horizon_info['public_reversion_score'],
+            'directional_reversion': horizon_info['directional_reversion'],
+            'directional_floor': horizon_info['directional_floor'],
             'direction_gate_mean': direction_gate.mean(),
             'direction_gate_std': direction_gate.std(unbiased=False),
             'public_reversion_gate_mean': public_reversion_gate.mean(),
             'public_reversion_gate_std': public_reversion_gate.std(unbiased=False),
             'breakout_residual_gate_mean': breakout_residual_gate.mean(),
             'breakout_residual_gate_std': breakout_residual_gate.std(unbiased=False),
-            'directional_floor_mean': directional_floor.mean(),
+            'directional_floor_mean': horizon_info['directional_floor'].mean(),
             'transition_context_score': torch.sigmoid(self.transition_probe(transition_context)),
             'reversion_context_score': torch.sigmoid(self.reversion_probe(reversion_context)),
         }
+        info.update(horizon_info)
         return main_pred, aux_pred, info
 
-    def forward(self, x, return_attn_weights=False, return_aux=False, return_debug=False):
+    def forward(
+        self,
+        x,
+        return_attn_weights=False,
+        return_aux=False,
+        return_debug=False,
+        horizon_prior=None,
+        family_mode=None,
+        valid_horizon_mask=None,
+    ):
         x = self.input_norm(x, mode='norm')
         x = self.proj(x)
         if return_attn_weights:
@@ -492,9 +682,21 @@ class KHAOS_KAN(nn.Module):
             x = self.attention_block(x)
             attn_weights = None
         if self.arch_version in self.multiscale_versions:
-            main_pred, aux_pred, info = self._forward_itera3(x, attn_weights)
+            main_pred, aux_pred, info = self._forward_itera3(
+                x,
+                attn_weights,
+                horizon_prior=horizon_prior,
+                family_mode=family_mode,
+                valid_horizon_mask=valid_horizon_mask,
+            )
         else:
-            main_pred, aux_pred, info = self._forward_itera2(x, attn_weights)
+            main_pred, aux_pred, info = self._forward_itera2(
+                x,
+                attn_weights,
+                horizon_prior=horizon_prior,
+                family_mode=family_mode,
+                valid_horizon_mask=valid_horizon_mask,
+            )
         if return_attn_weights or return_debug:
             if return_aux:
                 return main_pred, aux_pred, info
