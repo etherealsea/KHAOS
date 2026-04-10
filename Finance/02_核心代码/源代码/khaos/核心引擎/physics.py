@@ -97,6 +97,9 @@ def ema_smooth(x, window):
         ema[:, t] = alpha * x[:, t] + (1 - alpha) * ema[:, t - 1]
     return ema
 
+# 注意：这里的 MLE 代表 Maximum Lyapunov Exponent (最大李雅普诺夫指数)，
+# 用于衡量系统对初始条件的敏感性（混沌发散度）。
+# 切勿与 Maximum Likelihood Estimation (最大似然估计) 混淆。
 def calculate_lyapunov_proxy(log_returns, window=LOCAL_PHYSICS_WINDOW):
     eps = 1e-8
     r_t_minus_1 = torch.roll(log_returns, shifts=1, dims=1)
