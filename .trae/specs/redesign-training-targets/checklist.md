@@ -1,5 +1,0 @@
-- [x] `data_loader.py` 中的 `self.targets` 已更新为 `[N, 2]` 的二维数组，分别代表波动率扩张率和均值回归强度。
-- [x] `train.py` 中的 `KHAOS_KAN` 实例化时，`output_dim` 已正确修改为 `2`。
-- [x] `loss.py` 中的 `PhysicsLoss` 能够正确解包二维预测值，并对 `pred[..., 0]` 和 `pred[..., 1]` 施加各自独立的物理正则化惩罚。
-- [x] `symbolic_extractor.py` 已更新其内部维度参数（如 `output_dim=2`），并且可以正常加载多输出维度的模型权重。
-- [x] 在终端运行 `python Finance/02_核心代码/源代码/khaos/模型训练/train.py --test_mode` 成功完成了一个 epoch 的测试，没有发生维度不匹配的报错。

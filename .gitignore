@@ -19,7 +19,9 @@ env/
 logs/
 train_log.txt
 
-# Local collaboration caches
+# Local AI/editor metadata
+.trae/
+Finance/.trae/
 .context_db/
 Finance/.context_db/
 
@@ -32,7 +34,8 @@ Finance/.context_db/
 Finance/02_核心代码/模型权重备份/
 Finance/models/
 
-# Large raw and processed datasets
+# Dataset caches and large local data
+**/dataset_cache/
 Finance/01_数据中心/01_原始数据/
 Finance/01_数据中心/03_研究数据/
 Finance/02_核心代码/旧代码归档/data_legacy/raw/
