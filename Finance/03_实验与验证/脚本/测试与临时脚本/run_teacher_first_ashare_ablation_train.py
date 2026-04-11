@@ -580,14 +580,14 @@ def run_training_phase(
             max_files=len(phase_assets) * len(spec['timeframes']),
         )
     else:
-        phase_assets = selected_assets[:2]
+        phase_assets = selected_assets
         namespace = build_namespace(
             experiment_name=experiment_name,
             save_dir=WEIGHT_ROOT / experiment_name,
             assets=phase_assets,
-            epochs=2,
+            epochs=spec['epochs'],
             batch_size=256,
-            fast_full=True,
+            fast_full=False,
             per_timeframe_train_cap=spec['per_timeframe_train_cap'],
             constraint_profile=constraint_profile,
             resume=resume,
@@ -598,6 +598,7 @@ def run_training_phase(
     Path(namespace.save_dir).mkdir(parents=True, exist_ok=True)
 
     log_mode = 'a' if log_path.exists() else 'w'
+    print(f"Log path is {log_path}")
     with log_path.open(log_mode, encoding='utf-8', buffering=1) as log_file:
         log_file.write(f'\nteacher_first_experiment_start={experiment_name}\n')
         log_file.write(f'teacher_first_phase_start={phase}\n')
@@ -1038,4 +1039,5 @@ def main():
 
 
 if __name__ == '__main__':
+    print("Starting script...")
     main()
