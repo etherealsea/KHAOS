@@ -58,11 +58,17 @@ BASE_CAPS = {'15m': 4096, '60m': 5120, '240m': 3072, '1d': 4096}
 CAPS_WITH_5M = {'5m': 2048, '15m': 4096, '60m': 6144, '240m': 3072, '1d': 4096}
 SHORT_T_CAPS = {'5m': 4096, '15m': 6144, '60m': 6144, '240m': 2048, '1d': 1536}
 SHORT_T_BALANCED_CAPS = {'5m': 3072, '15m': 6144, '60m': 6144, '240m': 3072, '1d': 2048}
+SHORT_T_DUAL_PRECISION_CAPS = {'5m': 3072, '15m': 6144, '60m': 2048, '240m': 4096, '1d': 4096}
+SHORT_T_DISCOVERY_CAPS = {'5m': 3072, '15m': 6144, '60m': 2560, '240m': 4096, '1d': 4096}
+SHORT_T_DISCOVERY_SHORT_BIAS_CAPS = {'5m': 1024, '15m': 7168, '60m': 3072, '240m': 1536, '1d': 1024}
 
 SMOKE_CAPS_BASE = {'15m': 1024, '60m': 1024, '240m': 512, '1d': 512}
 SMOKE_CAPS_WITH_5M = {'5m': 512, '15m': 1024, '60m': 1024, '240m': 512, '1d': 512}
 SMOKE_CAPS_SHORT_T = {'5m': 1024, '15m': 1536, '60m': 1536, '240m': 384, '1d': 256}
 SMOKE_CAPS_SHORT_T_BALANCED = {'5m': 768, '15m': 1536, '60m': 1536, '240m': 512, '1d': 384}
+SMOKE_CAPS_SHORT_T_DUAL_PRECISION = {'5m': 768, '15m': 1536, '60m': 512, '240m': 1024, '1d': 1024}
+SMOKE_CAPS_SHORT_T_DISCOVERY = {'5m': 768, '15m': 1536, '60m': 640, '240m': 1024, '1d': 1024}
+SMOKE_CAPS_SHORT_T_DISCOVERY_SHORT_BIAS = {'5m': 256, '15m': 1792, '60m': 768, '240m': 384, '1d': 256}
 
 SMOKE_GATE_THRESHOLDS = {
     'composite_score': 0.34,
@@ -88,8 +94,8 @@ FORMAL_SUCCESS_THRESHOLDS = {
     'baseline_composite_margin': 0.005,
 }
 
-MAINLINE_SMOKE_ORDER = ['iterA4_refresh', 'shortT_balanced_v1', 'shortT_balanced_v2']
-MAINLINE_CANDIDATES = ['shortT_balanced_v1', 'shortT_balanced_v2']
+MAINLINE_SMOKE_ORDER = ['iterA4_refresh', 'shortT_balanced_v3', 'shortT_balanced_v1', 'shortT_balanced_v2']
+MAINLINE_CANDIDATES = ['shortT_balanced_v3', 'shortT_balanced_v1', 'shortT_balanced_v2']
 
 EXPERIMENT_SPECS = {
     'iterA4_baseline': {
@@ -185,6 +191,21 @@ EXPERIMENT_SPECS = {
         'per_timeframe_train_cap': SHORT_T_BALANCED_CAPS,
         'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_BALANCED,
     },
+    'shortT_balanced_v3': {
+        'timeframes': WITH_5M_TIMEFRAMES,
+        'arch_version': 'iterA4_multiscale',
+        'dataset_profile': 'shortT_balanced_v2',
+        'loss_profile': 'shortT_balanced_v2',
+        'score_profile': 'short_t_balanced_guarded',
+        'score_timeframes': ['15m', '60m', '240m', '1d'],
+        'aux_timeframes': ['5m'],
+        'constraint_profile': 'teacher_feasible_v1',
+        'epochs': 20,
+        'early_stop_patience': 5,
+        'per_timeframe_train_cap': SHORT_T_BALANCED_CAPS,
+        'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_BALANCED,
+        'baseline_reference_dir': str(WEIGHT_ROOT / 'shortT_balanced_v2'),
+    },
     'shortT_precision_v1': {
         'timeframes': WITH_5M_TIMEFRAMES,
         'arch_version': 'iterA4_multiscale',
@@ -199,6 +220,104 @@ EXPERIMENT_SPECS = {
         'per_timeframe_train_cap': SHORT_T_BALANCED_CAPS,
         'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_BALANCED,
         'warm_start_from': 'shortT_balanced_v1',
+    },
+    'shortT_dual_precision_v1': {
+        'timeframes': WITH_5M_TIMEFRAMES,
+        'arch_version': 'iterA4_multiscale',
+        'dataset_profile': 'shortT_precision_v2',
+        'loss_profile': 'shortT_precision_v2',
+        'score_profile': 'short_t_precision_focus',
+        'score_timeframes': ['15m', '60m', '240m', '1d'],
+        'aux_timeframes': ['5m'],
+        'constraint_profile': 'teacher_feasible_precision_v1',
+        'epochs': 20,
+        'early_stop_patience': 5,
+        'per_timeframe_train_cap': SHORT_T_DUAL_PRECISION_CAPS,
+        'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_DUAL_PRECISION,
+        'kill_keep_signal_frequency_max': 0.37,
+        'kill_keep_public_violation_rate_max': 0.10,
+        'kill_keep_timeframe_60m_composite_min': 0.38,
+        'warm_start_weights_only': False,
+        'warm_start_path': None,
+        'allow_resume': False,
+        'baseline_reference_dir': str(WEIGHT_ROOT / 'shortT_balanced_v3'),
+        'promotion_overall_composite_threshold': None,
+        'promotion_timeframe_composite_thresholds': None,
+    },
+    'shortT_discovery_v1': {
+        'timeframes': WITH_5M_TIMEFRAMES,
+        'arch_version': 'iterA4_multiscale',
+        'dataset_profile': 'shortT_discovery_v1',
+        'loss_profile': 'shortT_discovery_v1',
+        'score_profile': 'short_t_discovery_focus',
+        'score_timeframes': ['15m', '60m', '240m', '1d'],
+        'aux_timeframes': ['5m'],
+        'constraint_profile': 'teacher_feasible_discovery_v1',
+        'epochs': 20,
+        'early_stop_patience': 5,
+        'per_timeframe_train_cap': SHORT_T_DISCOVERY_CAPS,
+        'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_DISCOVERY,
+        'kill_keep_signal_frequency_max': 0.40,
+        'kill_keep_public_violation_rate_max': 0.14,
+        'kill_keep_timeframe_60m_composite_min': 0.36,
+        'kill_keep_breakout_signal_space_min': 0.95,
+        'kill_keep_reversion_signal_space_min': 0.70,
+        'warm_start_weights_only': False,
+        'warm_start_path': None,
+        'allow_resume': False,
+        'baseline_reference_dir': str(WEIGHT_ROOT / 'shortT_dual_precision_v1'),
+        'promotion_overall_composite_threshold': None,
+        'promotion_timeframe_composite_thresholds': None,
+    },
+    'shortT_discovery_guarded_v1': {
+        'timeframes': WITH_5M_TIMEFRAMES,
+        'arch_version': 'iterA4_multiscale',
+        'dataset_profile': 'shortT_discovery_guarded_v1',
+        'loss_profile': 'shortT_discovery_guarded_v1',
+        'score_profile': 'short_t_discovery_guarded_focus',
+        'score_timeframes': ['15m', '60m', '240m', '1d'],
+        'aux_timeframes': ['5m'],
+        'constraint_profile': 'teacher_feasible_discovery_v1',
+        'epochs': 20,
+        'early_stop_patience': 5,
+        'per_timeframe_train_cap': SHORT_T_DISCOVERY_CAPS,
+        'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_DISCOVERY,
+        'kill_keep_signal_frequency_max': 0.36,
+        'kill_keep_public_violation_rate_max': 0.12,
+        'kill_keep_timeframe_60m_composite_min': 0.34,
+        'kill_keep_breakout_signal_space_min': 0.88,
+        'kill_keep_reversion_signal_space_min': 0.64,
+        'warm_start_weights_only': False,
+        'warm_start_path': None,
+        'allow_resume': False,
+        'baseline_reference_dir': str(WEIGHT_ROOT / 'shortT_discovery_v1'),
+        'promotion_overall_composite_threshold': None,
+        'promotion_timeframe_composite_thresholds': None,
+    },
+    'shortT_discovery_guarded_v2': {
+        'timeframes': WITH_5M_TIMEFRAMES,
+        'arch_version': 'iterA4_multiscale',
+        'dataset_profile': 'shortT_discovery_guarded_v2',
+        'loss_profile': 'shortT_discovery_guarded_v2',
+        'score_profile': 'short_t_discovery_guarded_focus',
+        'score_timeframes': ['15m', '60m'],
+        'aux_timeframes': ['5m', '240m', '1d'],
+        'constraint_profile': 'teacher_feasible_discovery_v1',
+        'epochs': 20,
+        'early_stop_patience': 5,
+        'per_timeframe_train_cap': SHORT_T_DISCOVERY_SHORT_BIAS_CAPS,
+        'smoke_per_timeframe_train_cap': SMOKE_CAPS_SHORT_T_DISCOVERY_SHORT_BIAS,
+        'kill_keep_signal_frequency_max': 0.34,
+        'kill_keep_public_violation_rate_max': 0.14,
+        'kill_keep_timeframe_60m_composite_min': 0.33,
+        'kill_keep_breakout_signal_space_min': 0.86,
+        'kill_keep_reversion_signal_space_min': 0.62,
+        'warm_start_weights_only': False,
+        'warm_start_path': None,
+        'allow_resume': False,
+        'baseline_reference_dir': str(WEIGHT_ROOT / 'shortT_discovery_guarded_v1'),
+        'promotion_overall_composite_threshold': None,
+        'promotion_timeframe_composite_thresholds': None,
     },
     'horizon_single_precision_v1': {
         'timeframes': WITH_5M_TIMEFRAMES,
@@ -457,12 +576,14 @@ def build_namespace(
 ):
     spec = EXPERIMENT_SPECS[experiment_name]
     resolved_constraint_profile = spec.get('constraint_profile', constraint_profile)
-    resolved_resume = resume
+    resolved_resume = bool(resume and spec.get('allow_resume', True))
     resolved_resume_path = None
     resolved_warm_start_weights_only = bool(spec.get('warm_start_weights_only', False))
     resolved_warm_start_path = spec.get('warm_start_path')
     warm_start_from = spec.get('warm_start_from')
     resolved_baseline_reference_dir = spec.get('baseline_reference_dir')
+    if not resolved_warm_start_path:
+        resolved_warm_start_path = None
     if warm_start_from:
         warm_start_best = WEIGHT_ROOT / warm_start_from / f'{warm_start_from}_best.pth'
         if warm_start_best.exists():
@@ -470,6 +591,22 @@ def build_namespace(
             resolved_warm_start_path = str(warm_start_best)
             if resolved_baseline_reference_dir is None:
                 resolved_baseline_reference_dir = str(WEIGHT_ROOT / warm_start_from)
+    resolved_promotion_overall_threshold = (
+        spec['promotion_overall_composite_threshold']
+        if 'promotion_overall_composite_threshold' in spec
+        else PROMOTION_THRESHOLDS['overall_model_composite']
+    )
+    resolved_promotion_timeframe_thresholds = spec.get('promotion_timeframe_composite_thresholds')
+    if 'promotion_timeframe_composite_thresholds' not in spec:
+        resolved_promotion_timeframe_thresholds = ','.join(
+            f'{tf}={threshold}'
+            for tf, threshold in PROMOTION_THRESHOLDS['timeframe_composite'].items()
+        )
+    elif isinstance(resolved_promotion_timeframe_thresholds, dict):
+        resolved_promotion_timeframe_thresholds = ','.join(
+            f'{tf}={threshold}'
+            for tf, threshold in resolved_promotion_timeframe_thresholds.items()
+        )
     return argparse.Namespace(
         data_dir=str(DATA_DIR),
         save_dir=str(save_dir),
@@ -532,13 +669,12 @@ def build_namespace(
         kill_keep_public_violation_rate_max=spec.get('kill_keep_public_violation_rate_max', 1.0),
         kill_keep_signal_frequency_max=spec.get('kill_keep_signal_frequency_max', 1.0),
         kill_keep_timeframe_60m_composite_min=spec.get('kill_keep_timeframe_60m_composite_min', 0.0),
+        kill_keep_breakout_signal_space_min=spec.get('kill_keep_breakout_signal_space_min', 0.0),
+        kill_keep_reversion_signal_space_min=spec.get('kill_keep_reversion_signal_space_min', 0.0),
         kill_keep_horizon_entropy_min=spec.get('kill_keep_horizon_entropy_min', 0.0),
         kill_keep_horizon_entropy_timeframes=spec.get('kill_keep_horizon_entropy_timeframes'),
-        promotion_overall_composite_threshold=PROMOTION_THRESHOLDS['overall_model_composite'],
-        promotion_timeframe_composite_thresholds=','.join(
-            f'{tf}={threshold}'
-            for tf, threshold in PROMOTION_THRESHOLDS['timeframe_composite'].items()
-        ),
+        promotion_overall_composite_threshold=resolved_promotion_overall_threshold,
+        promotion_timeframe_composite_thresholds=resolved_promotion_timeframe_thresholds,
         per_timeframe_train_cap=per_timeframe_train_cap,
         max_files=max_files,
     )
@@ -973,7 +1109,7 @@ def run_mainline_pipeline(args):
 
         write_json(PIPELINE_DIR / 'mainline_20260407_summary.json', summary)
 
-    summary['status'] = 'failed_after_shortT_balanced_v2'
+    summary['status'] = f"failed_after_{MAINLINE_CANDIDATES[-1]}"
     summary['completed_at'] = datetime.now().isoformat()
     write_json(PIPELINE_DIR / 'mainline_20260407_summary.json', summary)
     return summary

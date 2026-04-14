@@ -160,6 +160,94 @@ LOSS_WEIGHT_PRESETS = {
         'signal_calibration': 0.16,
         'horizon_margin': 0.24,
     },
+    'shortT_precision_v2': {
+        'main': 1.0,
+        'aux': 0.34,
+        'rank': 0.26,
+        'breakout_event_gap': 0.36,
+        'reversion_event_gap': 0.40,
+        'p3': 0.10,
+        'p4': 0.10,
+        'p6': 0.12,
+        'p7': 0.15,
+        'breakout_hard_negative': 0.48,
+        'reversion_hard_negative': 0.56,
+        'direction_consistency': 0.24,
+        'continuation_suppression': 0.28,
+        'horizon_event': 0.42,
+        'horizon_aux': 0.22,
+        'horizon_align': 0.34,
+        'horizon_hard_negative': 0.42,
+        'horizon_entropy': 0.06,
+        'signal_calibration': 0.20,
+        'horizon_margin': 0.24,
+    },
+    'shortT_discovery_v1': {
+        'main': 1.0,
+        'aux': 0.46,
+        'rank': 0.32,
+        'breakout_event_gap': 0.18,
+        'reversion_event_gap': 0.20,
+        'p3': 0.08,
+        'p4': 0.08,
+        'p6': 0.10,
+        'p7': 0.12,
+        'breakout_hard_negative': 0.18,
+        'reversion_hard_negative': 0.22,
+        'direction_consistency': 0.16,
+        'continuation_suppression': 0.18,
+        'horizon_event': 0.36,
+        'horizon_aux': 0.26,
+        'horizon_align': 0.26,
+        'horizon_hard_negative': 0.24,
+        'horizon_entropy': 0.04,
+        'signal_calibration': 0.18,
+        'horizon_margin': 0.20,
+    },
+    'shortT_discovery_guarded_v1': {
+        'main': 1.0,
+        'aux': 0.40,
+        'rank': 0.28,
+        'breakout_event_gap': 0.28,
+        'reversion_event_gap': 0.34,
+        'p3': 0.08,
+        'p4': 0.08,
+        'p6': 0.10,
+        'p7': 0.12,
+        'breakout_hard_negative': 0.32,
+        'reversion_hard_negative': 0.40,
+        'direction_consistency': 0.20,
+        'continuation_suppression': 0.22,
+        'horizon_event': 0.38,
+        'horizon_aux': 0.24,
+        'horizon_align': 0.30,
+        'horizon_hard_negative': 0.32,
+        'horizon_entropy': 0.04,
+        'signal_calibration': 0.20,
+        'horizon_margin': 0.22,
+    },
+    'shortT_discovery_guarded_v2': {
+        'main': 1.0,
+        'aux': 0.38,
+        'rank': 0.30,
+        'breakout_event_gap': 0.32,
+        'reversion_event_gap': 0.40,
+        'p3': 0.08,
+        'p4': 0.08,
+        'p6': 0.10,
+        'p7': 0.12,
+        'breakout_hard_negative': 0.36,
+        'reversion_hard_negative': 0.46,
+        'direction_consistency': 0.28,
+        'continuation_suppression': 0.30,
+        'horizon_event': 0.40,
+        'horizon_aux': 0.22,
+        'horizon_align': 0.30,
+        'horizon_hard_negative': 0.34,
+        'horizon_entropy': 0.04,
+        'signal_calibration': 0.24,
+        'horizon_margin': 0.22,
+    },
     'horizon_precision_v1': {
         'main': 1.0,
         'aux': 0.32,
@@ -181,6 +269,44 @@ LOSS_WEIGHT_PRESETS = {
         'horizon_entropy': 0.08,
         'signal_calibration': 0.20,
         'horizon_margin': 0.28,
+    },
+}
+
+
+LOSS_CURRICULUM_PRESETS = {
+    'shortT_discovery_guarded_v1': {
+        'warmup_fraction': 0.45,
+        'start_factor': 0.55,
+        'keys': (
+            'breakout_event_gap',
+            'reversion_event_gap',
+            'breakout_hard_negative',
+            'reversion_hard_negative',
+            'direction_consistency',
+            'continuation_suppression',
+            'horizon_event',
+            'horizon_hard_negative',
+            'horizon_margin',
+            'signal_calibration',
+        ),
+        'scale_constraint_weight': True,
+    },
+    'shortT_discovery_guarded_v2': {
+        'warmup_fraction': 0.35,
+        'start_factor': 0.60,
+        'keys': (
+            'breakout_event_gap',
+            'reversion_event_gap',
+            'breakout_hard_negative',
+            'reversion_hard_negative',
+            'direction_consistency',
+            'continuation_suppression',
+            'horizon_event',
+            'horizon_hard_negative',
+            'horizon_margin',
+            'signal_calibration',
+        ),
+        'scale_constraint_weight': True,
     },
 }
 
@@ -210,6 +336,14 @@ CONSTRAINT_PROFILE_PRESETS = {
         'reversion_event_margin': 0.14,
         'continuation_margin': 0.08,
     },
+    'teacher_feasible_discovery_v1': {
+        'enabled': True,
+        'weight': 0.24,
+        'blue_margin': 0.10,
+        'purple_margin': 0.10,
+        'reversion_event_margin': 0.08,
+        'continuation_margin': 0.06,
+    },
 }
 
 
@@ -219,16 +353,40 @@ class PhysicsLoss(nn.Module):
         base_weights = dict(LOSS_WEIGHT_PRESETS.get(profile, LOSS_WEIGHT_PRESETS['default']))
         if weights:
             base_weights.update(weights)
-        self.weights = base_weights
+        self.profile = str(profile or 'default')
+        self.base_weights = dict(base_weights)
+        self.weights = dict(base_weights)
         self.family_mode = str(family_mode or 'legacy')
         self.constraint_profile = str(constraint_profile or 'default')
-        self.constraint_config = dict(
+        self.base_constraint_config = dict(
             CONSTRAINT_PROFILE_PRESETS.get(self.constraint_profile, CONSTRAINT_PROFILE_PRESETS['default'])
         )
+        self.constraint_config = dict(self.base_constraint_config)
+        self.curriculum_config = dict(LOSS_CURRICULUM_PRESETS.get(self.profile, {}))
         self.main_loss_fn = nn.SmoothL1Loss(reduction='none')
         self.aux_loss_fn = nn.SmoothL1Loss(reduction='none')
         self.horizon_event_loss_fn = nn.SmoothL1Loss(reduction='none')
         self.horizon_aux_loss_fn = nn.SmoothL1Loss(reduction='none')
+        self.set_epoch(0, 1)
+
+    def set_epoch(self, epoch, total_epochs):
+        self.weights = dict(self.base_weights)
+        self.constraint_config = dict(self.base_constraint_config)
+        if not self.curriculum_config:
+            return
+        total_epochs = max(int(total_epochs), 1)
+        warmup_fraction = float(self.curriculum_config.get('warmup_fraction', 0.0))
+        start_factor = float(self.curriculum_config.get('start_factor', 1.0))
+        if warmup_fraction <= 0.0 or start_factor >= 1.0:
+            return
+        warmup_epochs = max(int(round(total_epochs * warmup_fraction)), 1)
+        progress = min(max(int(epoch) + 1, 0) / float(warmup_epochs), 1.0)
+        factor = start_factor + (1.0 - start_factor) * progress
+        for key in self.curriculum_config.get('keys', ()):
+            if key in self.weights:
+                self.weights[key] = self.base_weights[key] * factor
+        if self.curriculum_config.get('scale_constraint_weight', False):
+            self.constraint_config['weight'] = float(self.base_constraint_config.get('weight', 0.0)) * factor
 
     def _get_flag(self, event_flags, flag_name):
         idx = EVENT_FLAG_INDEX[flag_name]
