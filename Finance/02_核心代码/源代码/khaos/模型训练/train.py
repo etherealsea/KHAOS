@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch.amp import GradScaler
-from torch.utils.data import DataLoader, RandomSampler, ConcatDataset, Subset
+from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Sampler, Subset
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../')))
 """
@@ -81,7 +81,7 @@ CONSTRAINT_STAT_BASE_KEYS = (
 )
 
 RECENT_FOLD_ORDER = ('fold_3', 'fold_4')
-DATASET_CACHE_VERSION = 1
+DATASET_CACHE_VERSION = 2
 
 
 def set_seed(seed=42, deterministic=True):
@@ -105,7 +105,68 @@ def safe_corr(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def compute_event_metrics(scores, event_flags, hard_negative_flags):
+PRECISION_FIRST_SCORE_PROFILES = {
+    'short_t_precision_focus',
+    'short_t_discovery_focus',
+    'short_t_discovery_guarded_focus',
+    'recent_precision_v1',
+}
+AUX_GATED_SCORE_PROFILES = {'short_t_discovery_guarded_focus'}
+
+
+def resolve_event_selection_mode(score_profile='default'):
+    if score_profile in PRECISION_FIRST_SCORE_PROFILES:
+        return 'precision_first'
+    return 'f1'
+
+
+def resolve_event_oversignal_cap(label_frequency, event_type='generic'):
+    label_frequency = float(label_frequency)
+    if event_type == 'reversion':
+        return min(label_frequency + 0.02, 0.32)
+    if event_type == 'breakout':
+        return min(label_frequency + 0.02, 0.46)
+    return None
+
+
+def compute_event_oversignal(metrics):
+    return max(
+        float(metrics.get('signal_frequency', 0.0)) - float(metrics.get('label_frequency', 0.0)),
+        0.0,
+    )
+
+
+def score_event_candidate(candidate, selection_mode='f1', event_type='generic'):
+    if selection_mode == 'precision_first':
+        return compute_precision_first_event_quality(candidate, event_type=event_type)
+    return float(candidate['f1'])
+
+
+def is_better_event_candidate(candidate, best, selection_mode='f1', event_type='generic'):
+    if best is None:
+        return True
+    candidate_score = score_event_candidate(candidate, selection_mode=selection_mode, event_type=event_type)
+    best_score = score_event_candidate(best, selection_mode=selection_mode, event_type=event_type)
+    if candidate_score > best_score + 1e-12:
+        return True
+    if best_score > candidate_score + 1e-12:
+        return False
+    if candidate['precision'] > best['precision'] + 1e-12:
+        return True
+    if best['precision'] > candidate['precision'] + 1e-12:
+        return False
+    if best['hard_negative_rate'] > candidate['hard_negative_rate'] + 1e-12:
+        return True
+    if candidate['hard_negative_rate'] > best['hard_negative_rate'] + 1e-12:
+        return False
+    if best['signal_frequency'] > candidate['signal_frequency'] + 1e-12:
+        return True
+    if candidate['signal_frequency'] > best['signal_frequency'] + 1e-12:
+        return False
+    return candidate['threshold'] > best['threshold']
+
+
+def compute_event_metrics(scores, event_flags, hard_negative_flags, selection_mode='f1', event_type='generic'):
     scores = np.asarray(scores, dtype=np.float64)
     event_flags = np.asarray(event_flags, dtype=bool)
     hard_negative_flags = np.asarray(hard_negative_flags, dtype=bool)
@@ -120,10 +181,14 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags):
             'hard_negative_rate': 0.0,
             'signal_frequency': 0.0,
             'label_frequency': 0.0,
+            'oversignal': 0.0,
         }
     label_frequency = float(np.mean(event_flags)) if len(event_flags) > 0 else 0.0
-    thresholds = np.unique(np.quantile(scores, np.linspace(0.55, 0.95, 9)))
+    threshold_grid = np.linspace(0.55, 0.99, 12) if selection_mode == 'precision_first' else np.linspace(0.55, 0.95, 9)
+    thresholds = np.unique(np.quantile(scores, threshold_grid))
     best = None
+    fallback_best = None
+    oversignal_cap = resolve_event_oversignal_cap(label_frequency, event_type=event_type) if selection_mode == 'precision_first' else None
     for threshold in thresholds:
         pred = scores >= threshold
         tp = np.sum(pred & event_flags)
@@ -146,12 +211,15 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags):
             'hard_negative_rate': float(hn_rate),
             'signal_frequency': float(np.mean(pred)),
             'label_frequency': label_frequency,
+            'oversignal': max(float(np.mean(pred)) - label_frequency, 0.0),
         }
-        if best is None or candidate['f1'] > best['f1'] or (
-            candidate['f1'] == best['f1'] and candidate['hard_negative_rate'] < best['hard_negative_rate']
-        ):
+        if is_better_event_candidate(candidate, fallback_best, selection_mode=selection_mode, event_type=event_type):
+            fallback_best = candidate
+        if oversignal_cap is not None and candidate['signal_frequency'] > oversignal_cap + 1e-12:
+            continue
+        if is_better_event_candidate(candidate, best, selection_mode=selection_mode, event_type=event_type):
             best = candidate
-    return best
+    return best or fallback_best
 
 
 def compute_event_quality(metrics):
@@ -180,6 +248,74 @@ def compute_precision_first_event_quality(metrics, event_type='generic'):
         0.26 * metrics['hard_negative_rate'] -
         0.14 * oversignal -
         0.05 * signal_gap
+    )
+
+
+def compute_signal_space_summary(scores, threshold, target_values, aux_values):
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    target_values = np.asarray(target_values, dtype=np.float64).reshape(-1)
+    aux_values = np.asarray(aux_values, dtype=np.float64).reshape(-1)
+    if scores.size == 0 or target_values.size != scores.size or aux_values.size != scores.size:
+        return {
+            'signal_target_mean': 0.0,
+            'signal_space_mean': 0.0,
+            'signal_quality_mean': 0.0,
+            'all_target_mean': 0.0,
+            'all_space_mean': 0.0,
+            'all_quality_mean': 0.0,
+        }
+    pred = scores >= float(threshold)
+    quality_values = 0.65 * target_values + 0.35 * aux_values
+
+    def _masked_mean(values, mask):
+        if values.size == 0 or not np.any(mask):
+            return 0.0
+        return float(np.mean(values[mask]))
+
+    return {
+        'signal_target_mean': _masked_mean(target_values, pred),
+        'signal_space_mean': _masked_mean(aux_values, pred),
+        'signal_quality_mean': _masked_mean(quality_values, pred),
+        'all_target_mean': float(np.mean(target_values)) if target_values.size else 0.0,
+        'all_space_mean': float(np.mean(aux_values)) if aux_values.size else 0.0,
+        'all_quality_mean': float(np.mean(quality_values)) if quality_values.size else 0.0,
+    }
+
+
+def compose_metric_scores(main_scores, aux_scores, score_profile='default', event_type='generic'):
+    primary = np.asarray(main_scores, dtype=np.float64).reshape(-1)
+    if score_profile not in AUX_GATED_SCORE_PROFILES:
+        return primary
+    aux_values = np.asarray(aux_scores, dtype=np.float64).reshape(-1)
+    if aux_values.size != primary.size:
+        aux_values = np.zeros_like(primary)
+    primary = np.maximum(primary, 0.0)
+    aux_values = np.maximum(aux_values, 0.0)
+    coherent = np.minimum(primary, aux_values)
+    if event_type == 'reversion':
+        return 0.48 * primary + 0.22 * aux_values + 0.30 * coherent
+    return 0.52 * primary + 0.18 * aux_values + 0.30 * coherent
+
+
+def compute_discovery_space_quality(summary, event_type='generic'):
+    signal_quality_mean = float(summary.get('signal_quality_mean', 0.0))
+    signal_space_mean = float(summary.get('signal_space_mean', 0.0))
+    all_quality_mean = float(summary.get('all_quality_mean', 0.0))
+    all_space_mean = float(summary.get('all_space_mean', 0.0))
+    quality_lift = max(signal_quality_mean - all_quality_mean, 0.0)
+    space_lift = max(signal_space_mean - all_space_mean, 0.0)
+    if event_type == 'reversion':
+        return (
+            0.58 * np.tanh(signal_quality_mean / 1.20) +
+            0.22 * np.tanh(signal_space_mean / 1.10) +
+            0.12 * np.tanh(quality_lift / 0.60) +
+            0.08 * np.tanh(space_lift / 0.50)
+        )
+    return (
+        0.60 * np.tanh(signal_quality_mean / 1.25) +
+        0.20 * np.tanh(signal_space_mean / 1.15) +
+        0.12 * np.tanh(quality_lift / 0.70) +
+        0.08 * np.tanh(space_lift / 0.60)
     )
 
 
@@ -236,6 +372,8 @@ def compute_checkpoint_score(
     breakout_corr,
     reversion_corr,
     direction_macro_f1=None,
+    breakout_space_summary=None,
+    reversion_space_summary=None,
     profile='default',
 ):
     breakout_quality = compute_event_quality(breakout_metrics)
@@ -256,6 +394,52 @@ def compute_checkpoint_score(
             0.10 * direction_macro_f1 +
             0.03 * breakout_corr +
             0.03 * reversion_corr
+        )
+    if profile == 'short_t_discovery_focus':
+        breakout_quality = compute_precision_first_event_quality(breakout_metrics, event_type='breakout')
+        reversion_quality = compute_precision_first_event_quality(reversion_metrics, event_type='reversion')
+        breakout_space_quality = compute_discovery_space_quality(breakout_space_summary or {}, event_type='breakout')
+        reversion_space_quality = compute_discovery_space_quality(reversion_space_summary or {}, event_type='reversion')
+        if direction_macro_f1 is None:
+            return (
+                0.31 * breakout_quality +
+                0.31 * reversion_quality +
+                0.16 * breakout_space_quality +
+                0.16 * reversion_space_quality +
+                0.03 * breakout_corr +
+                0.03 * reversion_corr
+            )
+        return (
+            0.26 * breakout_quality +
+            0.28 * reversion_quality +
+            0.14 * breakout_space_quality +
+            0.16 * reversion_space_quality +
+            0.10 * direction_macro_f1 +
+            0.03 * breakout_corr +
+            0.03 * reversion_corr
+        )
+    if profile == 'short_t_discovery_guarded_focus':
+        breakout_quality = compute_precision_first_event_quality(breakout_metrics, event_type='breakout')
+        reversion_quality = compute_precision_first_event_quality(reversion_metrics, event_type='reversion')
+        breakout_space_quality = compute_discovery_space_quality(breakout_space_summary or {}, event_type='breakout')
+        reversion_space_quality = compute_discovery_space_quality(reversion_space_summary or {}, event_type='reversion')
+        if direction_macro_f1 is None:
+            return (
+                0.36 * breakout_quality +
+                0.40 * reversion_quality +
+                0.10 * breakout_space_quality +
+                0.10 * reversion_space_quality +
+                0.02 * breakout_corr +
+                0.02 * reversion_corr
+            )
+        return (
+            0.32 * breakout_quality +
+            0.36 * reversion_quality +
+            0.08 * breakout_space_quality +
+            0.08 * reversion_space_quality +
+            0.12 * direction_macro_f1 +
+            0.02 * breakout_corr +
+            0.02 * reversion_corr
         )
     if profile == 'short_t_breakout_focus':
         if direction_macro_f1 is None:
@@ -336,18 +520,25 @@ def compute_checkpoint_score(
 def build_metric_bucket():
     return {
         'preds': [],
+        'aux_preds': [],
         'targets': [],
+        'aux_targets': [],
         'flags': [],
         'logs': [],
+        'skip_counters': defaultdict(int),
         'debug_batches': {key: [] for key in DEBUG_BATCH_KEYS},
     }
 
 
 def merge_metric_bucket(destination, source):
     destination['preds'].extend(source['preds'])
+    destination['aux_preds'].extend(source['aux_preds'])
     destination['targets'].extend(source['targets'])
+    destination['aux_targets'].extend(source['aux_targets'])
     destination['flags'].extend(source['flags'])
     destination['logs'].extend(source['logs'])
+    for key, value in source.get('skip_counters', {}).items():
+        destination['skip_counters'][key] += int(value)
     for key in DEBUG_BATCH_KEYS:
         destination['debug_batches'][key].extend(source['debug_batches'][key])
 
@@ -397,10 +588,21 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         'direction_metrics': _zero_direction_metrics(),
         'signal_frequency': {'breakout': 0.0, 'reversion': 0.0},
         'label_frequency': {'breakout': 0.0, 'reversion': 0.0},
+        'oversignal': {'breakout': 0.0, 'reversion': 0.0},
         'breakout_signal_frequency': 0.0,
         'reversion_signal_frequency': 0.0,
         'breakout_label_frequency': 0.0,
         'reversion_label_frequency': 0.0,
+        'breakout_oversignal': 0.0,
+        'reversion_oversignal': 0.0,
+        'breakout_signal_target_mean': 0.0,
+        'reversion_signal_target_mean': 0.0,
+        'breakout_signal_space_mean': 0.0,
+        'reversion_signal_space_mean': 0.0,
+        'breakout_signal_quality_mean': 0.0,
+        'reversion_signal_quality_mean': 0.0,
+        'breakout_all_quality_mean': 0.0,
+        'reversion_all_quality_mean': 0.0,
         'direction_gate_mean': 0.0,
         'direction_gate_std': 0.0,
         'public_reversion_gate_mean': 0.0,
@@ -435,18 +637,59 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         return zero_summary
 
     pred_np = np.vstack(bucket['preds'])
+    aux_pred_np = np.vstack(bucket['aux_preds']) if bucket['aux_preds'] else np.zeros_like(pred_np)
     target_np = np.vstack(bucket['targets'])
+    aux_np = np.vstack(bucket['aux_targets']) if bucket['aux_targets'] else np.zeros_like(target_np)
     flags_np = np.vstack(bucket['flags'])
     pred_rev_np = np.maximum(pred_np[:, 1], 0.0)
+    aux_breakout_np = np.maximum(aux_pred_np[:, 0], 0.0)
+    aux_reversion_np = np.maximum(aux_pred_np[:, 1], 0.0)
+    breakout_metric_scores = compose_metric_scores(
+        pred_np[:, 0],
+        aux_breakout_np,
+        score_profile=score_profile,
+        event_type='breakout',
+    )
+    reversion_metric_scores = compose_metric_scores(
+        pred_rev_np,
+        aux_reversion_np,
+        score_profile=score_profile,
+        event_type='reversion',
+    )
     reversion_event_mask = flags_np[:, 1] > 0.5
     breakout_corr = safe_corr(pred_np[:, 0], target_np[:, 0])
     reversion_corr = safe_corr(pred_rev_np, target_np[:, 1])
-    breakout_event_mean = float(pred_np[flags_np[:, 0] > 0.5, 0].mean()) if np.any(flags_np[:, 0] > 0.5) else 0.0
-    reversion_event_mean = float(pred_rev_np[reversion_event_mask].mean()) if np.any(reversion_event_mask) else 0.0
-    breakout_hn_mean = float(pred_np[flags_np[:, 2] > 0.5, 0].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
-    reversion_hn_mean = float(pred_rev_np[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
-    breakout_metrics = compute_event_metrics(pred_np[:, 0], flags_np[:, 0] > 0.5, flags_np[:, 2] > 0.5)
-    reversion_metrics = compute_event_metrics(pred_rev_np, reversion_event_mask, flags_np[:, 3] > 0.5)
+    breakout_event_mean = float(breakout_metric_scores[flags_np[:, 0] > 0.5].mean()) if np.any(flags_np[:, 0] > 0.5) else 0.0
+    reversion_event_mean = float(reversion_metric_scores[reversion_event_mask].mean()) if np.any(reversion_event_mask) else 0.0
+    breakout_hn_mean = float(breakout_metric_scores[flags_np[:, 2] > 0.5].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
+    reversion_hn_mean = float(reversion_metric_scores[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
+    event_selection_mode = resolve_event_selection_mode(score_profile)
+    breakout_metrics = compute_event_metrics(
+        breakout_metric_scores,
+        flags_np[:, 0] > 0.5,
+        flags_np[:, 2] > 0.5,
+        selection_mode=event_selection_mode,
+        event_type='breakout',
+    )
+    reversion_metrics = compute_event_metrics(
+        reversion_metric_scores,
+        reversion_event_mask,
+        flags_np[:, 3] > 0.5,
+        selection_mode=event_selection_mode,
+        event_type='reversion',
+    )
+    breakout_space_summary = compute_signal_space_summary(
+        breakout_metric_scores,
+        breakout_metrics['threshold'],
+        target_np[:, 0],
+        aux_np[:, 0],
+    )
+    reversion_space_summary = compute_signal_space_summary(
+        reversion_metric_scores,
+        reversion_metrics['threshold'],
+        target_np[:, 1],
+        aux_np[:, 1],
+    )
     blue_scores = _flatten_debug_batches(bucket['debug_batches']['blue_score'])
     purple_scores = _flatten_debug_batches(bucket['debug_batches']['purple_score'])
     direction_metrics = compute_direction_metrics(blue_scores, purple_scores, flags_np) if (
@@ -470,6 +713,8 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         breakout_corr,
         reversion_corr,
         direction_metrics['macro_f1'] if use_direction_metrics else None,
+        breakout_space_summary=breakout_space_summary,
+        reversion_space_summary=reversion_space_summary,
         profile=score_profile,
     )
     summary = dict(zero_summary)
@@ -500,10 +745,24 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
                 'breakout': breakout_metrics['label_frequency'],
                 'reversion': reversion_metrics['label_frequency'],
             },
+            'oversignal': {
+                'breakout': breakout_metrics['oversignal'],
+                'reversion': reversion_metrics['oversignal'],
+            },
             'breakout_signal_frequency': breakout_metrics['signal_frequency'],
             'reversion_signal_frequency': reversion_metrics['signal_frequency'],
             'breakout_label_frequency': breakout_metrics['label_frequency'],
             'reversion_label_frequency': reversion_metrics['label_frequency'],
+            'breakout_oversignal': breakout_metrics['oversignal'],
+            'reversion_oversignal': reversion_metrics['oversignal'],
+            'breakout_signal_target_mean': breakout_space_summary['signal_target_mean'],
+            'reversion_signal_target_mean': reversion_space_summary['signal_target_mean'],
+            'breakout_signal_space_mean': breakout_space_summary['signal_space_mean'],
+            'reversion_signal_space_mean': reversion_space_summary['signal_space_mean'],
+            'breakout_signal_quality_mean': breakout_space_summary['signal_quality_mean'],
+            'reversion_signal_quality_mean': reversion_space_summary['signal_quality_mean'],
+            'breakout_all_quality_mean': breakout_space_summary['all_quality_mean'],
+            'reversion_all_quality_mean': reversion_space_summary['all_quality_mean'],
             'direction_gate_mean': float(direction_gate_values.mean()) if direction_gate_values.size else 0.0,
             'direction_gate_std': float(direction_gate_values.std()) if direction_gate_values.size else 0.0,
             'public_reversion_gate_mean': float(public_gate_values.mean()) if public_gate_values.size else 0.0,
@@ -911,6 +1170,135 @@ def build_capped_dataset(dataset, args, timeframe_label):
     return dataset
 
 
+def resolve_train_sample_target(dataset, args, timeframe_label):
+    dataset_size = int(len(dataset))
+    if dataset_size <= 0:
+        return 0
+    cap_config = parse_timeframe_cap_config(getattr(args, 'per_timeframe_train_cap', None))
+    sample_cap = cap_config.get(normalize_timeframe_label(timeframe_label))
+    if sample_cap:
+        return max(int(sample_cap), 0)
+    return dataset_size
+
+
+class BalancedConcatSampler(Sampler):
+    def __init__(self, dataset_lengths, target_samples, seed=42):
+        self.dataset_lengths = [int(length) for length in dataset_lengths]
+        self.target_samples = [int(samples) for samples in target_samples]
+        if len(self.dataset_lengths) != len(self.target_samples):
+            raise ValueError('dataset_lengths and target_samples must have the same length')
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return int(sum(self.target_samples))
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        sampled_indices = []
+        offset = 0
+        for dataset_length, target_samples in zip(self.dataset_lengths, self.target_samples):
+            if dataset_length <= 0 or target_samples <= 0:
+                offset += max(dataset_length, 0)
+                continue
+            if target_samples > dataset_length:
+                local_indices = torch.randint(0, dataset_length, (target_samples,), generator=generator)
+            elif target_samples == dataset_length:
+                local_indices = torch.randperm(dataset_length, generator=generator)
+            else:
+                local_indices = torch.randperm(dataset_length, generator=generator)[:target_samples]
+            sampled_indices.append(local_indices + offset)
+            offset += dataset_length
+        if not sampled_indices:
+            return iter(())
+        merged = torch.cat(sampled_indices)
+        if merged.numel() > 1:
+            merged = merged[torch.randperm(merged.numel(), generator=generator)]
+        return iter(merged.tolist())
+
+
+def build_train_loader(dataset, args, timeframe_label):
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+    target_samples = resolve_train_sample_target(dataset, args, timeframe_label)
+    if target_samples <= 0:
+        return DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, generator=g)
+    if target_samples != len(dataset):
+        replacement = len(dataset) < target_samples
+        sampler = RandomSampler(
+            dataset,
+            replacement=replacement,
+            num_samples=target_samples,
+            generator=g,
+        )
+        return DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            sampler=sampler,
+            drop_last=False,
+            generator=g,
+        )
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        generator=g,
+    )
+
+
+def build_global_train_loader(train_dataset_specs, args):
+    if not train_dataset_specs:
+        raise RuntimeError('No train dataset specs supplied for global train loader.')
+    datasets = []
+    dataset_lengths = []
+    target_samples = []
+    samples_by_timeframe = defaultdict(int)
+    plan = []
+    for spec in train_dataset_specs:
+        dataset = spec['dataset']
+        timeframe_label = normalize_timeframe_label(spec.get('timeframe_label')) or 'unknown'
+        dataset_size = int(len(dataset))
+        effective_samples = resolve_train_sample_target(dataset, args, timeframe_label)
+        if dataset_size <= 0 or effective_samples <= 0:
+            continue
+        datasets.append(dataset)
+        dataset_lengths.append(dataset_size)
+        target_samples.append(effective_samples)
+        samples_by_timeframe[timeframe_label] += int(effective_samples)
+        plan.append(
+            {
+                'asset_code': spec.get('asset_code'),
+                'timeframe_label': timeframe_label,
+                'split_label': spec.get('split_label'),
+                'data_path': spec.get('data_path'),
+                'dataset_size': dataset_size,
+                'effective_samples': int(effective_samples),
+            }
+        )
+    if not datasets:
+        raise RuntimeError('No non-empty training datasets available after applying cap semantics.')
+    concat_dataset = ConcatDataset(datasets)
+    sampler = BalancedConcatSampler(dataset_lengths, target_samples, seed=args.seed)
+    loader = DataLoader(
+        concat_dataset,
+        batch_size=args.batch_size,
+        sampler=sampler,
+        drop_last=False,
+    )
+    return loader, {
+        'dataset_count': len(datasets),
+        'sample_count': len(sampler),
+        'samples_by_timeframe': dict(sorted(samples_by_timeframe.items())),
+        'datasets': plan,
+        'sampler': sampler,
+    }
+
+
 def build_eval_loader(dataset, args):
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -986,6 +1374,42 @@ def append_debug_batches(bucket, debug_info, horizon_payload=None):
         else:
             debug_value = np.asarray(debug_value, dtype=np.float32)
         bucket['debug_batches'][debug_key].append(debug_value)
+
+
+def _tensor_is_finite(value):
+    if value is None:
+        return True
+    if not torch.is_tensor(value):
+        try:
+            return bool(np.all(np.isfinite(np.asarray(value, dtype=np.float32))))
+        except Exception:
+            return True
+    return bool(torch.isfinite(value).all().item())
+
+
+def _mapping_is_finite(values):
+    if not values:
+        return True
+    for value in values.values():
+        if torch.is_tensor(value):
+            if not bool(torch.isfinite(value).all().item()):
+                return False
+            continue
+        try:
+            if not np.isfinite(float(value)):
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
+def _count_non_finite_gradients(model):
+    invalid = 0
+    for parameter in model.parameters():
+        grad = parameter.grad
+        if grad is not None and not bool(torch.isfinite(grad).all().item()):
+            invalid += 1
+    return invalid
 
 
 def forward_model(kan, features_seq, args, horizon_payload=None, return_debug=False):
@@ -1387,6 +1811,120 @@ def evaluate_kill_keep_review(epoch_score_summary, timeframe_summaries, args):
     }
 
 
+def compute_summary_signal_frequency(summary):
+    signal_frequency = summary.get('signal_frequency', {})
+    breakout_signal = summary.get('breakout_signal_frequency')
+    reversion_signal = summary.get('reversion_signal_frequency')
+    if breakout_signal is None and isinstance(signal_frequency, dict):
+        breakout_signal = signal_frequency.get('breakout')
+    if reversion_signal is None and isinstance(signal_frequency, dict):
+        reversion_signal = signal_frequency.get('reversion')
+    return 0.5 * (float(breakout_signal or 0.0) + float(reversion_signal or 0.0))
+
+
+def compute_score_timeframe_avg_signal_frequency(timeframe_summaries, score_timeframes=None, fallback_summary=None):
+    candidate_labels = [label for label in (score_timeframes or []) if label in timeframe_summaries]
+    if not candidate_labels:
+        candidate_labels = sorted(timeframe_summaries.keys())
+    if candidate_labels:
+        values = [compute_summary_signal_frequency(timeframe_summaries[label]) for label in candidate_labels]
+        return float(np.mean(values)), candidate_labels
+    if fallback_summary is not None:
+        return compute_summary_signal_frequency(fallback_summary), []
+    return 0.0, []
+
+
+def compute_standard_score_veto(epoch_score_summary, timeframe_summaries, args, score_timeframes=None):
+    avg_signal_frequency, used_timeframes = compute_score_timeframe_avg_signal_frequency(
+        timeframe_summaries=timeframe_summaries,
+        score_timeframes=score_timeframes,
+        fallback_summary=epoch_score_summary,
+    )
+    veto_reasons = []
+    checks = {}
+
+    signal_threshold = getattr(args, 'kill_keep_signal_frequency_max', None)
+    if signal_threshold is not None:
+        signal_threshold = float(signal_threshold)
+        signal_passed = avg_signal_frequency <= signal_threshold
+        checks['avg_signal_frequency'] = {
+            'actual': avg_signal_frequency,
+            'threshold': signal_threshold,
+            'passed': signal_passed,
+            'timeframes': used_timeframes,
+        }
+        if not signal_passed:
+            veto_reasons.append(f'avg_signal_frequency({avg_signal_frequency:.3f}>{signal_threshold:.3f})')
+
+    public_violation_threshold = getattr(args, 'kill_keep_public_violation_rate_max', None)
+    if public_violation_threshold is not None and float(public_violation_threshold) < 1.0:
+        public_violation_actual = float(epoch_score_summary.get('public_below_directional_violation_rate', 0.0))
+        public_violation_threshold = float(public_violation_threshold)
+        public_violation_passed = public_violation_actual <= public_violation_threshold
+        checks['public_below_directional_violation_rate'] = {
+            'actual': public_violation_actual,
+            'threshold': public_violation_threshold,
+            'passed': public_violation_passed,
+        }
+        if not public_violation_passed:
+            veto_reasons.append(
+                f'public_below_directional_violation_rate({public_violation_actual:.3f}>{public_violation_threshold:.3f})'
+            )
+
+    timeframe_60m_threshold = getattr(args, 'kill_keep_timeframe_60m_composite_min', None)
+    if timeframe_60m_threshold is not None and float(timeframe_60m_threshold) > 0.0:
+        timeframe_60m_summary = timeframe_summaries.get('60m', {})
+        timeframe_60m_actual = timeframe_60m_summary.get('composite_score')
+        timeframe_60m_threshold = float(timeframe_60m_threshold)
+        timeframe_60m_passed = timeframe_60m_actual is not None and float(timeframe_60m_actual) >= timeframe_60m_threshold
+        checks['timeframe_60m_composite'] = {
+            'actual': float(timeframe_60m_actual) if timeframe_60m_actual is not None else None,
+            'threshold': timeframe_60m_threshold,
+            'passed': timeframe_60m_passed,
+        }
+        if not timeframe_60m_passed:
+            actual_repr = 'missing' if timeframe_60m_actual is None else f'{float(timeframe_60m_actual):.3f}'
+            veto_reasons.append(f'timeframe_60m_composite({actual_repr}<{timeframe_60m_threshold:.3f})')
+
+    breakout_space_threshold = getattr(args, 'kill_keep_breakout_signal_space_min', None)
+    if breakout_space_threshold is not None and float(breakout_space_threshold) > 0.0:
+        breakout_space_actual = float(epoch_score_summary.get('breakout_signal_space_mean', 0.0))
+        breakout_space_threshold = float(breakout_space_threshold)
+        breakout_space_passed = breakout_space_actual >= breakout_space_threshold
+        checks['breakout_signal_space_mean'] = {
+            'actual': breakout_space_actual,
+            'threshold': breakout_space_threshold,
+            'passed': breakout_space_passed,
+        }
+        if not breakout_space_passed:
+            veto_reasons.append(
+                f'breakout_signal_space_mean({breakout_space_actual:.3f}<{breakout_space_threshold:.3f})'
+            )
+
+    reversion_space_threshold = getattr(args, 'kill_keep_reversion_signal_space_min', None)
+    if reversion_space_threshold is not None and float(reversion_space_threshold) > 0.0:
+        reversion_space_actual = float(epoch_score_summary.get('reversion_signal_space_mean', 0.0))
+        reversion_space_threshold = float(reversion_space_threshold)
+        reversion_space_passed = reversion_space_actual >= reversion_space_threshold
+        checks['reversion_signal_space_mean'] = {
+            'actual': reversion_space_actual,
+            'threshold': reversion_space_threshold,
+            'passed': reversion_space_passed,
+        }
+        if not reversion_space_passed:
+            veto_reasons.append(
+                f'reversion_signal_space_mean({reversion_space_actual:.3f}<{reversion_space_threshold:.3f})'
+            )
+
+    return {
+        'passed': len(veto_reasons) == 0,
+        'reasons': veto_reasons,
+        'checks': checks,
+        'avg_signal_frequency': avg_signal_frequency,
+        'score_timeframes': used_timeframes,
+    }
+
+
 def compute_recent_precision_score(
     fold_summaries,
     timeframe_summaries,
@@ -1495,6 +2033,7 @@ def evaluate_dataset_loader(kan, eval_loader, criterion, args, device, use_debug
     with torch.no_grad():
         for batch in eval_loader:
             features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags, horizon_payload = unpack_batch(batch, device)
+            batch_size_val = int(batch_y.size(0))
             psi_t = features_seq[:, -1, :]
             with torch.amp.autocast('cuda', enabled=(device.type == 'cuda'), dtype=amp_dtype):
                 pred, aux_pred, debug_info = forward_model(
@@ -1517,12 +2056,26 @@ def evaluate_dataset_loader(kan, eval_loader, criterion, args, device, use_debug
                 )
                 reg_loss = kan.get_regularization_loss(regularize_activation=1e-4, regularize_entropy=1e-4)
                 loss = (loss_unweighted * batch_weights).mean() + rank_loss + reg_loss
+            if not _tensor_is_finite(pred) or not _tensor_is_finite(aux_pred):
+                file_bucket['skip_counters']['pred_non_finite'] += 1
+                continue
+            if not (
+                _tensor_is_finite(loss_unweighted) and
+                _tensor_is_finite(rank_loss) and
+                _tensor_is_finite(reg_loss) and
+                _tensor_is_finite(loss) and
+                _mapping_is_finite(l_dict)
+            ):
+                file_bucket['skip_counters']['loss_non_finite'] += 1
+                continue
             batch_log = dict(l_dict)
             batch_log['total_loss'] = float(loss.item())
-            batch_log['batch_size'] = int(batch_y.size(0))
+            batch_log['batch_size'] = batch_size_val
             file_bucket['logs'].append(batch_log)
             file_bucket['preds'].append(pred.detach().float().cpu().numpy())
+            file_bucket['aux_preds'].append(aux_pred.detach().float().cpu().numpy())
             file_bucket['targets'].append(batch_y.detach().cpu().numpy())
+            file_bucket['aux_targets'].append(batch_aux.detach().cpu().numpy())
             file_bucket['flags'].append(batch_flags.detach().cpu().numpy())
             append_debug_batches(file_bucket, debug_info=debug_info, horizon_payload=horizon_payload)
     return file_bucket
@@ -1779,8 +2332,8 @@ def train(args):
     latest_metrics = None
     horizon_registry = {}
 
-    print("Loading all datasets for global ConcatDataset...")
-    all_train_datasets = []
+    print("Loading all datasets for global mixed training...")
+    train_dataset_specs = []
     eval_jobs = []
     for job_idx, record in enumerate(runtime_records):
         data_path = record['path']
@@ -1796,8 +2349,13 @@ def train(args):
             timeframe_label = normalize_timeframe_label(dataset_meta.get('timeframe') or record.get('timeframe')) or 'unknown'
             
             if train_ds is not None and len(train_ds) >= max(1, min(args.batch_size, 8)):
-                capped_train_ds = build_capped_dataset(train_ds, args, timeframe_label)
-                all_train_datasets.append(capped_train_ds)
+                train_dataset_specs.append({
+                    'dataset': train_ds,
+                    'timeframe_label': timeframe_label,
+                    'split_label': split_label,
+                    'data_path': data_path,
+                    'asset_code': dataset_meta.get('asset_code') or record.get('asset_code'),
+                })
             
             if eval_ds is not None and len(eval_ds) > 0:
                 eval_jobs.append({
@@ -1812,37 +2370,35 @@ def train(args):
             print(f"Error processing {data_path} split={split_label}: {exc}")
             continue
 
-    if not all_train_datasets:
+    if not train_dataset_specs:
         raise RuntimeError("No valid training datasets found.")
 
-    global_train_ds = ConcatDataset(all_train_datasets)
-    global_train_loader = DataLoader(
-        global_train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        drop_last=len(global_train_ds) >= args.batch_size,
-        generator=torch.Generator().manual_seed(args.seed)
+    global_train_loader, global_train_plan = build_global_train_loader(train_dataset_specs, args)
+    global_train_sampler = global_train_plan['sampler']
+    print(
+        f"Global training loader created: {global_train_plan['sample_count']} sampled items "
+        f"across {global_train_plan['dataset_count']} datasets."
     )
-    print(f"Global training dataset created: {len(global_train_ds)} samples across {len(all_train_datasets)} datasets.")
+    print(f"Global training balance by timeframe: {global_train_plan['samples_by_timeframe']}")
 
     for epoch in range(start_epoch, args.epochs):
 
         print(f"\\n========== EPOCH {epoch + 1}/{args.epochs} ==========")
-        epoch_train_loss_total = 0.0
-        epoch_train_batches = 0
         epoch_train_logs = []
         epoch_all_bucket = build_metric_bucket()
         epoch_timeframe_buckets = defaultdict(build_metric_bucket)
         epoch_fold_buckets = defaultdict(build_metric_bucket)
+        train_skip_counters = defaultdict(int)
         
         kan.train()
-        total_loss = 0.0
-        loss_logs = []
-        job_effective_train_samples = 0
+        if hasattr(criterion, 'set_epoch'):
+            criterion.set_epoch(epoch, args.epochs)
+        global_train_sampler.set_epoch(epoch)
         amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         
         for batch_idx, batch in enumerate(global_train_loader):
             features_seq, batch_y, batch_aux, batch_sigma, batch_weights, batch_flags, horizon_payload = unpack_batch(batch, device)
+            batch_size_val = int(batch_y.size(0))
             psi_t = features_seq[:, -1, :]
             optimizer.zero_grad(set_to_none=True)
             
@@ -1854,10 +2410,10 @@ def train(args):
                     horizon_payload=horizon_payload,
                     return_debug=use_debug_metrics,
                 )
-                if torch.isnan(pred).any():
-                    print("NaN in predictions. Skipping batch.")
+                if not _tensor_is_finite(pred) or not _tensor_is_finite(aux_pred):
+                    train_skip_counters['pred_non_finite'] += 1
                     continue
-                    
+
                 loss_unweighted, rank_loss, l_dict = criterion(
                     pred,
                     aux_pred,
@@ -1871,35 +2427,44 @@ def train(args):
                 )
                 reg_loss = kan.get_regularization_loss(regularize_activation=1e-4, regularize_entropy=1e-4)
                 loss = (loss_unweighted * batch_weights).mean() + rank_loss + reg_loss
-                
+            if not (
+                _tensor_is_finite(loss_unweighted) and
+                _tensor_is_finite(rank_loss) and
+                _tensor_is_finite(reg_loss) and
+                _tensor_is_finite(loss) and
+                _mapping_is_finite(l_dict)
+            ):
+                train_skip_counters['loss_non_finite'] += 1
+                continue
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(kan.parameters(), max_norm=getattr(args, 'grad_clip', 1.0))
+            invalid_grad_count = _count_non_finite_gradients(kan)
+            if invalid_grad_count:
+                train_skip_counters['grad_non_finite'] += 1
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
+            grad_norm = torch.nn.utils.clip_grad_norm_(kan.parameters(), max_norm=getattr(args, 'grad_clip', 1.0))
+            grad_norm_value = float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm)
+            if not np.isfinite(grad_norm_value):
+                train_skip_counters['grad_clip_non_finite'] += 1
+                optimizer.zero_grad(set_to_none=True)
+                scaler.update()
+                continue
             scaler.step(optimizer)
             scaler.update()
-            
-            if not torch.isnan(loss) and not torch.isinf(loss):
-                total_loss += float(loss.item())
-                batch_size_val = int(batch_y.size(0))
-                job_effective_train_samples += batch_size_val
-                
-                l_dict_log = dict(l_dict)
-                l_dict_log['total_loss'] = float(loss.item())
-                l_dict_log['batch_size'] = batch_size_val
-                loss_logs.append(l_dict_log)
+
+            l_dict_log = dict(l_dict)
+            l_dict_log['total_loss'] = float(loss.item())
+            l_dict_log['batch_size'] = batch_size_val
+            epoch_train_logs.append(l_dict_log)
             
             if batch_idx % 100 == 0:
                 print(
                     f"  [EPOCH {epoch + 1}] batch {batch_idx}/{len(global_train_loader)} loss={loss.item():.6f}"
                 )
-
-        epoch_train_loss_total = total_loss
-        epoch_train_batches = len(global_train_loader)
-        epoch_train_logs.extend(loss_logs)
-        
-        # We don't track per-timeframe train samples precisely anymore because of the global shuffle,
-        # but we can just use an empty dict or fake it.
-        epoch_effective_train_samples_by_timeframe = defaultdict(int)
+        epoch_effective_train_samples_by_timeframe = defaultdict(int, global_train_plan['samples_by_timeframe'])
 
         kan.eval()
         processed_jobs = 0
@@ -1993,13 +2558,24 @@ def train(args):
             )
         else:
             composite_score = epoch_score_summary['composite_score']
-            recent_score_components = {'mode': 'standard'}
-            score_veto = {'passed': True, 'reasons': []}
+            score_veto = compute_standard_score_veto(
+                epoch_score_summary=epoch_score_summary,
+                timeframe_summaries=timeframe_summaries,
+                args=args,
+                score_timeframes=score_timeframes,
+            )
+            recent_score_components = {
+                'mode': 'standard',
+                'avg_signal_frequency': score_veto['avg_signal_frequency'],
+                'score_timeframes': score_veto['score_timeframes'],
+            }
 
-        epoch_avg_loss = epoch_train_loss_total / max(epoch_train_batches, 1)
+        epoch_avg_loss = _metric_bucket_mean(epoch_train_logs, 'total_loss') if epoch_train_logs else 0.0
         epoch_avg_val_loss = epoch_score_summary['avg_val_loss']
         epoch_train_main = _metric_bucket_mean(epoch_train_logs, 'main') if epoch_train_logs else 0.0
         epoch_train_aux = _metric_bucket_mean(epoch_train_logs, 'aux') if epoch_train_logs else 0.0
+        skipped_train_steps = int(sum(train_skip_counters.values()))
+        eval_skip_counters = dict(sorted(epoch_all_bucket['skip_counters'].items()))
         print(
             f"[EPOCH {epoch + 1}] train_loss={epoch_avg_loss:.6f} val_loss={epoch_avg_val_loss:.6f} "
             f"score={composite_score:.4f} veto={score_veto['passed']}"
@@ -2008,6 +2584,13 @@ def train(args):
             f"[EPOCH {epoch + 1}] effective_train_samples_by_timeframe="
             f"{dict(sorted(epoch_effective_train_samples_by_timeframe.items()))}"
         )
+        if skipped_train_steps:
+            print(
+                f"[EPOCH {epoch + 1}] skipped_train_steps={skipped_train_steps} "
+                f"detail={dict(sorted(train_skip_counters.items()))}"
+            )
+        if eval_skip_counters:
+            print(f"[EPOCH {epoch + 1}] eval_skip_counters={eval_skip_counters}")
         if score_veto['reasons']:
             print(f"[EPOCH {epoch + 1}] veto_reasons={score_veto['reasons']}")
 
@@ -2049,6 +2632,12 @@ def train(args):
                     'reversion_precision': summary['reversion_metrics']['precision'],
                     'breakout_hard_negative_rate': summary['breakout_metrics']['hard_negative_rate'],
                     'reversion_hard_negative_rate': summary['reversion_metrics']['hard_negative_rate'],
+                    'breakout_oversignal': summary['breakout_oversignal'],
+                    'reversion_oversignal': summary['reversion_oversignal'],
+                    'breakout_signal_space_mean': summary['breakout_signal_space_mean'],
+                    'reversion_signal_space_mean': summary['reversion_signal_space_mean'],
+                    'breakout_signal_quality_mean': summary['breakout_signal_quality_mean'],
+                    'reversion_signal_quality_mean': summary['reversion_signal_quality_mean'],
                     'direction_macro_f1': summary['direction_metrics']['macro_f1'],
                     'signal_frequency': summary['signal_frequency'],
                     'pred_rev_mean': summary['pred_rev_mean'],
@@ -2076,6 +2665,12 @@ def train(args):
                     'reversion_precision': summary['reversion_metrics']['precision'],
                     'breakout_hard_negative_rate': summary['breakout_metrics']['hard_negative_rate'],
                     'reversion_hard_negative_rate': summary['reversion_metrics']['hard_negative_rate'],
+                    'breakout_oversignal': summary['breakout_oversignal'],
+                    'reversion_oversignal': summary['reversion_oversignal'],
+                    'breakout_signal_space_mean': summary['breakout_signal_space_mean'],
+                    'reversion_signal_space_mean': summary['reversion_signal_space_mean'],
+                    'breakout_signal_quality_mean': summary['breakout_signal_quality_mean'],
+                    'reversion_signal_quality_mean': summary['reversion_signal_quality_mean'],
                     'direction_macro_f1': summary['direction_metrics']['macro_f1'],
                     'signal_frequency': summary['signal_frequency'],
                     'pred_rev_mean': summary['pred_rev_mean'],
@@ -2210,6 +2805,9 @@ def train(args):
             'train_main': epoch_train_main,
             'train_aux': epoch_train_aux,
             'effective_train_samples_by_timeframe': dict(sorted(epoch_effective_train_samples_by_timeframe.items())),
+            'skipped_train_steps': skipped_train_steps,
+            'train_skip_counters': dict(sorted(train_skip_counters.items())),
+            'eval_skip_counters': eval_skip_counters,
             'horizon_family_guard_passed': horizon_family_guard_passed,
             'best_raw_updated': best_raw_updated,
             'best_gate_updated': best_gate_updated,
@@ -2220,6 +2818,12 @@ def train(args):
             'reversion_precision': epoch_score_summary['reversion_metrics']['precision'],
             'breakout_hard_negative_rate': epoch_score_summary['breakout_metrics']['hard_negative_rate'],
             'reversion_hard_negative_rate': epoch_score_summary['reversion_metrics']['hard_negative_rate'],
+            'breakout_oversignal': epoch_score_summary['breakout_oversignal'],
+            'reversion_oversignal': epoch_score_summary['reversion_oversignal'],
+            'breakout_signal_space_mean': epoch_score_summary['breakout_signal_space_mean'],
+            'reversion_signal_space_mean': epoch_score_summary['reversion_signal_space_mean'],
+            'breakout_signal_quality_mean': epoch_score_summary['breakout_signal_quality_mean'],
+            'reversion_signal_quality_mean': epoch_score_summary['reversion_signal_quality_mean'],
             'direction_macro_f1': epoch_score_summary['direction_metrics']['macro_f1'],
             'signal_frequency': epoch_score_summary['signal_frequency'],
             'pred_rev_mean': epoch_score_summary['pred_rev_mean'],
@@ -2253,6 +2857,9 @@ def train(args):
             'score_veto': score_veto,
             'horizon_summary': horizon_summary,
             'effective_train_samples_by_timeframe': dict(sorted(epoch_effective_train_samples_by_timeframe.items())),
+            'skipped_train_steps': skipped_train_steps,
+            'train_skip_counters': dict(sorted(train_skip_counters.items())),
+            'eval_skip_counters': eval_skip_counters,
             'horizon_family_guard_passed': horizon_family_guard_passed,
             'best_raw_updated': best_raw_updated,
             'best_gate_updated': best_gate_updated,
@@ -2425,6 +3032,8 @@ if __name__ == "__main__":
     parser.add_argument('--kill_keep_public_violation_rate_max', type=float, default=1.0)
     parser.add_argument('--kill_keep_signal_frequency_max', type=float, default=1.0)
     parser.add_argument('--kill_keep_timeframe_60m_composite_min', type=float, default=0.0)
+    parser.add_argument('--kill_keep_breakout_signal_space_min', type=float, default=0.0)
+    parser.add_argument('--kill_keep_reversion_signal_space_min', type=float, default=0.0)
     parser.add_argument('--kill_keep_horizon_entropy_min', type=float, default=0.0)
     parser.add_argument('--kill_keep_horizon_entropy_timeframes', type=str, default=None)
     train(parser.parse_args())
