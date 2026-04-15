@@ -594,8 +594,12 @@ class KHAOS_KAN(nn.Module):
             # 【优化修改】：打破严格的凸组合限制，解决 public_below_directional_violation_rate 接近 100% 的问题
             # 将加权平均改为“以 directional_reversion 为基座，向上叠加残差”的方式，
             # 确保 reversion_pred 能够突破 max(blue, purple) 的上限限制，满足 loss.py 中的可行域约束。
-            reversion_event_logits = directional_reversion_h + public_reversion_gate * torch.relu(
+            reversion_residual = public_reversion_gate * torch.relu(
                 public_reversion_score_h - directional_reversion_h + 0.15
+            )
+            reversion_event_logits = torch.maximum(
+                directional_floor_h + 0.10,
+                directional_reversion_h + reversion_residual,
             )
         else:
             reversion_event_logits = directional_reversion_h

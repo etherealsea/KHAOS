@@ -338,10 +338,10 @@ CONSTRAINT_PROFILE_PRESETS = {
     },
     'teacher_feasible_discovery_v1': {
         'enabled': True,
-        'weight': 0.24,
-        'blue_margin': 0.10,
-        'purple_margin': 0.10,
-        'reversion_event_margin': 0.08,
+        'weight': 0.40,
+        'blue_margin': 0.12,
+        'purple_margin': 0.12,
+        'reversion_event_margin': 0.12,
         'continuation_margin': 0.06,
     },
 }

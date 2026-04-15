@@ -222,6 +222,51 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags, selection_mo
     return best or fallback_best
 
 
+def compute_event_metrics_at_threshold(scores, event_flags, hard_negative_flags, threshold):
+    scores = np.asarray(scores, dtype=np.float64)
+    event_flags = np.asarray(event_flags, dtype=bool)
+    hard_negative_flags = np.asarray(hard_negative_flags, dtype=bool)
+    if len(scores) == 0:
+        return {
+            'threshold': float(threshold or 0.0),
+            'accuracy': 0.0,
+            'precision': 0.0,
+            'recall': 0.0,
+            'f1': 0.0,
+            'event_rate': 0.0,
+            'hard_negative_rate': 0.0,
+            'signal_frequency': 0.0,
+            'label_frequency': 0.0,
+            'oversignal': 0.0,
+        }
+    label_frequency = float(np.mean(event_flags)) if len(event_flags) > 0 else 0.0
+    threshold = float(threshold or 0.0)
+    pred = scores >= threshold
+    tp = np.sum(pred & event_flags)
+    fp = np.sum(pred & ~event_flags)
+    fn = np.sum(~pred & event_flags)
+    tn = np.sum(~pred & ~event_flags)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+    accuracy = (tp + tn) / max(len(scores), 1)
+    hn_rate = np.mean(pred[hard_negative_flags]) if np.any(hard_negative_flags) else 0.0
+    event_rate = np.mean(pred[event_flags]) if np.any(event_flags) else 0.0
+    signal_frequency = float(np.mean(pred)) if len(pred) else 0.0
+    return {
+        'threshold': float(threshold),
+        'accuracy': float(accuracy),
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1': float(f1),
+        'event_rate': float(event_rate),
+        'hard_negative_rate': float(hn_rate),
+        'signal_frequency': signal_frequency,
+        'label_frequency': label_frequency,
+        'oversignal': max(signal_frequency - label_frequency, 0.0),
+    }
+
+
 def compute_event_quality(metrics):
     signal_gap = abs(metrics['signal_frequency'] - metrics['label_frequency'])
     return metrics['f1'] - 0.20 * metrics['hard_negative_rate'] - 0.05 * signal_gap
@@ -567,7 +612,7 @@ def _masked_array_mean(values, mask):
     return float(values[mask].mean())
 
 
-def summarize_metric_bucket(bucket, score_profile='default', use_direction_metrics=False):
+def summarize_metric_bucket(bucket, score_profile='default', use_direction_metrics=False, frozen_thresholds=None):
     zero_summary = {
         'sample_count': 0,
         'avg_val_loss': 0.0,
@@ -627,6 +672,8 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         'loss_horizon_hard_negative': 0.0,
         'loss_horizon_entropy': 0.0,
         'loss_signal_calibration': 0.0,
+        'thresholds_frozen': False,
+        'frozen_thresholds': None,
         **{
             key: 0.0
             for base_key in CONSTRAINT_STAT_BASE_KEYS
@@ -664,20 +711,41 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
     breakout_hn_mean = float(breakout_metric_scores[flags_np[:, 2] > 0.5].mean()) if np.any(flags_np[:, 2] > 0.5) else 0.0
     reversion_hn_mean = float(reversion_metric_scores[flags_np[:, 3] > 0.5].mean()) if np.any(flags_np[:, 3] > 0.5) else 0.0
     event_selection_mode = resolve_event_selection_mode(score_profile)
-    breakout_metrics = compute_event_metrics(
-        breakout_metric_scores,
-        flags_np[:, 0] > 0.5,
-        flags_np[:, 2] > 0.5,
-        selection_mode=event_selection_mode,
-        event_type='breakout',
-    )
-    reversion_metrics = compute_event_metrics(
-        reversion_metric_scores,
-        reversion_event_mask,
-        flags_np[:, 3] > 0.5,
-        selection_mode=event_selection_mode,
-        event_type='reversion',
-    )
+    frozen_breakout_threshold = None
+    frozen_reversion_threshold = None
+    if isinstance(frozen_thresholds, dict):
+        frozen_breakout_threshold = frozen_thresholds.get('breakout')
+        frozen_reversion_threshold = frozen_thresholds.get('reversion')
+    if frozen_breakout_threshold is None:
+        breakout_metrics = compute_event_metrics(
+            breakout_metric_scores,
+            flags_np[:, 0] > 0.5,
+            flags_np[:, 2] > 0.5,
+            selection_mode=event_selection_mode,
+            event_type='breakout',
+        )
+    else:
+        breakout_metrics = compute_event_metrics_at_threshold(
+            breakout_metric_scores,
+            flags_np[:, 0] > 0.5,
+            flags_np[:, 2] > 0.5,
+            threshold=frozen_breakout_threshold,
+        )
+    if frozen_reversion_threshold is None:
+        reversion_metrics = compute_event_metrics(
+            reversion_metric_scores,
+            reversion_event_mask,
+            flags_np[:, 3] > 0.5,
+            selection_mode=event_selection_mode,
+            event_type='reversion',
+        )
+    else:
+        reversion_metrics = compute_event_metrics_at_threshold(
+            reversion_metric_scores,
+            reversion_event_mask,
+            flags_np[:, 3] > 0.5,
+            threshold=frozen_reversion_threshold,
+        )
     breakout_space_summary = compute_signal_space_summary(
         breakout_metric_scores,
         breakout_metrics['threshold'],
@@ -787,6 +855,11 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             'loss_horizon_hard_negative': _metric_bucket_mean(bucket['logs'], 'horizon_hard_negative'),
             'loss_horizon_entropy': _metric_bucket_mean(bucket['logs'], 'horizon_entropy'),
             'loss_signal_calibration': _metric_bucket_mean(bucket['logs'], 'signal_calibration'),
+            'thresholds_frozen': bool(frozen_breakout_threshold is not None or frozen_reversion_threshold is not None),
+            'frozen_thresholds': {
+                'breakout': float(frozen_breakout_threshold) if frozen_breakout_threshold is not None else None,
+                'reversion': float(frozen_reversion_threshold) if frozen_reversion_threshold is not None else None,
+            } if (frozen_breakout_threshold is not None or frozen_reversion_threshold is not None) else None,
         }
     )
     for base_key in CONSTRAINT_STAT_BASE_KEYS:
@@ -2335,6 +2408,7 @@ def train(args):
     print("Loading all datasets for global mixed training...")
     train_dataset_specs = []
     eval_jobs = []
+    threshold_fit_jobs = []
     for job_idx, record in enumerate(runtime_records):
         data_path = record['path']
         split_label = record.get('split_label')
@@ -2356,6 +2430,13 @@ def train(args):
                     'data_path': data_path,
                     'asset_code': dataset_meta.get('asset_code') or record.get('asset_code'),
                 })
+                if not getattr(args, 'disable_threshold_fit', False):
+                    threshold_fit_jobs.append({
+                        'eval_ds': build_capped_dataset(train_ds, args, timeframe_label),
+                        'timeframe_label': timeframe_label,
+                        'split_label': split_label,
+                        'data_path': data_path,
+                    })
             
             if eval_ds is not None and len(eval_ds) > 0:
                 eval_jobs.append({
@@ -2467,6 +2548,37 @@ def train(args):
         epoch_effective_train_samples_by_timeframe = defaultdict(int, global_train_plan['samples_by_timeframe'])
 
         kan.eval()
+        frozen_thresholds_by_timeframe = {}
+        if threshold_fit_jobs:
+            epoch_threshold_fit_buckets = defaultdict(build_metric_bucket)
+            for threshold_job in threshold_fit_jobs:
+                timeframe_label = threshold_job['timeframe_label']
+                try:
+                    fit_loader = build_eval_loader(threshold_job['eval_ds'], args)
+                    fit_bucket = evaluate_dataset_loader(
+                        kan=kan,
+                        eval_loader=fit_loader,
+                        criterion=criterion,
+                        args=args,
+                        device=device,
+                        use_debug_metrics=use_debug_metrics,
+                    )
+                    merge_metric_bucket(epoch_threshold_fit_buckets[timeframe_label], fit_bucket)
+                except Exception as exc:
+                    print(f"Error threshold-fitting {os.path.basename(threshold_job['data_path'])} timeframe={timeframe_label}: {exc}")
+                    continue
+            for timeframe, bucket in epoch_threshold_fit_buckets.items():
+                if not bucket['preds']:
+                    continue
+                fit_summary = summarize_metric_bucket(
+                    bucket,
+                    score_profile=score_profile,
+                    use_direction_metrics=use_direction_metrics,
+                )
+                frozen_thresholds_by_timeframe[timeframe] = {
+                    'breakout': float(fit_summary['breakout_metrics']['threshold']),
+                    'reversion': float(fit_summary['reversion_metrics']['threshold']),
+                }
         processed_jobs = 0
         for eval_job in eval_jobs:
             data_path = eval_job['data_path']
@@ -2517,6 +2629,7 @@ def train(args):
                 bucket,
                 score_profile=score_profile,
                 use_direction_metrics=use_direction_metrics,
+                frozen_thresholds=frozen_thresholds_by_timeframe.get(timeframe),
             )
             for timeframe, bucket in sorted(epoch_timeframe_buckets.items())
         }
@@ -3020,6 +3133,7 @@ if __name__ == "__main__":
     parser.add_argument('--dataset_cache_dir', type=str, default=None)
     parser.add_argument('--disable_dataset_cache', action='store_true', default=False)
     parser.add_argument('--skip_dataset_cache_prewarm', action='store_true', default=False)
+    parser.add_argument('--disable_threshold_fit', action='store_true', default=False)
     parser.add_argument('--config_fingerprint', type=str, default=None)
     parser.add_argument('--baseline_reference_dir', type=str, default=None)
     parser.add_argument('--enforce_horizon_family_guard', action='store_true', default=False)
@@ -3029,7 +3143,7 @@ if __name__ == "__main__":
     parser.add_argument('--breakout_precision_floor', type=float, default=0.0)
     parser.add_argument('--reversion_precision_floor', type=float, default=0.0)
     parser.add_argument('--kill_keep_review_epoch', type=int, default=0)
-    parser.add_argument('--kill_keep_public_violation_rate_max', type=float, default=1.0)
+    parser.add_argument('--kill_keep_public_violation_rate_max', type=float, default=0.25)
     parser.add_argument('--kill_keep_signal_frequency_max', type=float, default=1.0)
     parser.add_argument('--kill_keep_timeframe_60m_composite_min', type=float, default=0.0)
     parser.add_argument('--kill_keep_breakout_signal_space_min', type=float, default=0.0)
