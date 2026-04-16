@@ -2357,6 +2357,7 @@ def train(args):
     epoch_metrics_path = os.path.join(args.save_dir, getattr(args, 'epoch_metrics_name', 'epoch_metrics.jsonl'))
     per_timeframe_metrics_path = os.path.join(args.save_dir, getattr(args, 'per_timeframe_metrics_name', 'per_timeframe_metrics.jsonl'))
     per_fold_metrics_path = os.path.join(args.save_dir, getattr(args, 'per_fold_metrics_name', 'per_fold_metrics.jsonl'))
+    per_asset_metrics_path = os.path.join(args.save_dir, getattr(args, 'per_asset_metrics_name', 'per_asset_metrics.jsonl'))
     final_holdout_metrics_path = os.path.join(args.save_dir, getattr(args, 'final_holdout_metrics_name', 'final_holdout_metrics.json'))
     horizon_summary_path = os.path.join(args.save_dir, getattr(args, 'horizon_summary_name', 'horizon_discovery_summary.json'))
     horizon_family_guard_passed = True
@@ -2397,7 +2398,7 @@ def train(args):
     best_gate_score = resume_state['best_gate_score']
     no_improve_epochs = resume_state['no_improve_epochs']
     if start_epoch == 0:
-        for metric_path in (epoch_metrics_path, per_timeframe_metrics_path, per_fold_metrics_path):
+        for metric_path in (epoch_metrics_path, per_timeframe_metrics_path, per_fold_metrics_path, per_asset_metrics_path):
             if metric_path and os.path.exists(metric_path):
                 os.remove(metric_path)
 
@@ -2443,7 +2444,8 @@ def train(args):
                     'eval_ds': eval_ds,
                     'timeframe_label': timeframe_label,
                     'split_label': split_label,
-                    'data_path': data_path
+                    'data_path': data_path,
+                    'asset_code': dataset_meta.get('asset_code') or record.get('asset_code'),
                 })
         except Exception as exc:
             import traceback
@@ -2599,6 +2601,7 @@ def train(args):
                     file_bucket,
                     score_profile=score_profile,
                     use_direction_metrics=use_direction_metrics,
+                    frozen_thresholds=frozen_thresholds_by_timeframe.get(timeframe_label),
                 )
                 
                 print(
@@ -2612,6 +2615,49 @@ def train(args):
                 merge_metric_bucket(epoch_timeframe_buckets[timeframe_label], file_bucket)
                 if split_label:
                     merge_metric_bucket(epoch_fold_buckets[split_label], file_bucket)
+                append_jsonl(
+                    per_asset_metrics_path,
+                    {
+                        'epoch': epoch + 1,
+                        'asset': eval_job.get('asset_code') or 'unknown',
+                        'timeframe': timeframe_label,
+                        'split_label': split_label or 'default',
+                        'file': os.path.basename(data_path),
+                        'constraint_profile': getattr(args, 'constraint_profile', 'default'),
+                        'arch_version': getattr(args, 'arch_version', 'iterA2_base'),
+                        'dataset_profile': getattr(args, 'dataset_profile', 'iterA2'),
+                        'loss_profile': getattr(args, 'loss_profile', 'default'),
+                        'score_profile': score_profile,
+                        'thresholds_frozen': bool(file_summary.get('thresholds_frozen', False)),
+                        'frozen_thresholds': file_summary.get('frozen_thresholds'),
+                        'sample_count': file_summary['sample_count'],
+                        'breakout_f1': file_summary['breakout_metrics']['f1'],
+                        'reversion_f1': file_summary['reversion_metrics']['f1'],
+                        'breakout_precision': file_summary['breakout_metrics']['precision'],
+                        'reversion_precision': file_summary['reversion_metrics']['precision'],
+                        'breakout_hard_negative_rate': file_summary['breakout_metrics']['hard_negative_rate'],
+                        'reversion_hard_negative_rate': file_summary['reversion_metrics']['hard_negative_rate'],
+                        'breakout_oversignal': file_summary['breakout_oversignal'],
+                        'reversion_oversignal': file_summary['reversion_oversignal'],
+                        'breakout_signal_space_mean': file_summary['breakout_signal_space_mean'],
+                        'reversion_signal_space_mean': file_summary['reversion_signal_space_mean'],
+                        'breakout_signal_quality_mean': file_summary['breakout_signal_quality_mean'],
+                        'reversion_signal_quality_mean': file_summary['reversion_signal_quality_mean'],
+                        'direction_macro_f1': file_summary['direction_metrics']['macro_f1'],
+                        'signal_frequency': file_summary['signal_frequency'],
+                        'pred_rev_mean': file_summary['pred_rev_mean'],
+                        'pred_rev_event_mean': file_summary['pred_rev_event_mean'],
+                        'directional_floor_mean': file_summary['directional_floor_mean'],
+                        'directional_floor_reversion_event_mean': file_summary['directional_floor_reversion_event_mean'],
+                        'reversion_event_count': file_summary['reversion_event_count'],
+                        'selected_horizon_breakout_value_mean': file_summary['selected_horizon_breakout_value_mean'],
+                        'selected_horizon_reversion_value_mean': file_summary['selected_horizon_reversion_value_mean'],
+                        'horizon_entropy_breakout_mean': file_summary['horizon_entropy_breakout_mean'],
+                        'horizon_entropy_reversion_mean': file_summary['horizon_entropy_reversion_mean'],
+                        'public_below_directional_violation_rate': file_summary['public_below_directional_violation_rate'],
+                        'composite_score': file_summary['composite_score'],
+                    },
+                )
                 processed_jobs += 1
             except Exception as exc:
                 import traceback
