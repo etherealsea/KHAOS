@@ -2784,6 +2784,8 @@ def train(args):
                     'dataset_profile': getattr(args, 'dataset_profile', 'iterA2'),
                     'loss_profile': getattr(args, 'loss_profile', 'default'),
                     'score_profile': score_profile,
+                    'thresholds_frozen': bool(summary.get('thresholds_frozen', False)),
+                    'frozen_thresholds': summary.get('frozen_thresholds'),
                     'sample_count': summary['sample_count'],
                     'breakout_f1': summary['breakout_metrics']['f1'],
                     'reversion_f1': summary['reversion_metrics']['f1'],
@@ -3143,6 +3145,7 @@ if __name__ == "__main__":
     parser.add_argument('--epoch_metrics_name', type=str, default='epoch_metrics.jsonl')
     parser.add_argument('--per_timeframe_metrics_name', type=str, default='per_timeframe_metrics.jsonl')
     parser.add_argument('--per_fold_metrics_name', type=str, default='per_fold_metrics.jsonl')
+    parser.add_argument('--per_asset_metrics_name', type=str, default='per_asset_metrics.jsonl')
     parser.add_argument('--final_holdout_metrics_name', type=str, default='final_holdout_metrics.json')
     parser.add_argument('--horizon_summary_name', type=str, default='horizon_discovery_summary.json')
     parser.add_argument('--epochs', type=int, default=3)

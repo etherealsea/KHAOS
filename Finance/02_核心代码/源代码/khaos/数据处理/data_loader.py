@@ -623,6 +623,7 @@ class FinancialDataset(Dataset):
         self.forecast_horizon = forecast_horizon
         self.feature_names = PHYSICS_FEATURE_NAMES
         df.columns = [c.lower().strip() for c in df.columns]
+        self.time = df['time'].values if 'time' in df.columns else None
         required_cols = ['open', 'high', 'low', 'close', 'volume']
         for col in required_cols:
             if col not in df.columns:
@@ -636,8 +637,9 @@ class FinancialDataset(Dataset):
         log_high = np.log(np.maximum(self.high, 1e-8))
         log_low = np.log(np.maximum(self.low, 1e-8))
         returns = np.diff(log_close, prepend=log_close[0])
-        self.sigma = pd.Series(returns).rolling(window=volatility_window, min_periods=1).std().bfill().values
-        self.sigma = np.maximum(self.sigma, 1e-6).astype(np.float32)
+        sigma = pd.Series(returns).rolling(window=volatility_window, min_periods=1).std()
+        sigma = sigma.ffill().fillna(0.0).values
+        self.sigma = np.maximum(sigma, 1e-6).astype(np.float32)
         self.ema20 = ema_np(self.close, 20)
         entropy = rolling_entropy_proxy_np(self.high, self.low, self.close, LOCAL_PHYSICS_WINDOW)
         hurst = rolling_hurst_proxy_np(log_close, LOCAL_PHYSICS_WINDOW)
