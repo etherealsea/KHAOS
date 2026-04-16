@@ -59,8 +59,8 @@ from khaos.模型训练.loss import PhysicsLoss
 from khaos.核心引擎.physics import PHYSICS_FEATURE_NAMES
 
 DEBUG_BATCH_KEYS = (
-    'blue_score',
-    'purple_score',
+    'bear_score',
+    'bull_score',
     'direction_gate',
     'public_reversion_gate',
     'breakout_residual_gate',
@@ -74,8 +74,8 @@ DEBUG_BATCH_KEYS = (
 )
 
 CONSTRAINT_STAT_BASE_KEYS = (
-    'blue_over_purple_violation',
-    'purple_over_blue_violation',
+    'bear_over_bull_violation',
+    'bull_over_bear_violation',
     'public_below_directional_violation',
     'continuation_public_violation',
 )
@@ -368,27 +368,27 @@ def _zero_direction_metrics():
     return {
         'accuracy': 0.0,
         'macro_f1': 0.0,
-        'blue_f1': 0.0,
-        'purple_f1': 0.0,
+        'bear_f1': 0.0,
+        'bull_f1': 0.0,
         'support': 0,
     }
 
 
-def compute_direction_metrics(blue_scores, purple_scores, flags):
-    blue_scores = np.asarray(blue_scores, dtype=np.float64).reshape(-1)
-    purple_scores = np.asarray(purple_scores, dtype=np.float64).reshape(-1)
+def compute_direction_metrics(bear_scores, bull_scores, flags):
+    bear_scores = np.asarray(bear_scores, dtype=np.float64).reshape(-1)
+    bull_scores = np.asarray(bull_scores, dtype=np.float64).reshape(-1)
     flags = np.asarray(flags, dtype=np.float64)
-    blue_idx = EVENT_FLAG_INDEX['reversion_down_context']
-    purple_idx = EVENT_FLAG_INDEX['reversion_up_context']
-    if flags.ndim != 2 or flags.shape[1] <= max(blue_idx, purple_idx):
+    bear_idx = EVENT_FLAG_INDEX['reversion_down_context']
+    bull_idx = EVENT_FLAG_INDEX['reversion_up_context']
+    if flags.ndim != 2 or flags.shape[1] <= max(bear_idx, bull_idx):
         return _zero_direction_metrics()
-    blue_mask = flags[:, blue_idx] > 0.5
-    purple_mask = flags[:, purple_idx] > 0.5
-    valid_mask = blue_mask | purple_mask
+    bear_mask = flags[:, bear_idx] > 0.5
+    bull_mask = flags[:, bull_idx] > 0.5
+    valid_mask = bear_mask | bull_mask
     if not np.any(valid_mask):
         return _zero_direction_metrics()
-    truth = np.where(blue_mask[valid_mask], 1, 0)
-    pred = np.where(blue_scores[valid_mask] >= purple_scores[valid_mask], 1, 0)
+    truth = np.where(bear_mask[valid_mask], 1, 0)
+    pred = np.where(bear_scores[valid_mask] >= bull_scores[valid_mask], 1, 0)
 
     def _binary_f1(target_label):
         truth_mask = truth == target_label
@@ -400,13 +400,13 @@ def compute_direction_metrics(blue_scores, purple_scores, flags):
         recall = tp / max(tp + fn, 1)
         return 2 * precision * recall / max(precision + recall, 1e-8)
 
-    blue_f1 = float(_binary_f1(1))
-    purple_f1 = float(_binary_f1(0))
+    bear_f1 = float(_binary_f1(1))
+    bull_f1 = float(_binary_f1(0))
     return {
         'accuracy': float(np.mean(truth == pred)),
-        'macro_f1': float((blue_f1 + purple_f1) / 2.0),
-        'blue_f1': blue_f1,
-        'purple_f1': purple_f1,
+        'macro_f1': float((bear_f1 + bull_f1) / 2.0),
+        'bear_f1': bear_f1,
+        'bull_f1': bull_f1,
         'support': int(np.sum(valid_mask)),
     }
 
@@ -758,10 +758,10 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         target_np[:, 1],
         aux_np[:, 1],
     )
-    blue_scores = _flatten_debug_batches(bucket['debug_batches']['blue_score'])
-    purple_scores = _flatten_debug_batches(bucket['debug_batches']['purple_score'])
-    direction_metrics = compute_direction_metrics(blue_scores, purple_scores, flags_np) if (
-        use_direction_metrics and blue_scores.size > 0 and purple_scores.size > 0
+    bear_scores = _flatten_debug_batches(bucket['debug_batches']['bear_score'])
+    bull_scores = _flatten_debug_batches(bucket['debug_batches']['bull_score'])
+    direction_metrics = compute_direction_metrics(bear_scores, bull_scores, flags_np) if (
+        use_direction_metrics and bear_scores.size > 0 and bull_scores.size > 0
     ) else _zero_direction_metrics()
     direction_gate_values = _flatten_debug_batches(bucket['debug_batches']['direction_gate'])
     public_gate_values = _flatten_debug_batches(bucket['debug_batches']['public_reversion_gate'])
