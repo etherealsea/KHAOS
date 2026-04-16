@@ -273,26 +273,21 @@ def compute_event_quality(metrics):
 
 
 def compute_precision_first_event_quality(metrics, event_type='generic'):
-    signal_gap = abs(metrics['signal_frequency'] - metrics['label_frequency'])
-    oversignal = max(metrics['signal_frequency'] - metrics['label_frequency'], 0.0)
-    if event_type == 'reversion':
-        return (
-            0.44 * metrics['precision'] +
-            0.34 * metrics['f1'] +
-            0.12 * metrics['accuracy'] +
-            0.10 * metrics['recall'] -
-            0.30 * metrics['hard_negative_rate'] -
-            0.18 * oversignal -
-            0.05 * signal_gap
-        )
+    """
+    Iter11: Strictly prioritize Precision. 
+    Returns negative score if hard constraints are violated.
+    """
+    # Hard constraints: Need at least 60% precision and acceptable hard negative rate
+    if metrics['precision'] < 0.60 or metrics['hard_negative_rate'] > 0.15:
+        # Return a very low score but keep some ordering
+        return -999.0 + metrics['precision'] - metrics['hard_negative_rate']
+
+    # Focus purely on finding the most accurate signal
     return (
-        0.42 * metrics['precision'] +
-        0.36 * metrics['f1'] +
-        0.12 * metrics['accuracy'] +
-        0.10 * metrics['recall'] -
-        0.26 * metrics['hard_negative_rate'] -
-        0.14 * oversignal -
-        0.05 * signal_gap
+        0.80 * metrics['precision'] +           # Massive weight on precision
+        0.10 * metrics['f1'] +                  # Slight weight on F1 to break ties
+        0.10 * metrics['accuracy'] -
+        0.40 * metrics['hard_negative_rate']    # Heavy penalty for bad signals
     )
 
 
