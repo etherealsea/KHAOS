@@ -110,8 +110,26 @@ PRECISION_FIRST_SCORE_PROFILES = {
     'short_t_discovery_focus',
     'short_t_discovery_guarded_focus',
     'recent_precision_v1',
+    'iter11_precision_first',
 }
 AUX_GATED_SCORE_PROFILES = {'short_t_discovery_guarded_focus'}
+
+PRECISION_FIRST_PROFILE_CONFIG = {
+    'default': {
+        'min_precision': 0.60,
+        'max_hard_negative_rate': 0.15,
+        'threshold_grid_min': 0.55,
+        'threshold_grid_max': 0.99,
+        'threshold_grid_points': 12,
+    },
+    'iter11_precision_first': {
+        'min_precision': 0.70,
+        'max_hard_negative_rate': 0.12,
+        'threshold_grid_min': 0.75,
+        'threshold_grid_max': 0.995,
+        'threshold_grid_points': 12,
+    },
+}
 
 
 def resolve_event_selection_mode(score_profile='default'):
@@ -120,8 +138,10 @@ def resolve_event_selection_mode(score_profile='default'):
     return 'f1'
 
 
-def resolve_event_oversignal_cap(label_frequency, event_type='generic'):
+def resolve_event_oversignal_cap(label_frequency, event_type='generic', score_profile='default'):
     label_frequency = float(label_frequency)
+    if score_profile == 'iter11_precision_first':
+        return min(label_frequency, 0.05)
     if event_type == 'reversion':
         return min(label_frequency + 0.02, 0.32)
     if event_type == 'breakout':
@@ -136,17 +156,27 @@ def compute_event_oversignal(metrics):
     )
 
 
-def score_event_candidate(candidate, selection_mode='f1', event_type='generic'):
+def score_event_candidate(candidate, selection_mode='f1', event_type='generic', score_profile='default'):
     if selection_mode == 'precision_first':
-        return compute_precision_first_event_quality(candidate, event_type=event_type)
+        return compute_precision_first_event_quality(candidate, event_type=event_type, score_profile=score_profile)
     return float(candidate['f1'])
 
 
-def is_better_event_candidate(candidate, best, selection_mode='f1', event_type='generic'):
+def is_better_event_candidate(candidate, best, selection_mode='f1', event_type='generic', score_profile='default'):
     if best is None:
         return True
-    candidate_score = score_event_candidate(candidate, selection_mode=selection_mode, event_type=event_type)
-    best_score = score_event_candidate(best, selection_mode=selection_mode, event_type=event_type)
+    candidate_score = score_event_candidate(
+        candidate,
+        selection_mode=selection_mode,
+        event_type=event_type,
+        score_profile=score_profile,
+    )
+    best_score = score_event_candidate(
+        best,
+        selection_mode=selection_mode,
+        event_type=event_type,
+        score_profile=score_profile,
+    )
     if candidate_score > best_score + 1e-12:
         return True
     if best_score > candidate_score + 1e-12:
@@ -166,7 +196,14 @@ def is_better_event_candidate(candidate, best, selection_mode='f1', event_type='
     return candidate['threshold'] > best['threshold']
 
 
-def compute_event_metrics(scores, event_flags, hard_negative_flags, selection_mode='f1', event_type='generic'):
+def compute_event_metrics(
+    scores,
+    event_flags,
+    hard_negative_flags,
+    selection_mode='f1',
+    event_type='generic',
+    score_profile='default',
+):
     scores = np.asarray(scores, dtype=np.float64)
     event_flags = np.asarray(event_flags, dtype=bool)
     hard_negative_flags = np.asarray(hard_negative_flags, dtype=bool)
@@ -184,11 +221,24 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags, selection_mo
             'oversignal': 0.0,
         }
     label_frequency = float(np.mean(event_flags)) if len(event_flags) > 0 else 0.0
-    threshold_grid = np.linspace(0.55, 0.99, 12) if selection_mode == 'precision_first' else np.linspace(0.55, 0.95, 9)
+    precision_cfg = PRECISION_FIRST_PROFILE_CONFIG.get(score_profile) or PRECISION_FIRST_PROFILE_CONFIG['default']
+    threshold_grid = (
+        np.linspace(
+            float(precision_cfg['threshold_grid_min']),
+            float(precision_cfg['threshold_grid_max']),
+            int(precision_cfg['threshold_grid_points']),
+        )
+        if selection_mode == 'precision_first'
+        else np.linspace(0.55, 0.95, 9)
+    )
     thresholds = np.unique(np.quantile(scores, threshold_grid))
     best = None
     fallback_best = None
-    oversignal_cap = resolve_event_oversignal_cap(label_frequency, event_type=event_type) if selection_mode == 'precision_first' else None
+    oversignal_cap = (
+        resolve_event_oversignal_cap(label_frequency, event_type=event_type, score_profile=score_profile)
+        if selection_mode == 'precision_first'
+        else None
+    )
     for threshold in thresholds:
         pred = scores >= threshold
         tp = np.sum(pred & event_flags)
@@ -213,11 +263,23 @@ def compute_event_metrics(scores, event_flags, hard_negative_flags, selection_mo
             'label_frequency': label_frequency,
             'oversignal': max(float(np.mean(pred)) - label_frequency, 0.0),
         }
-        if is_better_event_candidate(candidate, fallback_best, selection_mode=selection_mode, event_type=event_type):
+        if is_better_event_candidate(
+            candidate,
+            fallback_best,
+            selection_mode=selection_mode,
+            event_type=event_type,
+            score_profile=score_profile,
+        ):
             fallback_best = candidate
         if oversignal_cap is not None and candidate['signal_frequency'] > oversignal_cap + 1e-12:
             continue
-        if is_better_event_candidate(candidate, best, selection_mode=selection_mode, event_type=event_type):
+        if is_better_event_candidate(
+            candidate,
+            best,
+            selection_mode=selection_mode,
+            event_type=event_type,
+            score_profile=score_profile,
+        ):
             best = candidate
     return best or fallback_best
 
@@ -272,14 +334,15 @@ def compute_event_quality(metrics):
     return metrics['f1'] - 0.20 * metrics['hard_negative_rate'] - 0.05 * signal_gap
 
 
-def compute_precision_first_event_quality(metrics, event_type='generic'):
+def compute_precision_first_event_quality(metrics, event_type='generic', score_profile='default'):
     """
     Iter11: Strictly prioritize Precision. 
     Returns negative score if hard constraints are violated.
     """
-    # Hard constraints: Need at least 60% precision and acceptable hard negative rate
-    if metrics['precision'] < 0.60 or metrics['hard_negative_rate'] > 0.15:
-        # Return a very low score but keep some ordering
+    cfg = PRECISION_FIRST_PROFILE_CONFIG.get(score_profile) or PRECISION_FIRST_PROFILE_CONFIG['default']
+    min_precision = float(cfg.get('min_precision', 0.60))
+    max_hn = float(cfg.get('max_hard_negative_rate', 0.15))
+    if metrics['precision'] < min_precision or metrics['hard_negative_rate'] > max_hn:
         return -999.0 + metrics['precision'] - metrics['hard_negative_rate']
 
     # Focus purely on finding the most accurate signal
@@ -418,9 +481,17 @@ def compute_checkpoint_score(
 ):
     breakout_quality = compute_event_quality(breakout_metrics)
     reversion_quality = compute_event_quality(reversion_metrics)
-    if profile in {'short_t_precision_focus', 'recent_precision_v1'}:
-        breakout_quality = compute_precision_first_event_quality(breakout_metrics, event_type='breakout')
-        reversion_quality = compute_precision_first_event_quality(reversion_metrics, event_type='reversion')
+    if profile in {'short_t_precision_focus', 'recent_precision_v1', 'iter11_precision_first'}:
+        breakout_quality = compute_precision_first_event_quality(
+            breakout_metrics,
+            event_type='breakout',
+            score_profile=profile,
+        )
+        reversion_quality = compute_precision_first_event_quality(
+            reversion_metrics,
+            event_type='reversion',
+            score_profile=profile,
+        )
         if direction_macro_f1 is None:
             return (
                 0.46 * breakout_quality +
@@ -436,8 +507,16 @@ def compute_checkpoint_score(
             0.03 * reversion_corr
         )
     if profile == 'short_t_discovery_focus':
-        breakout_quality = compute_precision_first_event_quality(breakout_metrics, event_type='breakout')
-        reversion_quality = compute_precision_first_event_quality(reversion_metrics, event_type='reversion')
+        breakout_quality = compute_precision_first_event_quality(
+            breakout_metrics,
+            event_type='breakout',
+            score_profile=profile,
+        )
+        reversion_quality = compute_precision_first_event_quality(
+            reversion_metrics,
+            event_type='reversion',
+            score_profile=profile,
+        )
         breakout_space_quality = compute_discovery_space_quality(breakout_space_summary or {}, event_type='breakout')
         reversion_space_quality = compute_discovery_space_quality(reversion_space_summary or {}, event_type='reversion')
         if direction_macro_f1 is None:
@@ -459,8 +538,16 @@ def compute_checkpoint_score(
             0.03 * reversion_corr
         )
     if profile == 'short_t_discovery_guarded_focus':
-        breakout_quality = compute_precision_first_event_quality(breakout_metrics, event_type='breakout')
-        reversion_quality = compute_precision_first_event_quality(reversion_metrics, event_type='reversion')
+        breakout_quality = compute_precision_first_event_quality(
+            breakout_metrics,
+            event_type='breakout',
+            score_profile=profile,
+        )
+        reversion_quality = compute_precision_first_event_quality(
+            reversion_metrics,
+            event_type='reversion',
+            score_profile=profile,
+        )
         breakout_space_quality = compute_discovery_space_quality(breakout_space_summary or {}, event_type='breakout')
         reversion_space_quality = compute_discovery_space_quality(reversion_space_summary or {}, event_type='reversion')
         if direction_macro_f1 is None:
@@ -718,6 +805,7 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             flags_np[:, 2] > 0.5,
             selection_mode=event_selection_mode,
             event_type='breakout',
+            score_profile=score_profile,
         )
     else:
         breakout_metrics = compute_event_metrics_at_threshold(
@@ -733,6 +821,7 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             flags_np[:, 3] > 0.5,
             selection_mode=event_selection_mode,
             event_type='reversion',
+            score_profile=score_profile,
         )
     else:
         reversion_metrics = compute_event_metrics_at_threshold(

@@ -40,7 +40,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--arch_version', type=str, default='iterA4_multiscale')
     parser.add_argument('--constraint_profile', type=str, default='teacher_feasible_discovery_v1')
-    parser.add_argument('--score_profile', type=str, default='short_t_discovery_guarded_focus')
+    parser.add_argument('--score_profile', type=str, default='iter11_precision_first')
     parser.add_argument('--fast_full', action='store_true', default=False)
     args = parser.parse_args()
 
@@ -103,4 +103,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
