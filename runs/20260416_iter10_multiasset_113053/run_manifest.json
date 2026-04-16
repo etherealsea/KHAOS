@@ -1,0 +1,12 @@
+{
+  "run_id": "20260416_iter10_multiasset_113053",
+  "data_dir": "/workspace/data",
+  "training_subdir": "iter10_multiasset",
+  "assets": "000333,000651,000725",
+  "timeframes": "15m,1h,1d",
+  "epochs_total": 2,
+  "chunk_size": 2,
+  "arch_version": "iterA4_multiscale",
+  "constraint_profile": "teacher_feasible_discovery_v1",
+  "score_profile": "iter11_precision_first"
+}
