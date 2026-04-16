@@ -254,8 +254,8 @@ class KHAOS_KAN(nn.Module):
             self.shared_mixer = StateMixer(self.d_model, 2)
             self.transition_mixer = StateMixer(self.d_model, 3)
             self.reversion_mixer = StateMixer(self.d_model, 3)
-            self.blue_mixer = StateMixer(self.d_model, 3)
-            self.purple_mixer = StateMixer(self.d_model, 3)
+            self.bear_mixer = StateMixer(self.d_model, 3)
+            self.bull_mixer = StateMixer(self.d_model, 3)
             if self.arch_version == 'iterA5_multiscale':
                 self.public_reversion_mixer = StateMixer(self.d_model, 3)
             self.direction_gate = nn.Sequential(
@@ -287,10 +287,10 @@ class KHAOS_KAN(nn.Module):
             self.breakout_head = KANHead(
                 self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
             )
-            self.blue_reversion_head = KANHead(
+            self.bear_reversion_head = KANHead(
                 self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
             )
-            self.purple_reversion_head = KANHead(
+            self.bull_reversion_head = KANHead(
                 self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
             )
             if self.arch_version == 'iterA5_multiscale':
@@ -483,8 +483,8 @@ class KHAOS_KAN(nn.Module):
             family_mode=family_mode,
             valid_horizon_mask=valid_horizon_mask,
             reversion_extras={
-                'blue_score': torch.relu(reversion_event_logits),
-                'purple_score': torch.relu(reversion_event_logits),
+                'bear_score': torch.relu(reversion_event_logits),
+                'bull_score': torch.relu(reversion_event_logits),
                 'public_reversion_score': torch.relu(reversion_event_logits),
                 'directional_reversion': torch.relu(reversion_event_logits),
                 'directional_floor': torch.relu(reversion_event_logits),
@@ -502,8 +502,8 @@ class KHAOS_KAN(nn.Module):
             'direction_gate': direction_gate,
             'public_reversion_gate': public_reversion_gate,
             'breakout_residual_gate': breakout_residual_gate,
-            'blue_score': horizon_info['blue_score'],
-            'purple_score': horizon_info['purple_score'],
+            'bear_score': horizon_info['bear_score'],
+            'bull_score': horizon_info['bull_score'],
             'public_reversion_score': horizon_info['public_reversion_score'],
             'directional_reversion': horizon_info['directional_reversion'],
             'directional_floor': horizon_info['directional_floor'],
@@ -534,8 +534,8 @@ class KHAOS_KAN(nn.Module):
         shared_state, shared_mix = self.shared_mixer(last_state, global_state)
         transition_context, transition_mix = self.transition_mixer(shared_state, mid_state, short_state)
         reversion_context, reversion_mix = self.reversion_mixer(shared_state, mid_state, short_state)
-        blue_state, blue_mix = self.blue_mixer(reversion_context, short_state, last_state)
-        purple_state, purple_mix = self.purple_mixer(reversion_context, mid_state, last_state)
+        bear_state, bear_mix = self.bear_mixer(reversion_context, short_state, last_state)
+        bull_state, bull_mix = self.bull_mixer(reversion_context, mid_state, last_state)
         public_reversion_state = None
         public_reversion_mix = None
         if self.arch_version == 'iterA5_multiscale':
@@ -566,14 +566,14 @@ class KHAOS_KAN(nn.Module):
             )
             breakout_state = torch.tanh(transition_context + breakout_residual_gate * (short_state - mid_state))
         breakout_event_logits = self.breakout_head(breakout_state)
-        blue_score_h = self.blue_reversion_head(blue_state)
-        purple_score_h = self.purple_reversion_head(purple_state)
-        directional_reversion_h = direction_gate * blue_score_h + (1.0 - direction_gate) * purple_score_h
+        bear_score_h = self.bear_reversion_head(bear_state)
+        bull_score_h = self.bull_reversion_head(bull_state)
+        directional_reversion_h = direction_gate * bear_score_h + (1.0 - direction_gate) * bull_score_h
         directional_floor_h = torch.maximum(
             directional_reversion_h,
-            torch.maximum(blue_score_h, purple_score_h) - 0.08,
+            torch.maximum(bear_score_h, bull_score_h) - 0.08,
         )
-        public_reversion_score_h = torch.maximum(blue_score_h, purple_score_h)
+        public_reversion_score_h = torch.maximum(bear_score_h, bull_score_h)
         if self.arch_version == 'iterA5_multiscale':
             public_reversion_score = self.public_reversion_head(public_reversion_state)
             
@@ -593,9 +593,13 @@ class KHAOS_KAN(nn.Module):
             
             # 【优化修改】：打破严格的凸组合限制，解决 public_below_directional_violation_rate 接近 100% 的问题
             # 将加权平均改为“以 directional_reversion 为基座，向上叠加残差”的方式，
-            # 确保 reversion_pred 能够突破 max(blue, purple) 的上限限制，满足 loss.py 中的可行域约束。
-            reversion_event_logits = directional_reversion_h + public_reversion_gate * torch.relu(
+            # 确保 reversion_pred 能够突破 max(bear, bull) 的上限限制，满足 loss.py 中的可行域约束。
+            reversion_residual = public_reversion_gate * torch.relu(
                 public_reversion_score_h - directional_reversion_h + 0.15
+            )
+            reversion_event_logits = torch.maximum(
+                directional_floor_h + 0.10,
+                directional_reversion_h + reversion_residual,
             )
         else:
             reversion_event_logits = directional_reversion_h
@@ -621,8 +625,8 @@ class KHAOS_KAN(nn.Module):
             family_mode=family_mode,
             valid_horizon_mask=valid_horizon_mask,
             reversion_extras={
-                'blue_score': blue_score_h,
-                'purple_score': purple_score_h,
+                'bear_score': bear_score_h,
+                'bull_score': bull_score_h,
                 'public_reversion_score': public_reversion_score_h,
                 'directional_reversion': directional_reversion_h,
                 'directional_floor': directional_floor_h,
@@ -637,14 +641,14 @@ class KHAOS_KAN(nn.Module):
             'shared_mix': shared_mix,
             'transition_mix': transition_mix,
             'reversion_mix': reversion_mix,
-            'blue_mix': blue_mix,
-            'purple_mix': purple_mix,
+            'bear_mix': bear_mix,
+            'bull_mix': bull_mix,
             'public_reversion_mix': public_reversion_mix,
             'direction_gate': direction_gate,
             'public_reversion_gate': public_reversion_gate,
             'breakout_residual_gate': breakout_residual_gate,
-            'blue_score': horizon_info['blue_score'],
-            'purple_score': horizon_info['purple_score'],
+            'bear_score': horizon_info['bear_score'],
+            'bull_score': horizon_info['bull_score'],
             'public_reversion_score': horizon_info['public_reversion_score'],
             'directional_reversion': horizon_info['directional_reversion'],
             'directional_floor': horizon_info['directional_floor'],
@@ -705,8 +709,8 @@ class KHAOS_KAN(nn.Module):
     def get_regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
         reg_loss = self.breakout_head.regularization_loss(regularize_activation, regularize_entropy)
         if self.arch_version in self.multiscale_versions:
-            reg_loss += self.blue_reversion_head.regularization_loss(regularize_activation, regularize_entropy)
-            reg_loss += self.purple_reversion_head.regularization_loss(regularize_activation, regularize_entropy)
+            reg_loss += self.bear_reversion_head.regularization_loss(regularize_activation, regularize_entropy)
+            reg_loss += self.bull_reversion_head.regularization_loss(regularize_activation, regularize_entropy)
             if self.arch_version == 'iterA5_multiscale':
                 reg_loss += self.public_reversion_head.regularization_loss(regularize_activation, regularize_entropy)
             return reg_loss

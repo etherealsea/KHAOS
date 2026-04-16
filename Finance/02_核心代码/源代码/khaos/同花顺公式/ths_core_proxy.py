@@ -90,10 +90,10 @@ if _DEFAULT_PARAMS_PATH.exists():
         DEFAULT_THS_CORE_PARAMS = THSCoreParams()
 
 PHASE_NAME_MAP = {
-    -2: 'purple_reversion',
+    -2: 'bull_reversion',
     0: 'neutral',
     1: 'breakout',
-    2: 'blue_reversion',
+    2: 'bear_reversion',
 }
 
 TUNABLE_THS_FIELDS = (
@@ -342,14 +342,14 @@ def compute_ths_core_frame(
     )
 
     bk_dom = bk_score
-    blue_dom = dnrev_raw
-    purple_dom = uprev_raw
+    bear_dom = dnrev_raw
+    bull_dom = uprev_raw
 
-    bk_on = (bk_dom >= params.bk_evt_th) & (bk_dom >= blue_dom) & (bk_dom >= purple_dom)
-    blue_on = (blue_dom >= params.rv_evt_th) & ((blue_dom - purple_dom) >= params.dir_gap) & (blue_dom > bk_dom)
-    purple_on = (purple_dom >= params.rv_evt_th) & ((purple_dom - blue_dom) >= params.dir_gap) & (purple_dom > bk_dom)
+    bk_on = (bk_dom >= params.bk_evt_th) & (bk_dom >= bear_dom) & (bk_dom >= bull_dom)
+    bear_on = (bear_dom >= params.rv_evt_th) & ((bear_dom - bull_dom) >= params.dir_gap) & (bear_dom > bk_dom)
+    bull_on = (bull_dom >= params.rv_evt_th) & ((bull_dom - bear_dom) >= params.dir_gap) & (bull_dom > bk_dom)
 
-    phase = np.where(bk_on, 1, np.where(blue_on, 2, np.where(purple_on, -2, 0))).astype(np.int32)
+    phase = np.where(bk_on, 1, np.where(bear_on, 2, np.where(bull_on, -2, 0))).astype(np.int32)
     out['LC'] = lc
     out['RET'] = ret.values
     out['VOL'] = vol.values
@@ -390,11 +390,11 @@ def compute_ths_core_frame(
     out['UPREV_RAW'] = uprev_raw
     out['DNREV_RAW'] = dnrev_raw
     out['BK_DOM'] = bk_dom
-    out['BLUE_DOM'] = blue_dom
-    out['PURPLE_DOM'] = purple_dom
+    out['BEAR_DOM'] = bear_dom
+    out['BULL_DOM'] = bull_dom
     out['BK_ON'] = bk_on.astype(np.int32)
-    out['BLUE_ON'] = blue_on.astype(np.int32)
-    out['PURPLE_ON'] = purple_on.astype(np.int32)
+    out['BEAR_ON'] = bear_on.astype(np.int32)
+    out['BULL_ON'] = bull_on.astype(np.int32)
     out['PHASE'] = phase
     return out
 

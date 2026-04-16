@@ -315,33 +315,33 @@ CONSTRAINT_PROFILE_PRESETS = {
     'default': {
         'enabled': False,
         'weight': 0.0,
-        'blue_margin': 0.12,
-        'purple_margin': 0.12,
+        'bear_margin': 0.12,
+        'bull_margin': 0.12,
         'reversion_event_margin': 0.10,
         'continuation_margin': 0.05,
     },
     'teacher_feasible_v1': {
         'enabled': True,
         'weight': 0.35,
-        'blue_margin': 0.12,
-        'purple_margin': 0.12,
+        'bear_margin': 0.12,
+        'bull_margin': 0.12,
         'reversion_event_margin': 0.10,
         'continuation_margin': 0.05,
     },
     'teacher_feasible_precision_v1': {
         'enabled': True,
         'weight': 0.45,
-        'blue_margin': 0.14,
-        'purple_margin': 0.14,
+        'bear_margin': 0.14,
+        'bull_margin': 0.14,
         'reversion_event_margin': 0.14,
         'continuation_margin': 0.08,
     },
     'teacher_feasible_discovery_v1': {
         'enabled': True,
-        'weight': 0.24,
-        'blue_margin': 0.10,
-        'purple_margin': 0.10,
-        'reversion_event_margin': 0.08,
+        'weight': 0.40,
+        'bear_margin': 0.12,
+        'bull_margin': 0.12,
+        'reversion_event_margin': 0.12,
         'continuation_margin': 0.06,
     },
 }
@@ -620,8 +620,8 @@ class PhysicsLoss(nn.Module):
         reversion_hard_negative = event_flags[..., 3]
         breakout_event = self._get_flag(event_flags, 'breakout_event')
         reversion_event = self._get_flag(event_flags, 'reversion_event')
-        blue_context = self._get_flag(event_flags, 'reversion_down_context')
-        purple_context = self._get_flag(event_flags, 'reversion_up_context')
+        bear_context = self._get_flag(event_flags, 'reversion_down_context')
+        bull_context = self._get_flag(event_flags, 'reversion_up_context')
         continuation_pressure = self._get_flag(event_flags, 'continuation_pressure')
         breakout_hard_negative_penalty = breakout_hard_negative * torch.relu(pred_vol)
         reversion_hard_negative_penalty = reversion_hard_negative * pred_rev
@@ -643,28 +643,28 @@ class PhysicsLoss(nn.Module):
         )
 
         if debug_info is not None:
-            blue_score = torch.relu(debug_info['blue_score'].squeeze(-1))
-            purple_score = torch.relu(debug_info['purple_score'].squeeze(-1))
+            bear_score = torch.relu(debug_info['bear_score'].squeeze(-1))
+            bull_score = torch.relu(debug_info['bull_score'].squeeze(-1))
             directional_floor = debug_info.get('directional_floor')
             if directional_floor is not None:
                 directional_floor = torch.relu(directional_floor.squeeze(-1))
             else:
-                directional_floor = torch.maximum(blue_score, purple_score)
+                directional_floor = torch.maximum(bear_score, bull_score)
         else:
-            blue_score = pred_rev
-            purple_score = pred_rev
+            bear_score = pred_rev
+            bull_score = pred_rev
             directional_floor = pred_rev
 
         direction_consistency_loss = (
-            self._direction_margin_loss(blue_score, purple_score, blue_context, margin=0.12) +
-            self._direction_margin_loss(purple_score, blue_score, purple_context, margin=0.12)
+            self._direction_margin_loss(bear_score, bull_score, bear_context, margin=0.12) +
+            self._direction_margin_loss(bull_score, bear_score, bull_context, margin=0.12)
         )
         constraint_cfg = self.constraint_config
-        blue_over_purple_raw = torch.relu(
-            purple_score + constraint_cfg.get('blue_margin', 0.12) - blue_score
+        bear_over_bull_raw = torch.relu(
+            bull_score + constraint_cfg.get('bear_margin', 0.12) - bear_score
         )
-        purple_over_blue_raw = torch.relu(
-            blue_score + constraint_cfg.get('purple_margin', 0.12) - purple_score
+        bull_over_bear_raw = torch.relu(
+            bear_score + constraint_cfg.get('bull_margin', 0.12) - bull_score
         )
         public_below_directional_raw = torch.relu(
             directional_floor + constraint_cfg.get('reversion_event_margin', 0.10) - pred_rev
@@ -672,13 +672,13 @@ class PhysicsLoss(nn.Module):
         continuation_public_raw = torch.relu(
             pred_rev - (directional_floor + constraint_cfg.get('continuation_margin', 0.05))
         )
-        blue_over_purple_violation, blue_over_purple_violation_rate = self._masked_violation_stats(
-            blue_over_purple_raw,
-            blue_context,
+        bear_over_bull_violation, bear_over_bull_violation_rate = self._masked_violation_stats(
+            bear_over_bull_raw,
+            bear_context,
         )
-        purple_over_blue_violation, purple_over_blue_violation_rate = self._masked_violation_stats(
-            purple_over_blue_raw,
-            purple_context,
+        bull_over_bear_violation, bull_over_bear_violation_rate = self._masked_violation_stats(
+            bull_over_bear_raw,
+            bull_context,
         )
         public_below_directional_violation, public_below_directional_violation_rate = self._masked_violation_stats(
             public_below_directional_raw,
@@ -689,15 +689,15 @@ class PhysicsLoss(nn.Module):
             continuation_pressure,
         )
         constraint_penalty = (
-            blue_context * blue_over_purple_raw +
-            purple_context * purple_over_blue_raw +
+            bear_context * bear_over_bull_raw +
+            bull_context * bull_over_bear_raw +
             reversion_event * public_below_directional_raw +
             continuation_pressure * continuation_public_raw
         )
         continuation_suppression = continuation_pressure * (
             pred_rev +
-            0.35 * blue_score +
-            0.35 * purple_score
+            0.35 * bear_score +
+            0.35 * bull_score
         )
 
         horizon_per_sample = pred.new_zeros(pred.size(0), 1)
@@ -752,10 +752,10 @@ class PhysicsLoss(nn.Module):
             'direction_consistency': direction_consistency_loss.item(),
             'continuation_suppression': continuation_suppression.mean().item(),
             'constraint_penalty': constraint_penalty.mean().item(),
-            'blue_over_purple_violation': blue_over_purple_violation.item(),
-            'blue_over_purple_violation_rate': blue_over_purple_violation_rate.item(),
-            'purple_over_blue_violation': purple_over_blue_violation.item(),
-            'purple_over_blue_violation_rate': purple_over_blue_violation_rate.item(),
+            'bear_over_bull_violation': bear_over_bull_violation.item(),
+            'bear_over_bull_violation_rate': bear_over_bull_violation_rate.item(),
+            'bull_over_bear_violation': bull_over_bear_violation.item(),
+            'bull_over_bear_violation_rate': bull_over_bear_violation_rate.item(),
             'public_below_directional_violation': public_below_directional_violation.item(),
             'public_below_directional_violation_rate': public_below_directional_violation_rate.item(),
             'continuation_public_violation': continuation_public_violation.item(),

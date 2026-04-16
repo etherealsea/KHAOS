@@ -238,84 +238,39 @@ def build_reversion_targets(log_close, ema20, sigma, entropy, hurst, forecast_ho
 
 
 def _compute_breakout_discovery_components(log_close, log_high, log_low, returns, sigma, entropy, forecast_horizon):
+    """
+    Iter11: Pure MFE/MAE breakout target logic
+    Direction d_t is estimated using a 10-period rolling mean of returns.
+    """
     future_path = build_future_path(log_close, forecast_horizon)
-    future_high_path = np.stack(
-        [np.roll(log_high, -step) for step in range(1, forecast_horizon + 1)],
-        axis=1,
-    ).astype(np.float32)
-    future_low_path = np.stack(
-        [np.roll(log_low, -step) for step in range(1, forecast_horizon + 1)],
-        axis=1,
-    ).astype(np.float32)
-    for step in range(1, forecast_horizon + 1):
-        future_high_path[-step:, step - 1] = log_high[-step:]
-        future_low_path[-step:, step - 1] = log_low[-step:]
-
     sigma_safe = sigma + 1e-8
-    breakout_space = np.maximum(np.max(future_high_path, axis=1) - log_close, 0.0) / sigma_safe
-    downside_excursion = np.maximum(log_close - np.min(future_low_path, axis=1), 0.0) / sigma_safe
-    terminal_breakout = np.maximum(future_path[:, -1], 0.0) / sigma_safe
-    net_displacement = np.maximum(future_path.max(axis=1), 0.0) / sigma_safe
-    path_persistence = np.mean(future_path > 0.0, axis=1).astype(np.float32)
-    path_efficiency = terminal_breakout / np.maximum(net_displacement, 1e-6)
-    clean_space = np.maximum(breakout_space - 0.40 * downside_excursion - 0.25, 0.0)
-    clean_terminal = np.maximum(terminal_breakout - 0.25 * downside_excursion, 0.0)
+    
+    # 1. Define current direction
+    rolling_ret = pd.Series(returns).rolling(window=10, min_periods=1).mean().values
+    d_t = np.sign(rolling_ret).astype(np.float32)
+    # Default to +1 if 0
+    d_t[d_t == 0] = 1.0
 
-    future_vol = pd.Series(returns).rolling(window=forecast_horizon, min_periods=1).std().shift(-forecast_horizon).values
-    future_vol = np.nan_to_num(future_vol, nan=0.0).astype(np.float32)
-    vol_release = np.maximum(np.log((future_vol + 1e-8) / sigma_safe), 0.0)
-    entropy_ref = ema_np(entropy, LOCAL_PHYSICS_WINDOW)
-    entropy_quiet = np.maximum(entropy_ref - entropy, 0.0)
-    future_entropy = pd.Series(entropy).rolling(window=forecast_horizon, min_periods=1).mean().shift(-forecast_horizon).values
-    future_entropy = np.nan_to_num(future_entropy, nan=entropy[-1]).astype(np.float32)
-    entropy_release = np.maximum(future_entropy - entropy, 0.0)
-    quality_gate = np.clip(0.50 + 0.35 * np.clip(path_efficiency, 0.0, 1.5) + 0.15 * path_persistence, 0.0, 1.40)
-    guarded_target = np.maximum(
-        0.0,
-        (
-            0.44 * clean_space +
-            0.28 * clean_terminal +
-            0.12 * np.maximum(path_efficiency, 0.0) +
-            0.08 * path_persistence +
-            0.08 * vol_release
-        ) * quality_gate -
-        0.18 * downside_excursion
-    ).astype(np.float32)
-    guarded_aux = np.maximum(
-        0.0,
-        0.62 * clean_space +
-        0.22 * breakout_space +
-        0.10 * entropy_release +
-        0.06 * entropy_quiet
-    ).astype(np.float32)
+    # 2. MFE & MAE relative to d_t
+    signed_future = future_path * d_t[:, None]
+    mfe = np.maximum(signed_future, 0.0).max(axis=1)
+    mae = np.maximum(-signed_future, 0.0).max(axis=1)
+    
+    mfe_norm = mfe / sigma_safe
+    mae_norm = mae / sigma_safe
+    
+    # 3. Score calculation (MFE_norm * exp(-λ * MAE_norm))
+    # Lambda = 1.2 penalizes drawdowns heavily
+    score = mfe_norm * np.exp(-1.2 * mae_norm)
+    aux_score = np.maximum(mfe_norm - 0.8 * mae_norm, 0.0)
+
     return {
-        'breakout_space': breakout_space.astype(np.float32),
-        'downside_excursion': downside_excursion.astype(np.float32),
-        'terminal_breakout': terminal_breakout.astype(np.float32),
-        'path_efficiency': path_efficiency.astype(np.float32),
-        'path_persistence': path_persistence.astype(np.float32),
-        'clean_space': clean_space.astype(np.float32),
-        'clean_terminal': clean_terminal.astype(np.float32),
-        'vol_release': vol_release.astype(np.float32),
-        'entropy_release': entropy_release.astype(np.float32),
-        'entropy_quiet': entropy_quiet.astype(np.float32),
-        'target_default': np.maximum(
-            0.0,
-            0.38 * clean_space +
-            0.28 * clean_terminal +
-            0.16 * np.maximum(path_efficiency, 0.0) +
-            0.10 * path_persistence +
-            0.08 * vol_release
-        ).astype(np.float32),
-        'aux_default': np.maximum(
-            0.0,
-            0.55 * clean_space +
-            0.20 * breakout_space +
-            0.15 * entropy_release +
-            0.10 * entropy_quiet
-        ).astype(np.float32),
-        'target_guarded_v1': guarded_target,
-        'aux_guarded_v1': guarded_aux,
+        'mfe_norm': mfe_norm.astype(np.float32),
+        'mae_norm': mae_norm.astype(np.float32),
+        'target_default': score.astype(np.float32),
+        'aux_default': aux_score.astype(np.float32),
+        'target_guarded_v1': score.astype(np.float32),
+        'aux_guarded_v1': aux_score.astype(np.float32),
     }
 
 
@@ -331,22 +286,13 @@ def fit_breakout_discovery_thresholds(log_close, log_high, log_low, returns, sig
     )
     target_key = 'target_guarded_v1' if preset == 'guarded_v1' else 'target_default'
     valid_target = _valid_prefix(components[target_key], forecast_horizon)
-    valid_space = _valid_prefix(components['clean_space'], forecast_horizon)
-    valid_downside = _valid_prefix(components['downside_excursion'], forecast_horizon)
-    if preset == 'guarded_v1':
-        return {
-            'event_target_threshold': _robust_quantile(valid_target, 0.88, floor=0.68),
-            'event_space_threshold': _robust_quantile(valid_space, 0.80, floor=0.42),
-            'hard_negative_space_threshold': _robust_quantile(valid_space, 0.56, floor=0.20),
-            'hard_negative_downside_threshold': _robust_quantile(valid_downside, 0.66, floor=0.22),
-            'terminal_confirmation_ratio': 0.42,
-        }
+    valid_mae = _valid_prefix(components['mae_norm'], forecast_horizon)
+    
+    # We use 0.95 (top 5%) for event threshold as requested by user
     return {
-        'event_target_threshold': _robust_quantile(valid_target, 0.82, floor=0.55),
-        'event_space_threshold': _robust_quantile(valid_space, 0.70, floor=0.30),
-        'hard_negative_space_threshold': _robust_quantile(valid_space, 0.55, floor=0.18),
-        'hard_negative_downside_threshold': _robust_quantile(valid_downside, 0.70, floor=0.25),
-        'terminal_confirmation_ratio': 0.35,
+        'event_target_threshold': _robust_quantile(valid_target, 0.95, floor=0.5),
+        'hard_negative_target_threshold': _robust_quantile(valid_target, 0.30, floor=0.1),
+        'hard_negative_mae_threshold': _robust_quantile(valid_mae, 0.85, floor=1.5),
     }
 
 
@@ -374,10 +320,8 @@ def build_breakout_discovery_targets(
     aux_key = 'aux_guarded_v1' if preset == 'guarded_v1' else 'aux_default'
     breakout_target = components[target_key].copy()
     breakout_aux = components[aux_key].copy()
-    clean_space = components['clean_space']
-    downside_excursion = components['downside_excursion']
-    breakout_space = components['breakout_space']
-    terminal_breakout = components['terminal_breakout']
+    mae_norm = components['mae_norm']
+
     threshold_cfg = dict(
         threshold_config or fit_breakout_discovery_thresholds(
             log_close,
@@ -391,23 +335,13 @@ def build_breakout_discovery_targets(
         )
     )
     event_target_threshold = float(threshold_cfg['event_target_threshold'])
-    event_space_threshold = float(threshold_cfg['event_space_threshold'])
-    hard_negative_space_threshold = float(threshold_cfg['hard_negative_space_threshold'])
-    hard_negative_downside_threshold = float(threshold_cfg['hard_negative_downside_threshold'])
-    terminal_confirmation_ratio = float(threshold_cfg.get('terminal_confirmation_ratio', 0.35))
+    hn_target_threshold = float(threshold_cfg['hard_negative_target_threshold'])
+    hn_mae_threshold = float(threshold_cfg['hard_negative_mae_threshold'])
 
-    breakout_event = (
-        (breakout_target >= event_target_threshold) &
-        (clean_space >= event_space_threshold) &
-        (terminal_breakout >= terminal_confirmation_ratio * breakout_space)
-    ).astype(np.float32)
+    breakout_event = (breakout_target >= event_target_threshold).astype(np.float32)
     breakout_hard_negative = (
-        (breakout_space >= hard_negative_space_threshold) &
-        (
-            (clean_space < event_space_threshold) |
-            (downside_excursion >= hard_negative_downside_threshold) |
-            (breakout_target < 0.85 * event_target_threshold)
-        )
+        (mae_norm >= hn_mae_threshold) & 
+        (breakout_target <= hn_target_threshold)
     ).astype(np.float32)
 
     _tail_zero(
@@ -426,84 +360,39 @@ def build_breakout_discovery_targets(
 
 
 def _compute_reversion_discovery_components(log_close, ema20, sigma, entropy, hurst, forecast_horizon):
-    log_ema20 = np.log(np.maximum(ema20, 1e-8))
-    ekf_track = compute_ekf_track(log_close)
-    ekf_residual = log_close - ekf_track
-    ema_log_gap = log_close - log_ema20
-    sigma_safe = sigma + 1e-8
-    res_score = ekf_residual / sigma_safe
-    ema_score = ema_log_gap / sigma_safe
-    imbalance_direction = np.sign(res_score + ema_score).astype(np.float32)
-    imbalance_alignment = np.abs(res_score + ema_score) / (np.abs(res_score) + np.abs(ema_score) + 1e-6)
-    imbalance_strength = np.maximum(0.0, np.abs(res_score) + np.abs(ema_score) - 0.80)
-
+    """
+    Iter11: Pure MFE/MAE reversion target logic
+    Direction -d_t is used to assess reversion quality (opposite of recent trend).
+    """
     future_path = build_future_path(log_close, forecast_horizon)
-    signed_future = future_path * imbalance_direction[:, None]
-    continuation_excursion = np.maximum(signed_future, 0.0).max(axis=1) / sigma_safe
-    reversal_excursion = np.maximum(-signed_future, 0.0).max(axis=1) / sigma_safe
-    terminal_reversal = np.maximum(-(imbalance_direction * future_path[:, -1]), 0.0) / sigma_safe
-    clean_reversal = np.maximum(reversal_excursion - 0.45 * continuation_excursion - 0.25, 0.0)
-    clean_terminal = np.maximum(terminal_reversal - 0.20 * continuation_excursion, 0.0)
+    sigma_safe = sigma + 1e-8
+    
+    # 1. Define recent direction and use its opposite for reversion
+    returns = np.diff(log_close, prepend=log_close[0])
+    rolling_ret = pd.Series(returns).rolling(window=10, min_periods=1).mean().values
+    d_t = np.sign(rolling_ret).astype(np.float32)
+    d_t[d_t == 0] = 1.0
+    rev_dir = -d_t
 
-    entropy_ref = ema_np(entropy, LOCAL_PHYSICS_WINDOW)
-    future_entropy = pd.Series(entropy).rolling(window=forecast_horizon, min_periods=1).mean().shift(-forecast_horizon).values
-    future_entropy = np.nan_to_num(future_entropy, nan=entropy[-1]).astype(np.float32)
-    entropy_release = np.maximum(future_entropy - entropy, 0.0)
-    entropy_quiet = np.maximum(entropy_ref - entropy, 0.0)
-    trend_pressure = np.maximum(hurst - 0.55, 0.0)
-    imbalance_gate = np.clip(
-        0.40 +
-        0.40 * np.tanh(imbalance_strength / 1.25) +
-        0.20 * imbalance_alignment,
-        0.0,
-        1.50,
-    )
-    guarded_target = np.maximum(
-        0.0,
-        (
-            0.40 * clean_reversal +
-            0.30 * clean_terminal +
-            0.14 * entropy_release +
-            0.10 * entropy_quiet +
-            0.06 * imbalance_alignment
-        ) * imbalance_gate -
-        0.20 * continuation_excursion
-    ).astype(np.float32)
-    guarded_aux = np.maximum(
-        0.0,
-        0.64 * clean_reversal +
-        0.18 * reversal_excursion +
-        0.10 * clean_terminal +
-        0.08 * trend_pressure
-    ).astype(np.float32)
+    # 2. MFE & MAE relative to rev_dir
+    signed_future = future_path * rev_dir[:, None]
+    mfe = np.maximum(signed_future, 0.0).max(axis=1)
+    mae = np.maximum(-signed_future, 0.0).max(axis=1)
+    
+    mfe_norm = mfe / sigma_safe
+    mae_norm = mae / sigma_safe
+    
+    # 3. Score calculation (MFE_norm * exp(-λ * MAE_norm))
+    score = mfe_norm * np.exp(-1.2 * mae_norm)
+    aux_score = np.maximum(mfe_norm - 0.8 * mae_norm, 0.0)
+
     return {
-        'continuation_excursion': continuation_excursion.astype(np.float32),
-        'reversal_excursion': reversal_excursion.astype(np.float32),
-        'terminal_reversal': terminal_reversal.astype(np.float32),
-        'clean_reversal': clean_reversal.astype(np.float32),
-        'clean_terminal': clean_terminal.astype(np.float32),
-        'imbalance_alignment': imbalance_alignment.astype(np.float32),
-        'imbalance_strength': imbalance_strength.astype(np.float32),
-        'entropy_release': entropy_release.astype(np.float32),
-        'entropy_quiet': entropy_quiet.astype(np.float32),
-        'trend_pressure': trend_pressure.astype(np.float32),
-        'target_default': np.maximum(
-            0.0,
-            imbalance_strength * (
-                0.34 * clean_reversal +
-                0.28 * clean_terminal +
-                0.18 * imbalance_alignment +
-                0.12 * entropy_release +
-                0.08 * entropy_quiet
-            )
-        ).astype(np.float32),
-        'aux_default': np.maximum(
-            0.0,
-            (0.60 * clean_reversal + 0.25 * reversal_excursion + 0.15 * clean_terminal) *
-            (0.55 + 0.30 * imbalance_alignment + 0.15 * trend_pressure)
-        ).astype(np.float32),
-        'target_guarded_v1': guarded_target,
-        'aux_guarded_v1': guarded_aux,
+        'mfe_norm': mfe_norm.astype(np.float32),
+        'mae_norm': mae_norm.astype(np.float32),
+        'target_default': score.astype(np.float32),
+        'aux_default': aux_score.astype(np.float32),
+        'target_guarded_v1': score.astype(np.float32),
+        'aux_guarded_v1': aux_score.astype(np.float32),
     }
 
 
@@ -518,26 +407,13 @@ def fit_reversion_discovery_thresholds(log_close, ema20, sigma, entropy, hurst, 
     )
     target_key = 'target_guarded_v1' if preset == 'guarded_v1' else 'target_default'
     valid_target = _valid_prefix(components[target_key], forecast_horizon)
-    valid_reversal = _valid_prefix(components['clean_reversal'], forecast_horizon)
-    valid_continuation = _valid_prefix(components['continuation_excursion'], forecast_horizon)
-    if preset == 'guarded_v1':
-        return {
-            'event_target_threshold': _robust_quantile(valid_target, 0.88, floor=0.52),
-            'event_reversal_threshold': _robust_quantile(valid_reversal, 0.80, floor=0.30),
-            'hard_negative_reversal_threshold': _robust_quantile(valid_reversal, 0.56, floor=0.14),
-            'continuation_threshold': _robust_quantile(valid_continuation, 0.66, floor=0.22),
-            'terminal_confirmation_ratio': 0.42,
-            'alignment_min': 0.34,
-            'imbalance_strength_min': 0.76,
-        }
+    valid_mae = _valid_prefix(components['mae_norm'], forecast_horizon)
+    
+    # Use 0.95 (top 5%) for high-precision event threshold
     return {
-        'event_target_threshold': _robust_quantile(valid_target, 0.82, floor=0.40),
-        'event_reversal_threshold': _robust_quantile(valid_reversal, 0.72, floor=0.22),
-        'hard_negative_reversal_threshold': _robust_quantile(valid_reversal, 0.50, floor=0.12),
-        'continuation_threshold': _robust_quantile(valid_continuation, 0.70, floor=0.25),
-        'terminal_confirmation_ratio': 0.35,
-        'alignment_min': 0.25,
-        'imbalance_strength_min': 0.70,
+        'event_target_threshold': _robust_quantile(valid_target, 0.95, floor=0.5),
+        'hard_negative_target_threshold': _robust_quantile(valid_target, 0.30, floor=0.1),
+        'hard_negative_mae_threshold': _robust_quantile(valid_mae, 0.85, floor=1.5),
     }
 
 
@@ -563,12 +439,8 @@ def build_reversion_discovery_targets(
     aux_key = 'aux_guarded_v1' if preset == 'guarded_v1' else 'aux_default'
     target = components[target_key].copy()
     aux_target = components[aux_key].copy()
-    clean_reversal = components['clean_reversal']
-    continuation_excursion = components['continuation_excursion']
-    reversal_excursion = components['reversal_excursion']
-    terminal_reversal = components['terminal_reversal']
-    imbalance_alignment = components['imbalance_alignment']
-    imbalance_strength = components['imbalance_strength']
+    mae_norm = components['mae_norm']
+
     threshold_cfg = dict(
         threshold_config or fit_reversion_discovery_thresholds(
             log_close,
@@ -581,26 +453,13 @@ def build_reversion_discovery_targets(
         )
     )
     event_target_threshold = float(threshold_cfg['event_target_threshold'])
-    event_reversal_threshold = float(threshold_cfg['event_reversal_threshold'])
-    hard_negative_reversal_threshold = float(threshold_cfg['hard_negative_reversal_threshold'])
-    continuation_threshold = float(threshold_cfg['continuation_threshold'])
-    terminal_confirmation_ratio = float(threshold_cfg.get('terminal_confirmation_ratio', 0.35))
-    alignment_min = float(threshold_cfg.get('alignment_min', 0.25))
-    imbalance_strength_min = float(threshold_cfg.get('imbalance_strength_min', 0.70))
+    hn_target_threshold = float(threshold_cfg['hard_negative_target_threshold'])
+    hn_mae_threshold = float(threshold_cfg['hard_negative_mae_threshold'])
 
-    reversion_event = (
-        (target >= event_target_threshold) &
-        (clean_reversal >= event_reversal_threshold) &
-        (terminal_reversal >= terminal_confirmation_ratio * reversal_excursion) &
-        (imbalance_alignment >= alignment_min)
-    ).astype(np.float32)
+    reversion_event = (target >= event_target_threshold).astype(np.float32)
     reversion_hard_negative = (
-        (imbalance_strength >= imbalance_strength_min) &
-        (
-            (clean_reversal < hard_negative_reversal_threshold) |
-            (target < 0.85 * event_target_threshold) |
-            (continuation_excursion >= np.maximum(reversal_excursion, continuation_threshold))
-        )
+        (mae_norm >= hn_mae_threshold) & 
+        (target <= hn_target_threshold)
     ).astype(np.float32)
 
     _tail_zero(
@@ -623,6 +482,7 @@ class FinancialDataset(Dataset):
         self.forecast_horizon = forecast_horizon
         self.feature_names = PHYSICS_FEATURE_NAMES
         df.columns = [c.lower().strip() for c in df.columns]
+        self.time = df['time'].values if 'time' in df.columns else None
         required_cols = ['open', 'high', 'low', 'close', 'volume']
         for col in required_cols:
             if col not in df.columns:
@@ -636,8 +496,9 @@ class FinancialDataset(Dataset):
         log_high = np.log(np.maximum(self.high, 1e-8))
         log_low = np.log(np.maximum(self.low, 1e-8))
         returns = np.diff(log_close, prepend=log_close[0])
-        self.sigma = pd.Series(returns).rolling(window=volatility_window, min_periods=1).std().bfill().values
-        self.sigma = np.maximum(self.sigma, 1e-6).astype(np.float32)
+        sigma = pd.Series(returns).rolling(window=volatility_window, min_periods=1).std()
+        sigma = sigma.ffill().fillna(0.0).values
+        self.sigma = np.maximum(sigma, 1e-6).astype(np.float32)
         self.ema20 = ema_np(self.close, 20)
         entropy = rolling_entropy_proxy_np(self.high, self.low, self.close, LOCAL_PHYSICS_WINDOW)
         hurst = rolling_hurst_proxy_np(log_close, LOCAL_PHYSICS_WINDOW)
