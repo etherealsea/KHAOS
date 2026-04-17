@@ -554,10 +554,30 @@ class FinancialDataset(Dataset):
         self.data = np.stack([
             self.open, self.high, self.low, self.close, self.volume, self.ema20
         ], axis=1)
-        print(f"  [Pre-computation] Extracting physics features for {len(df)} rows...")
+
+        import hashlib
+        import os
+        import torch
+        
+        # Create a unique hash for the dataset features to use as cache key
+        # We'll use the raw data shape, sum, and dataset length to ensure uniqueness
         raw_tensor = torch.tensor(self.data, dtype=torch.float32)
-        self.physics_features = compute_physics_features_bulk(raw_tensor, device='cpu')
-        print(f"  [Pre-computation] Done. Feature shape: {self.physics_features.shape}")
+        data_sig = f"{raw_tensor.shape}_{raw_tensor.sum().item():.4f}_{len(df)}"
+        cache_hash = hashlib.md5(data_sig.encode()).hexdigest()
+        cache_dir = os.path.join('/workspace/data', '.feature_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"features_{cache_hash}.pt")
+
+        if os.path.exists(cache_file):
+            print(f"  [Pre-computation] Loading cached physics features from {cache_file}...")
+            self.physics_features = torch.load(cache_file, map_location='cpu', weights_only=True)
+            print(f"  [Pre-computation] Done. Feature shape: {self.physics_features.shape}")
+        else:
+            print(f"  [Pre-computation] Extracting physics features for {len(df)} rows...")
+            self.physics_features = compute_physics_features_bulk(raw_tensor, device='cpu')
+            print(f"  [Pre-computation] Saving extracted features to cache {cache_file}...")
+            torch.save(self.physics_features, cache_file)
+            print(f"  [Pre-computation] Done. Feature shape: {self.physics_features.shape}")
 
     def __len__(self):
         return max(0, len(self.close) - self.window_size - self.forecast_horizon)
