@@ -1,3 +1,5 @@
+import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -367,9 +369,13 @@ class PhysicsLoss(nn.Module):
         self.aux_loss_fn = nn.SmoothL1Loss(reduction='none')
         self.horizon_event_loss_fn = nn.SmoothL1Loss(reduction='none')
         self.horizon_aux_loss_fn = nn.SmoothL1Loss(reduction='none')
+        self.epoch = 0
+        self.total_epochs = 1
         self.set_epoch(0, 1)
 
     def set_epoch(self, epoch, total_epochs):
+        self.epoch = epoch
+        self.total_epochs = max(int(total_epochs), 1)
         self.weights = dict(self.base_weights)
         self.constraint_config = dict(self.base_constraint_config)
         if not self.curriculum_config:
@@ -387,6 +393,9 @@ class PhysicsLoss(nn.Module):
                 self.weights[key] = self.base_weights[key] * factor
         if self.curriculum_config.get('scale_constraint_weight', False):
             self.constraint_config['weight'] = float(self.base_constraint_config.get('weight', 0.0)) * factor
+
+    def _get_progress(self):
+        return min(1.0, max(0.0, self.epoch / self.total_epochs))
 
     def _get_flag(self, event_flags, flag_name):
         idx = EVENT_FLAG_INDEX[flag_name]
@@ -621,6 +630,16 @@ class PhysicsLoss(nn.Module):
         debug_info=None,
         horizon_payload=None,
     ):
+        # Progress for Curriculum Learning (0.0 -> 1.0)
+        progress = self._get_progress()
+        
+        # Soft margin epsilon (shrinks from 0.15 -> 0.0 as training progresses)
+        epsilon = 0.15 * math.exp(-5.0 * progress)
+        
+        # Adaptive physical loss weight (starts at 0.1, ramps up to 1.0)
+        # Allows data-driven optimization early on, enforces physics strictly later
+        lambda_phys = 0.1 + 0.9 * progress
+
         if aux_pred.shape != aux_target.shape:
             aux_target = aux_target.view_as(aux_pred)
 
@@ -675,13 +694,13 @@ class PhysicsLoss(nn.Module):
             evidence=pred_vol,
             pos_mask=breakout_event > 0.5,
             hard_negative_mask=breakout_hard_negative > 0.5,
-            kl_penalty_weight=0.03
+            kl_penalty_weight=0.03 * lambda_phys
         )
         reversion_event_gap_loss = self._evidential_loss(
             evidence=pred_rev,
             pos_mask=reversion_event > 0.5,
             hard_negative_mask=reversion_hard_negative > 0.5,
-            kl_penalty_weight=0.05
+            kl_penalty_weight=0.05 * lambda_phys
         )
 
         if debug_info is not None:
@@ -692,27 +711,54 @@ class PhysicsLoss(nn.Module):
                 directional_floor = torch.relu(directional_floor[..., 1])
             else:
                 directional_floor = torch.maximum(bear_score, bull_score)
+            
+            # Using soft constraint margin for violation: ReLU(violation - epsilon)
+            # This allows the model to ignore minor violations early in training
+            public_reversion_score = debug_info.get('public_reversion_score')
+            if public_reversion_score is not None:
+                public_reversion_score = torch.relu(public_reversion_score[..., 1])
+                directional_violation = torch.relu(public_reversion_score - directional_floor - epsilon)
+                public_below_directional_violation = torch.relu(directional_floor - public_reversion_score - epsilon)
+            else:
+                directional_violation = torch.zeros_like(pred_rev[..., 1])
+                public_below_directional_violation = torch.zeros_like(pred_rev[..., 1])
         else:
             bear_score = pred_rev[..., 1]
             bull_score = pred_rev[..., 1]
             directional_floor = pred_rev[..., 1]
+            directional_violation = torch.zeros_like(pred_rev[..., 1])
+            public_below_directional_violation = torch.zeros_like(pred_rev[..., 1])
+
+        l_dict = {
+            'breakout_gap': breakout_event_gap_loss.mean().item(),
+            'reversion_gap': reversion_event_gap_loss.mean().item(),
+            'directional_violation': directional_violation.mean().item(),
+            'public_below_directional_violation': public_below_directional_violation.mean().item(),
+        }
+
+        # Combine with lambda_phys
+        main_loss = main_loss + lambda_phys * (breakout_event_gap_loss + reversion_event_gap_loss).unsqueeze(-1)
+        rank_loss = lambda_phys * (
+            0.15 * directional_violation.mean() +
+            0.20 * public_below_directional_violation.mean()
+        )
 
         direction_consistency_loss = (
-            self._direction_margin_loss(bear_score, bull_score, bear_context, margin=0.12) +
-            self._direction_margin_loss(bull_score, bear_score, bull_context, margin=0.12)
+            self._direction_margin_loss(bear_score, bull_score, bear_context, margin=0.12 - epsilon) +
+            self._direction_margin_loss(bull_score, bear_score, bull_context, margin=0.12 - epsilon)
         )
         constraint_cfg = self.constraint_config
         bear_over_bull_raw = torch.relu(
-            bull_score + constraint_cfg.get('bear_margin', 0.12) - bear_score
+            bull_score + constraint_cfg.get('bear_margin', 0.12) - bear_score - epsilon
         )
         bull_over_bear_raw = torch.relu(
-            bear_score + constraint_cfg.get('bull_margin', 0.12) - bull_score
+            bear_score + constraint_cfg.get('bull_margin', 0.12) - bull_score - epsilon
         )
         public_below_directional_raw = torch.relu(
-            directional_floor + constraint_cfg.get('reversion_event_margin', 0.10) - pred_rev[..., 1]
+            directional_floor + constraint_cfg.get('reversion_event_margin', 0.10) - pred_rev[..., 1] - epsilon
         )
         continuation_public_raw = torch.relu(
-            pred_rev[..., 1] - (directional_floor + constraint_cfg.get('continuation_margin', 0.05))
+            pred_rev[..., 1] - (directional_floor + constraint_cfg.get('continuation_margin', 0.05)) - epsilon
         )
         bear_over_bull_violation, bear_over_bull_violation_rate = self._masked_violation_stats(
             bear_over_bull_raw,
@@ -753,29 +799,32 @@ class PhysicsLoss(nn.Module):
                 horizon_payload=horizon_payload,
             )
 
+        # Multiply all strict physical penalties by lambda_phys to ensure Curriculum Learning
         per_sample_loss = (
             self.weights.get('main', 1.0) * main_loss +
             self.weights.get('aux', 0.35) * aux_loss +
-            self.weights.get('p3', 0.10) * p3.unsqueeze(1) +
-            self.weights.get('p4', 0.12) * p4.unsqueeze(1) +
-            self.weights.get('p6', 0.12) * p6_lyapunov.unsqueeze(1) +
-            self.weights.get('p7', 0.15) * (p7_csd + p7_false_reversion).unsqueeze(1) +
-            0.05 * transition_breakout.unsqueeze(1) * torch.relu(-aux_pred[..., 0]).unsqueeze(1) +
-            0.05 * transition_reversion.unsqueeze(1) * torch.relu(-aux_pred[..., 1]).unsqueeze(1) +
-            self.weights.get('breakout_hard_negative', 0.24) * breakout_hard_negative_penalty.unsqueeze(1) +
-            self.weights.get('reversion_hard_negative', 0.42) * reversion_hard_negative_penalty.unsqueeze(1) +
-            self.weights.get('continuation_suppression', 0.12) * continuation_suppression.unsqueeze(1) +
-            constraint_cfg.get('weight', 0.0) * constraint_penalty.unsqueeze(1) +
+            lambda_phys * self.weights.get('p3', 0.10) * p3.unsqueeze(1) +
+            lambda_phys * self.weights.get('p4', 0.12) * p4.unsqueeze(1) +
+            lambda_phys * self.weights.get('p6', 0.12) * p6_lyapunov.unsqueeze(1) +
+            lambda_phys * self.weights.get('p7', 0.15) * (p7_csd + p7_false_reversion).unsqueeze(1) +
+            lambda_phys * 0.05 * transition_breakout.unsqueeze(1) * torch.relu(-aux_pred[..., 0]).unsqueeze(1) +
+            lambda_phys * 0.05 * transition_reversion.unsqueeze(1) * torch.relu(-aux_pred[..., 1]).unsqueeze(1) +
+            lambda_phys * self.weights.get('breakout_hard_negative', 0.24) * breakout_hard_negative_penalty.unsqueeze(1) +
+            lambda_phys * self.weights.get('reversion_hard_negative', 0.42) * reversion_hard_negative_penalty.unsqueeze(1) +
+            lambda_phys * self.weights.get('continuation_suppression', 0.12) * continuation_suppression.unsqueeze(1) +
+            lambda_phys * constraint_cfg.get('weight', 0.0) * constraint_penalty.unsqueeze(1) +
             horizon_per_sample
         )
-        rank_loss = (
+        
+        # Rank loss also adapts via lambda_phys
+        rank_loss = rank_loss + (
             self.weights.get('rank', 0.20) * (
                 self._pairwise_rank_loss(pred[..., 0, 1], aux_target[..., 0]) +
                 self._pairwise_rank_loss(pred[..., 1, 1], aux_target[..., 1])
             ) +
-            self.weights.get('breakout_event_gap', 0.18) * breakout_event_gap_loss +
-            self.weights.get('reversion_event_gap', 0.28) * reversion_event_gap_loss +
-            self.weights.get('direction_consistency', 0.18) * direction_consistency_loss +
+            lambda_phys * self.weights.get('breakout_event_gap', 0.18) * breakout_event_gap_loss +
+            lambda_phys * self.weights.get('reversion_event_gap', 0.28) * reversion_event_gap_loss +
+            lambda_phys * self.weights.get('direction_consistency', 0.18) * direction_consistency_loss +
             horizon_rank
         )
 
