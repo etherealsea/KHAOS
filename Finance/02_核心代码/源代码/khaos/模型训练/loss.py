@@ -635,8 +635,11 @@ class PhysicsLoss(nn.Module):
         compression = physics_state[..., 13]
         sigma_ref = torch.clamp(sigma if sigma is not None else torch.ones_like(Res), min=1e-6)
 
-        main_loss = self.main_loss_fn(pred, target)
-        main_loss = main_loss.mean(dim=1, keepdim=True)
+        # main_loss is replaced by evidential_loss, we only need aux_loss here
+        # for target we will extract the event probabilities for any needed reference
+        # but the main loss calculation happens via _evidential_loss later.
+        # We can just initialize main_loss to 0 here to keep return structures compatible.
+        main_loss = torch.zeros(target.size(0), 1, device=target.device, dtype=target.dtype)
         aux_loss = self.aux_loss_fn(torch.relu(aux_pred), aux_target).mean(dim=1, keepdim=True)
 
         pred_vol = pred[..., 0, :]
