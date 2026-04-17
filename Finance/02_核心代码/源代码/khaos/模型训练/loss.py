@@ -675,21 +675,21 @@ class PhysicsLoss(nn.Module):
             evidence=pred_vol,
             pos_mask=breakout_event > 0.5,
             hard_negative_mask=breakout_hard_negative > 0.5,
-            kl_penalty_weight=0.18
+            kl_penalty_weight=0.03
         )
         reversion_event_gap_loss = self._evidential_loss(
             evidence=pred_rev,
             pos_mask=reversion_event > 0.5,
             hard_negative_mask=reversion_hard_negative > 0.5,
-            kl_penalty_weight=0.22
+            kl_penalty_weight=0.05
         )
 
         if debug_info is not None:
-            bear_score = torch.relu(debug_info['bear_score'][..., 1].squeeze(-1))
-            bull_score = torch.relu(debug_info['bull_score'][..., 1].squeeze(-1))
+            bear_score = torch.relu(debug_info['bear_score'][..., 1])
+            bull_score = torch.relu(debug_info['bull_score'][..., 1])
             directional_floor = debug_info.get('directional_floor')
             if directional_floor is not None:
-                directional_floor = torch.relu(directional_floor[..., 1].squeeze(-1))
+                directional_floor = torch.relu(directional_floor[..., 1])
             else:
                 directional_floor = torch.maximum(bear_score, bull_score)
         else:

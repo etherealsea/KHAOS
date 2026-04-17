@@ -562,16 +562,16 @@ class KHAOS_KAN(nn.Module):
             )
             breakout_state = torch.tanh(transition_context + breakout_residual_gate * (short_state - mid_state))
         breakout_event_logits = F.softplus(self.breakout_head(breakout_state))
-        bear_score_h = F.softplus(self.bear_reversion_head(bear_state))
-        bull_score_h = F.softplus(self.bull_reversion_head(bull_state))
-        directional_reversion_h = direction_gate * bear_score_h + (1.0 - direction_gate) * bull_score_h
+        bear_score_h = F.softplus(self.bear_reversion_head(bear_state)).view(batch_size, 2, self.horizon_count)
+        bull_score_h = F.softplus(self.bull_reversion_head(bull_state)).view(batch_size, 2, self.horizon_count)
+        directional_reversion_h = direction_gate.unsqueeze(-1) * bear_score_h + (1.0 - direction_gate.unsqueeze(-1)) * bull_score_h
         directional_floor_h = torch.maximum(
             directional_reversion_h,
             torch.maximum(bear_score_h, bull_score_h) - 0.08,
         )
         public_reversion_score_h = torch.maximum(bear_score_h, bull_score_h)
         if self.arch_version == 'iterA5_multiscale':
-            public_reversion_score_h = F.softplus(self.public_reversion_head(public_reversion_state))
+            public_reversion_score_h = F.softplus(self.public_reversion_head(public_reversion_state)).view(batch_size, 2, self.horizon_count)
         public_reversion_gate = torch.zeros_like(direction_gate)
         
         if self.arch_version in {'iterA4_multiscale', 'iterA5_multiscale'}:
