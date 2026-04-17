@@ -394,6 +394,48 @@ class PhysicsLoss(nn.Module):
             return event_flags.new_zeros(event_flags.shape[:-1])
         return event_flags[..., idx]
 
+    def _evidential_loss(self, evidence, pos_mask, hard_negative_mask, kl_penalty_weight=1.0):
+        # evidence shape: (batch_size, 2)
+        alpha = evidence + 1.0
+        S = alpha.sum(dim=-1, keepdim=True)
+        
+        # Target probability: [non-event, event]
+        y = torch.zeros_like(evidence)
+        y[:, 1] = pos_mask.float()
+        y[:, 0] = 1.0 - y[:, 1]
+        
+        # 1. Data Fitting Loss (Dirichlet Negative Log-Likelihood)
+        # sum(y_i * (log(S) - log(alpha_i)))
+        nll_loss = torch.sum(y * (torch.log(S) - torch.log(alpha)), dim=-1)
+        
+        # 2. KL Divergence Penalty for incorrect predictions
+        # We want to push the Dirichlet parameters towards uniform distribution (alpha=1)
+        # for classes that are NOT the target, especially if it's a hard negative.
+        # KL(Dir(alpha_tilde) || Dir(1))
+        # where alpha_tilde = y + (1 - y) * alpha
+        alpha_tilde = y + (1.0 - y) * alpha
+        
+        # KL Divergence formula for Dir(alpha) || Dir(1)
+        # KL = sum(lgamma(alpha)) - lgamma(sum(alpha)) + lgamma(K) - sum(lgamma(1))
+        #      + sum((alpha - 1) * (digamma(alpha) - digamma(sum(alpha))))
+        # Since K=2 and lgamma(1)=0:
+        S_tilde = alpha_tilde.sum(dim=-1, keepdim=True)
+        kl_div = (
+            torch.lgamma(alpha_tilde).sum(dim=-1)
+            - torch.lgamma(S_tilde.squeeze(-1))
+            + torch.lgamma(torch.tensor(2.0, device=evidence.device))
+            + torch.sum(
+                (alpha_tilde - 1.0) * (torch.digamma(alpha_tilde) - torch.digamma(S_tilde)),
+                dim=-1
+            )
+        )
+        
+        # Amplify KL penalty for hard negatives (where model shouldn't be confident at all)
+        penalty_mask = hard_negative_mask.float() * 5.0 + 1.0
+        kl_div = kl_div * penalty_mask * kl_penalty_weight
+        
+        return (nll_loss + kl_div).mean()
+
     def _pairwise_rank_loss(self, scores, strengths):
         pos_mask = strengths >= torch.quantile(strengths.detach(), 0.75)
         neg_mask = strengths <= torch.quantile(strengths.detach(), 0.25)
@@ -537,7 +579,7 @@ class PhysicsLoss(nn.Module):
                 device=pred.device,
                 dtype=pred.dtype,
             ).unsqueeze(1)
-        signal_strength = torch.relu(pred[..., 0:1]) + torch.relu(pred[..., 1:2])
+        signal_strength = torch.relu(pred[..., 0, 1:2]) + torch.relu(pred[..., 1, 1:2])
         calibration_loss = trade_block * signal_strength
 
         horizon_per_sample = (
@@ -599,20 +641,20 @@ class PhysicsLoss(nn.Module):
         main_loss = main_loss.mean(dim=1, keepdim=True)
         aux_loss = self.aux_loss_fn(torch.relu(aux_pred), aux_target).mean(dim=1, keepdim=True)
 
-        pred_vol = pred[..., 0]
-        pred_rev = torch.relu(pred[..., 1])
-        p3 = torch.relu(Ent - 0.7) * torch.relu(0.0 - pred_vol)
+        pred_vol = pred[..., 0, :]
+        pred_rev = torch.relu(pred[..., 1, :])
+        p3 = torch.relu(Ent - 0.7) * torch.relu(0.0 - pred_vol[..., 1])
         res_score = Res.abs() / sigma_ref
         ema_score = EMA_Div.abs() / sigma_ref
         alignment = (Res + EMA_Div).abs() / (Res.abs() + EMA_Div.abs() + 1e-6)
         reversion_setup = torch.relu(res_score - 1.0) * torch.relu(ema_score - 0.5) * alignment
-        p4 = reversion_setup * torch.relu(0.0 - pred[..., 1])
-        p6_lyapunov = torch.relu(MLE) * torch.relu(0.0 - pred_vol)
+        p4 = reversion_setup * torch.relu(0.0 - pred[..., 1, 1])
+        p6_lyapunov = torch.relu(MLE) * torch.relu(0.0 - pred_vol[..., 1])
         vol_mean = Vol.mean()
-        p7_csd = torch.relu(H - 0.6) * torch.relu(vol_mean - Vol) * torch.relu(MLE - 0.1) * torch.relu(0.0 - pred_vol)
+        p7_csd = torch.relu(H - 0.6) * torch.relu(vol_mean - Vol) * torch.relu(MLE - 0.1) * torch.relu(0.0 - pred_vol[..., 1])
         continuation_bias = torch.relu(H - 0.55) * torch.relu(MLE) * torch.relu(Vol - vol_mean)
         weak_dislocation = torch.relu(0.5 - reversion_setup)
-        p7_false_reversion = continuation_bias * weak_dislocation * pred_rev
+        p7_false_reversion = continuation_bias * weak_dislocation * pred_rev[..., 1]
         transition_breakout = torch.relu(compression + torch.relu(-dEnt) + torch.relu(ddEnt))
         transition_reversion = torch.relu(torch.relu(H - 0.55) + torch.relu(-Ent) + torch.relu(dEnt))
 
@@ -623,37 +665,34 @@ class PhysicsLoss(nn.Module):
         bear_context = self._get_flag(event_flags, 'reversion_down_context')
         bull_context = self._get_flag(event_flags, 'reversion_up_context')
         continuation_pressure = self._get_flag(event_flags, 'continuation_pressure')
-        breakout_hard_negative_penalty = breakout_hard_negative * torch.relu(pred_vol)
-        reversion_hard_negative_penalty = reversion_hard_negative * pred_rev
-        breakout_event_gap_loss = self._event_margin_loss(
-            pred_vol,
-            breakout_event > 0.5,
-            breakout_hard_negative > 0.5,
-            aux_target[..., 0],
-            margin=0.24,
-            scale=0.18,
+        breakout_hard_negative_penalty = breakout_hard_negative * pred_vol[..., 1]
+        reversion_hard_negative_penalty = reversion_hard_negative * pred_rev[..., 1]
+        
+        breakout_event_gap_loss = self._evidential_loss(
+            evidence=pred_vol,
+            pos_mask=breakout_event > 0.5,
+            hard_negative_mask=breakout_hard_negative > 0.5,
+            kl_penalty_weight=0.18
         )
-        reversion_event_gap_loss = self._event_margin_loss(
-            pred_rev,
-            reversion_event > 0.5,
-            reversion_hard_negative > 0.5,
-            aux_target[..., 1],
-            margin=0.32,
-            scale=0.22,
+        reversion_event_gap_loss = self._evidential_loss(
+            evidence=pred_rev,
+            pos_mask=reversion_event > 0.5,
+            hard_negative_mask=reversion_hard_negative > 0.5,
+            kl_penalty_weight=0.22
         )
 
         if debug_info is not None:
-            bear_score = torch.relu(debug_info['bear_score'].squeeze(-1))
-            bull_score = torch.relu(debug_info['bull_score'].squeeze(-1))
+            bear_score = torch.relu(debug_info['bear_score'][..., 1].squeeze(-1))
+            bull_score = torch.relu(debug_info['bull_score'][..., 1].squeeze(-1))
             directional_floor = debug_info.get('directional_floor')
             if directional_floor is not None:
-                directional_floor = torch.relu(directional_floor.squeeze(-1))
+                directional_floor = torch.relu(directional_floor[..., 1].squeeze(-1))
             else:
                 directional_floor = torch.maximum(bear_score, bull_score)
         else:
-            bear_score = pred_rev
-            bull_score = pred_rev
-            directional_floor = pred_rev
+            bear_score = pred_rev[..., 1]
+            bull_score = pred_rev[..., 1]
+            directional_floor = pred_rev[..., 1]
 
         direction_consistency_loss = (
             self._direction_margin_loss(bear_score, bull_score, bear_context, margin=0.12) +
@@ -667,10 +706,10 @@ class PhysicsLoss(nn.Module):
             bear_score + constraint_cfg.get('bull_margin', 0.12) - bull_score
         )
         public_below_directional_raw = torch.relu(
-            directional_floor + constraint_cfg.get('reversion_event_margin', 0.10) - pred_rev
+            directional_floor + constraint_cfg.get('reversion_event_margin', 0.10) - pred_rev[..., 1]
         )
         continuation_public_raw = torch.relu(
-            pred_rev - (directional_floor + constraint_cfg.get('continuation_margin', 0.05))
+            pred_rev[..., 1] - (directional_floor + constraint_cfg.get('continuation_margin', 0.05))
         )
         bear_over_bull_violation, bear_over_bull_violation_rate = self._masked_violation_stats(
             bear_over_bull_raw,
@@ -695,7 +734,7 @@ class PhysicsLoss(nn.Module):
             continuation_pressure * continuation_public_raw
         )
         continuation_suppression = continuation_pressure * (
-            pred_rev +
+            pred_rev[..., 1] +
             0.35 * bear_score +
             0.35 * bull_score
         )
@@ -728,8 +767,8 @@ class PhysicsLoss(nn.Module):
         )
         rank_loss = (
             self.weights.get('rank', 0.20) * (
-                self._pairwise_rank_loss(pred[..., 0], aux_target[..., 0]) +
-                self._pairwise_rank_loss(pred[..., 1], aux_target[..., 1])
+                self._pairwise_rank_loss(pred[..., 0, 1], aux_target[..., 0]) +
+                self._pairwise_rank_loss(pred[..., 1, 1], aux_target[..., 1])
             ) +
             self.weights.get('breakout_event_gap', 0.18) * breakout_event_gap_loss +
             self.weights.get('reversion_event_gap', 0.28) * reversion_event_gap_loss +

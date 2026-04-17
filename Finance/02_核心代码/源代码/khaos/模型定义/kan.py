@@ -285,17 +285,17 @@ class KHAOS_KAN(nn.Module):
                     nn.Linear(self.d_model, 1),
                 )
             self.breakout_head = KANHead(
-                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
             )
             self.bear_reversion_head = KANHead(
-                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
             )
             self.bull_reversion_head = KANHead(
-                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
             )
             if self.arch_version == 'iterA5_multiscale':
                 self.public_reversion_head = KANHead(
-                    self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+                    self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
                 )
             self.aux_head = nn.Sequential(
                 nn.Linear(self.d_model * 2, hidden_dim),
@@ -333,10 +333,10 @@ class KHAOS_KAN(nn.Module):
                 nn.Linear(self.d_model, self.d_model)
             )
             self.breakout_head = KANHead(
-                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
             )
             self.reversion_head = KANHead(
-                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+                self.d_model, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
             )
             self.aux_head = nn.Sequential(
                 nn.Linear(self.d_model * 2, hidden_dim),
@@ -461,8 +461,8 @@ class KHAOS_KAN(nn.Module):
         reversion_local_pooled = torch.sum(local_x * reversion_weights.unsqueeze(-1), dim=1)
         reversion_gate = torch.sigmoid(self.reversion_local_gate(torch.cat([shared_state, reversion_local_pooled], dim=1)))
         reversion_state = torch.tanh(reversion_gate * reversion_local_pooled + (1.0 - reversion_gate) * shared_state)
-        breakout_event_logits = self.breakout_head(breakout_state)
-        reversion_event_logits = self.reversion_head(reversion_state)
+        breakout_event_logits = F.softplus(self.breakout_head(breakout_state))
+        reversion_event_logits = F.softplus(self.reversion_head(reversion_state))
         aux_logits_by_horizon = self._reshape_aux_logits(
             self.aux_head(torch.cat([shared_state, pooled - last_state], dim=1))
         )
@@ -565,9 +565,9 @@ class KHAOS_KAN(nn.Module):
                 )
             )
             breakout_state = torch.tanh(transition_context + breakout_residual_gate * (short_state - mid_state))
-        breakout_event_logits = self.breakout_head(breakout_state)
-        bear_score_h = self.bear_reversion_head(bear_state)
-        bull_score_h = self.bull_reversion_head(bull_state)
+        breakout_event_logits = F.softplus(self.breakout_head(breakout_state))
+        bear_score_h = F.softplus(self.bear_reversion_head(bear_state))
+        bull_score_h = F.softplus(self.bull_reversion_head(bull_state))
         directional_reversion_h = direction_gate * bear_score_h + (1.0 - direction_gate) * bull_score_h
         directional_floor_h = torch.maximum(
             directional_reversion_h,
@@ -575,9 +575,7 @@ class KHAOS_KAN(nn.Module):
         )
         public_reversion_score_h = torch.maximum(bear_score_h, bull_score_h)
         if self.arch_version == 'iterA5_multiscale':
-            public_reversion_score = self.public_reversion_head(public_reversion_state)
-            
-            public_reversion_score_h = self.public_reversion_head(public_reversion_state)
+            public_reversion_score_h = F.softplus(self.public_reversion_head(public_reversion_state))
         public_reversion_gate = torch.zeros_like(direction_gate)
         
         if self.arch_version in {'iterA4_multiscale', 'iterA5_multiscale'}:

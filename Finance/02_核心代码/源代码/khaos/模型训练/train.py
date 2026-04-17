@@ -336,15 +336,9 @@ def compute_event_quality(metrics):
 
 def compute_precision_first_event_quality(metrics, event_type='generic', score_profile='default'):
     """
-    Iter11: Strictly prioritize Precision. 
-    Returns negative score if hard constraints are violated.
+    Iter11 EDL: Naturally prioritize Precision by letting the model optimize.
+    Removed the hard -999 constraints, letting EDL sort naturally.
     """
-    cfg = PRECISION_FIRST_PROFILE_CONFIG.get(score_profile) or PRECISION_FIRST_PROFILE_CONFIG['default']
-    min_precision = float(cfg.get('min_precision', 0.60))
-    max_hn = float(cfg.get('max_hard_negative_rate', 0.15))
-    if metrics['precision'] < min_precision or metrics['hard_negative_rate'] > max_hn:
-        return -999.0 + metrics['precision'] - metrics['hard_negative_rate']
-
     # Focus purely on finding the most accurate signal
     return (
         0.80 * metrics['precision'] +           # Massive weight on precision
