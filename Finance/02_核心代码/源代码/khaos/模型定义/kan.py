@@ -517,6 +517,7 @@ class KHAOS_KAN(nn.Module):
         return main_pred, aux_pred, info
 
     def _forward_itera3(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
+        batch_size = x.size(0)
         last_state = x[:, -1, :]
         global_state, global_weights = self.global_pool(x)
 
@@ -588,13 +589,20 @@ class KHAOS_KAN(nn.Module):
             # 【优化修改】：打破严格的凸组合限制，解决 public_below_directional_violation_rate 接近 100% 的问题
             # 将加权平均改为“以 directional_reversion 为基座，向上叠加残差”的方式，
             # 确保 reversion_pred 能够突破 max(bear, bull) 的上限限制，满足 loss.py 中的可行域约束。
-            reversion_residual = public_reversion_gate * torch.relu(
+            # Ansatz Hard-Wiring: Unlearnable physical distance gating
+            # The directional_gate determines if there is a clear trend.
+            # We detach it so the network cannot cheat by minimizing it to avoid loss.
+            directional_gate_hard = torch.sigmoid(10.0 * (torch.abs(bull_score_h - bear_score_h) - 0.05)).detach()
+            
+            reversion_residual = public_reversion_gate.unsqueeze(-1) * torch.relu(
                 public_reversion_score_h - directional_reversion_h + 0.15
             )
-            reversion_event_logits = torch.maximum(
-                directional_floor_h + 0.10,
-                directional_reversion_h + reversion_residual,
-            )
+            
+            # Apply the detached gate to the public reversion output.
+            # If there is no clear direction (directional_gate_hard ~ 0), the reversion event is strictly bounded by directional_reversion_h.
+            gated_residual = directional_gate_hard * reversion_residual
+            
+            reversion_event_logits = directional_reversion_h + gated_residual
         else:
             reversion_event_logits = directional_reversion_h
         aux_logits_by_horizon = self._reshape_aux_logits(
