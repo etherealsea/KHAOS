@@ -2223,7 +2223,9 @@ def evaluate_dataset_loader(kan, eval_loader, criterion, args, device, use_debug
             batch_log['total_loss'] = float(loss.item())
             batch_log['batch_size'] = batch_size_val
             file_bucket['logs'].append(batch_log)
-            file_bucket['preds'].append(pred.detach().float().cpu().numpy())
+            # In EDL, pred is [batch, tasks, 2]. pred[..., 1] is the Evidence for the Event.
+            # Evidence is a perfect score that combines Probability and Uncertainty!
+            file_bucket['preds'].append(pred[..., 1].detach().float().cpu().numpy())
             file_bucket['aux_preds'].append(aux_pred.detach().float().cpu().numpy())
             file_bucket['targets'].append(batch_y.detach().cpu().numpy())
             file_bucket['aux_targets'].append(batch_aux.detach().cpu().numpy())

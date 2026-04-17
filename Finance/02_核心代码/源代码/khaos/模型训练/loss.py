@@ -621,8 +621,6 @@ class PhysicsLoss(nn.Module):
         debug_info=None,
         horizon_payload=None,
     ):
-        if pred.shape != target.shape:
-            target = target.view_as(pred)
         if aux_pred.shape != aux_target.shape:
             aux_target = aux_target.view_as(aux_pred)
 
@@ -643,6 +641,8 @@ class PhysicsLoss(nn.Module):
 
         pred_vol = pred[..., 0, :]
         pred_rev = torch.relu(pred[..., 1, :])
+        if pred_vol.dim() != 2 or pred_vol.shape[1] != 2:
+            print(f"DEBUG loss.py: pred.shape={pred.shape}, pred_vol.shape={pred_vol.shape}")
         p3 = torch.relu(Ent - 0.7) * torch.relu(0.0 - pred_vol[..., 1])
         res_score = Res.abs() / sigma_ref
         ema_score = EMA_Div.abs() / sigma_ref

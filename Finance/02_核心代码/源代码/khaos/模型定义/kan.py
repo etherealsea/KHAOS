@@ -384,11 +384,11 @@ class KHAOS_KAN(nn.Module):
         reversion_extras=None,
     ):
         batch_size = breakout_event_logits.size(0)
+        breakout_event_logits = breakout_event_logits.view(batch_size, 2, self.horizon_count)
+        reversion_event_logits = reversion_event_logits.view(batch_size, 2, self.horizon_count)
         device = breakout_event_logits.device
         dtype = breakout_event_logits.dtype
-        family_mode = str(family_mode or self.horizon_family_mode)
-        prior = self._resolve_horizon_prior(horizon_prior, batch_size, device, dtype)
-        valid_mask = None
+
         if valid_horizon_mask is not None:
             valid_mask = valid_horizon_mask.to(device=device, dtype=dtype)
             if valid_mask.dim() == 1:
@@ -396,50 +396,46 @@ class KHAOS_KAN(nn.Module):
             valid_mask = (valid_mask > 0.5).to(dtype=dtype)
 
         if self.horizon_count <= 1:
-            breakout_weights = torch.ones_like(breakout_event_logits)
-            reversion_weights = torch.ones_like(reversion_event_logits)
-            breakout_horizon_logits = torch.zeros_like(breakout_event_logits)
-            reversion_horizon_logits = torch.zeros_like(reversion_event_logits)
+            breakout_weights = torch.ones(batch_size, 1, self.horizon_count, device=device, dtype=dtype)
+            reversion_weights = torch.ones(batch_size, 1, self.horizon_count, device=device, dtype=dtype)
+            breakout_horizon_logits = torch.zeros(batch_size, self.horizon_count, device=device, dtype=dtype)
+            reversion_horizon_logits = torch.zeros(batch_size, self.horizon_count, device=device, dtype=dtype)
         else:
-            if family_mode == 'single_cycle' and prior is not None:
-                breakout_weights = prior[:, 0, :]
-                reversion_weights = prior[:, 1, :]
+            if family_mode == 'single_cycle' and horizon_prior is not None:
+                breakout_weights = horizon_prior[:, 0, :].unsqueeze(1)
+                reversion_weights = horizon_prior[:, 1, :].unsqueeze(1)
             else:
                 if breakout_horizon_logits is None:
-                    breakout_horizon_logits = torch.zeros_like(breakout_event_logits)
-                if reversion_horizon_logits is None:
-                    reversion_horizon_logits = torch.zeros_like(reversion_event_logits)
-                if valid_mask is not None:
+                    breakout_horizon_logits = torch.zeros(batch_size, self.horizon_count, device=device, dtype=dtype)
+                    reversion_horizon_logits = torch.zeros(batch_size, self.horizon_count, device=device, dtype=dtype)
+                if valid_horizon_mask is not None:
                     invalid_fill = torch.finfo(breakout_event_logits.dtype).min
                     breakout_horizon_logits = breakout_horizon_logits.masked_fill(valid_mask <= 0.5, invalid_fill)
                     reversion_horizon_logits = reversion_horizon_logits.masked_fill(valid_mask <= 0.5, invalid_fill)
-                breakout_weights = torch.softmax(breakout_horizon_logits, dim=-1)
-                reversion_weights = torch.softmax(reversion_horizon_logits, dim=-1)
+                breakout_weights = torch.softmax(breakout_horizon_logits, dim=-1).unsqueeze(1)
+                reversion_weights = torch.softmax(reversion_horizon_logits, dim=-1).unsqueeze(1)
 
-        breakout_pred = torch.sum(breakout_weights * breakout_event_logits, dim=-1, keepdim=True)
-        reversion_pred = torch.sum(reversion_weights * reversion_event_logits, dim=-1, keepdim=True)
+        breakout_pred = torch.sum(breakout_weights * breakout_event_logits, dim=-1)
+        reversion_pred = torch.sum(reversion_weights * reversion_event_logits, dim=-1)
         aux_pred = torch.stack(
             [
-                torch.sum(breakout_weights * aux_logits_by_horizon[:, 0, :], dim=-1),
-                torch.sum(reversion_weights * aux_logits_by_horizon[:, 1, :], dim=-1),
+                torch.sum(breakout_weights.squeeze(1) * aux_logits_by_horizon[:, 0, :], dim=-1),
+                torch.sum(reversion_weights.squeeze(1) * aux_logits_by_horizon[:, 1, :], dim=-1),
             ],
             dim=1,
         )
         info = {
-            'event_logits_by_horizon': torch.stack([breakout_event_logits, reversion_event_logits], dim=1),
-            'aux_logits_by_horizon': aux_logits_by_horizon,
-            'horizon_logits': torch.stack([breakout_horizon_logits, reversion_horizon_logits], dim=1),
-            'horizon_weights': torch.stack([breakout_weights, reversion_weights], dim=1),
-            'selected_horizon_breakout': breakout_weights.argmax(dim=-1).to(dtype=torch.float32),
-            'selected_horizon_reversion': reversion_weights.argmax(dim=-1).to(dtype=torch.float32),
-            'horizon_entropy_breakout': (-breakout_weights.clamp_min(1e-8).log() * breakout_weights).sum(dim=-1),
-            'horizon_entropy_reversion': (-reversion_weights.clamp_min(1e-8).log() * reversion_weights).sum(dim=-1),
+            'breakout_horizon_weights': breakout_weights.squeeze(1),
+            'reversion_horizon_weights': reversion_weights.squeeze(1),
+            'breakout_horizon_logits': breakout_horizon_logits,
+            'reversion_horizon_logits': reversion_horizon_logits,
         }
         if reversion_extras:
             for key, value in reversion_extras.items():
                 if value is None:
                     continue
-                info[key] = torch.sum(reversion_weights * value, dim=-1, keepdim=True)
+                info[key] = value
+
         return breakout_pred, reversion_pred, aux_pred, info
 
     def _forward_itera2(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
@@ -493,7 +489,7 @@ class KHAOS_KAN(nn.Module):
         direction_gate = torch.full_like(breakout_pred, 0.5)
         public_reversion_gate = torch.zeros_like(direction_gate)
         breakout_residual_gate = torch.zeros_like(direction_gate)
-        main_pred = torch.cat([breakout_pred, reversion_pred], dim=1)
+        main_pred = torch.stack([breakout_pred, reversion_pred], dim=1)
         info = {
             'attn': attn_weights,
             'pool': pool_weights,
@@ -630,7 +626,7 @@ class KHAOS_KAN(nn.Module):
                 'directional_floor': directional_floor_h,
             },
         )
-        main_pred = torch.cat([breakout_pred, reversion_pred], dim=1)
+        main_pred = torch.stack([breakout_pred, reversion_pred], dim=1)
         info = {
             'attn': attn_weights,
             'global_pool': global_weights,
