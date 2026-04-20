@@ -20,7 +20,7 @@ def extract_zip(zip_path: Path, out_dir: Path):
 
 
 def run_train(train_py: Path, argv):
-    cmd = [sys.executable, str(train_py)] + argv
+    cmd = [sys.executable, '-u', str(train_py)] + argv
     proc = subprocess.run(cmd, stdout=sys.stdout, stderr=sys.stderr, check=False)
     if proc.returncode != 0:
         raise SystemExit(proc.returncode)
@@ -40,7 +40,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--arch_version', type=str, default='iterA4_multiscale')
     parser.add_argument('--constraint_profile', type=str, default='teacher_feasible_discovery_v1')
-    parser.add_argument('--score_profile', type=str, default='short_t_discovery_guarded_focus')
+    parser.add_argument('--score_profile', type=str, default='iter11_precision_first')
     parser.add_argument('--fast_full', action='store_true', default=False)
     args = parser.parse_args()
 
@@ -56,6 +56,7 @@ def main():
 
     train_py = Path('/workspace/Finance/02_核心代码/源代码/khaos/模型训练/train.py').resolve()
     report_py = Path('/workspace/scripts/generate_iter10_multiasset_report.py').resolve()
+    resume_path = save_dir / 'khaos_kan_resume.pth'
 
     for chunk_end in range(args.chunk_size, args.epochs_total + 1, args.chunk_size):
         argv = [
@@ -73,7 +74,7 @@ def main():
         ]
         if args.fast_full:
             argv.append('--fast_full')
-        if chunk_end != args.chunk_size:
+        if chunk_end != args.chunk_size or resume_path.exists():
             argv.append('--resume')
         run_train(train_py, argv)
 
@@ -103,4 +104,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

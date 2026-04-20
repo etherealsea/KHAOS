@@ -1,0 +1,12 @@
+{
+  "run_id": "20260417_smoke_ansatz_gating_bce",
+  "data_dir": "/workspace/data",
+  "training_subdir": "iter10_multiasset",
+  "assets": "000333",
+  "timeframes": "1h",
+  "epochs_total": 1,
+  "chunk_size": 1,
+  "arch_version": "iterA4_multiscale",
+  "constraint_profile": "teacher_feasible_discovery_v1",
+  "score_profile": "iter11_precision_first"
+}

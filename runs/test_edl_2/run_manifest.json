@@ -1,0 +1,12 @@
+{
+  "run_id": "test_edl_2",
+  "data_dir": "/workspace/data",
+  "training_subdir": "iter11_global_multiasset",
+  "assets": "BTCUSD",
+  "timeframes": "1d",
+  "epochs_total": 1,
+  "chunk_size": 2,
+  "arch_version": "iterA4_multiscale",
+  "constraint_profile": "teacher_feasible_discovery_v1",
+  "score_profile": "iter11_precision_first"
+}

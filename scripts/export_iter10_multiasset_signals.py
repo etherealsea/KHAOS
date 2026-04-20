@@ -123,27 +123,39 @@ def main():
         loader = torch.utils.data.DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
         breakout_scores = []
         reversion_scores = []
+        bear_scores = []
+        bull_scores = []
         sample_indices = []
         with torch.no_grad():
             seen = 0
             for batch in loader:
                 x = batch[0].to(device)
-                main_pred = model(x)
+                main_pred, info = model(x, return_debug=True)
                 bs = main_pred[:, 0].detach().cpu().numpy()
                 rs = main_pred[:, 1].detach().cpu().numpy()
                 breakout_scores.append(bs)
                 reversion_scores.append(rs)
+                bear = info.get('bear_score')
+                bull = info.get('bull_score')
+                if bear is None or bull is None:
+                    bear = torch.zeros((main_pred.size(0), 1), device=main_pred.device, dtype=main_pred.dtype)
+                    bull = torch.zeros((main_pred.size(0), 1), device=main_pred.device, dtype=main_pred.dtype)
+                bear_scores.append(bear.detach().cpu().numpy().reshape(-1))
+                bull_scores.append(bull.detach().cpu().numpy().reshape(-1))
                 bsz = len(bs)
                 sample_indices.extend(range(seen, seen + bsz))
                 seen += bsz
         breakout_scores = np.concatenate(breakout_scores, axis=0)
         reversion_scores = np.concatenate(reversion_scores, axis=0)
+        bear_scores = np.concatenate(bear_scores, axis=0)
+        bull_scores = np.concatenate(bull_scores, axis=0)
         window_size = int(getattr(test_ds, 'window_size', 20))
         out_path = signals_dir / f'{asset}_{tf}.csv'
         with out_path.open('w', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
             w.writerow([
                 'time', 'close', 'ema20', 'sigma',
+                'bear_score', 'bull_score', 'direction',
                 'breakout_score', 'reversion_score',
                 'breakout_threshold', 'reversion_threshold',
                 'breakout_signal', 'reversion_signal',
@@ -155,11 +167,14 @@ def main():
                 close = float(test_ds.close[end_idx])
                 ema20 = float(test_ds.ema20[end_idx])
                 sigma = float(test_ds.sigma[end_idx])
+                bear = float(bear_scores[i])
+                bull = float(bull_scores[i])
+                direction = 1 if bull >= bear else -1
                 bs = float(breakout_scores[i])
                 rs = float(reversion_scores[i])
                 b_sig = int(bs >= breakout_th)
                 r_sig = int(rs >= reversion_th)
-                w.writerow([t, close, ema20, sigma, bs, rs, breakout_th, reversion_th, b_sig, r_sig])
+                w.writerow([t, close, ema20, sigma, bear, bull, direction, bs, rs, breakout_th, reversion_th, b_sig, r_sig])
         print(out_path.as_posix())
 
 

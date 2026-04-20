@@ -477,7 +477,16 @@ def build_reversion_discovery_targets(
     )
 
 class FinancialDataset(Dataset):
-    def __init__(self, df, window_size=20, forecast_horizon=4, volatility_window=LOCAL_PHYSICS_WINDOW, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(
+        self,
+        df,
+        window_size=20,
+        forecast_horizon=4,
+        volatility_window=LOCAL_PHYSICS_WINDOW,
+        device='cuda' if torch.cuda.is_available() else 'cpu',
+        label_thresholds=None,
+        label_preset='guarded_v1',
+    ):
         self.window_size = window_size
         self.forecast_horizon = forecast_horizon
         self.feature_names = PHYSICS_FEATURE_NAMES
@@ -502,22 +511,26 @@ class FinancialDataset(Dataset):
         self.ema20 = ema_np(self.close, 20)
         entropy = rolling_entropy_proxy_np(self.high, self.low, self.close, LOCAL_PHYSICS_WINDOW)
         hurst = rolling_hurst_proxy_np(log_close, LOCAL_PHYSICS_WINDOW)
-        breakout_target, breakout_aux, breakout_event, breakout_hard_negative = build_breakout_targets(
+        breakout_target, breakout_aux, breakout_event, breakout_hard_negative = build_breakout_discovery_targets(
             log_close,
             log_high,
             log_low,
             returns,
             self.sigma,
             entropy,
-            self.forecast_horizon
+            self.forecast_horizon,
+            threshold_config=(label_thresholds or {}).get('breakout') if isinstance(label_thresholds, dict) else None,
+            preset=label_preset,
         )
-        reversion_target, reversion_aux, reversion_event, reversion_hard_negative = build_reversion_targets(
+        reversion_target, reversion_aux, reversion_event, reversion_hard_negative = build_reversion_discovery_targets(
             log_close,
             self.ema20,
             self.sigma,
             entropy,
             hurst,
-            self.forecast_horizon
+            self.forecast_horizon,
+            threshold_config=(label_thresholds or {}).get('reversion') if isinstance(label_thresholds, dict) else None,
+            preset=label_preset,
         )
         self.targets = np.stack([breakout_target, reversion_target], axis=1).astype(np.float32)
         self.aux_targets = np.stack([breakout_aux, reversion_aux], axis=1).astype(np.float32)
@@ -541,10 +554,30 @@ class FinancialDataset(Dataset):
         self.data = np.stack([
             self.open, self.high, self.low, self.close, self.volume, self.ema20
         ], axis=1)
-        print(f"  [Pre-computation] Extracting physics features for {len(df)} rows...")
+
+        import hashlib
+        import os
+        import torch
+        
+        # Create a unique hash for the dataset features to use as cache key
+        # We'll use the raw data shape, sum, and dataset length to ensure uniqueness
         raw_tensor = torch.tensor(self.data, dtype=torch.float32)
-        self.physics_features = compute_physics_features_bulk(raw_tensor, device='cpu')
-        print(f"  [Pre-computation] Done. Feature shape: {self.physics_features.shape}")
+        data_sig = f"{raw_tensor.shape}_{raw_tensor.sum().item():.4f}_{len(df)}"
+        cache_hash = hashlib.md5(data_sig.encode()).hexdigest()
+        cache_dir = os.path.join('/workspace/data', '.feature_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"features_{cache_hash}.pt")
+
+        if os.path.exists(cache_file):
+            print(f"  [Pre-computation] Loading cached physics features from {cache_file}...")
+            self.physics_features = torch.load(cache_file, map_location='cpu', weights_only=True)
+            print(f"  [Pre-computation] Done. Feature shape: {self.physics_features.shape}")
+        else:
+            print(f"  [Pre-computation] Extracting physics features for {len(df)} rows...")
+            self.physics_features = compute_physics_features_bulk(raw_tensor, device='cpu')
+            print(f"  [Pre-computation] Saving extracted features to cache {cache_file}...")
+            torch.save(self.physics_features, cache_file)
+            print(f"  [Pre-computation] Done. Feature shape: {self.physics_features.shape}")
 
     def __len__(self):
         return max(0, len(self.close) - self.window_size - self.forecast_horizon)
@@ -599,6 +632,57 @@ def create_rolling_datasets(file_path, train_ratio=0.8, window_size=20, horizon=
     test_df = df.iloc[train_size - window_size:] 
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    train_ds = FinancialDataset(train_df, window_size, horizon, device=device)
-    test_ds = FinancialDataset(test_df, window_size, horizon, device=device)
+    train_df_cols = [c.lower().strip() for c in train_df.columns]
+    train_df = train_df.copy()
+    train_df.columns = train_df_cols
+    close = train_df['close'].values.astype(np.float32)
+    high = train_df['high'].values.astype(np.float32)
+    low = train_df['low'].values.astype(np.float32)
+    log_close = np.log(np.maximum(close, 1e-8))
+    log_high = np.log(np.maximum(high, 1e-8))
+    log_low = np.log(np.maximum(low, 1e-8))
+    returns = np.diff(log_close, prepend=log_close[0])
+    sigma = pd.Series(returns).rolling(window=LOCAL_PHYSICS_WINDOW, min_periods=1).std()
+    sigma = sigma.ffill().fillna(0.0).values
+    sigma = np.maximum(sigma, 1e-6).astype(np.float32)
+    ema20 = ema_np(close, 20)
+    entropy = rolling_entropy_proxy_np(high, low, close, LOCAL_PHYSICS_WINDOW)
+    hurst = rolling_hurst_proxy_np(log_close, LOCAL_PHYSICS_WINDOW)
+    label_thresholds = {
+        'breakout': fit_breakout_discovery_thresholds(
+            log_close,
+            log_high,
+            log_low,
+            returns,
+            sigma,
+            entropy,
+            horizon,
+            preset='guarded_v1',
+        ),
+        'reversion': fit_reversion_discovery_thresholds(
+            log_close,
+            ema20,
+            sigma,
+            entropy,
+            hurst,
+            horizon,
+            preset='guarded_v1',
+        ),
+    }
+    train_ds = FinancialDataset(
+        train_df,
+        window_size,
+        horizon,
+        device=device,
+        label_thresholds=label_thresholds,
+        label_preset='guarded_v1',
+    )
+    test_ds = FinancialDataset(
+        test_df,
+        window_size,
+        horizon,
+        device=device,
+        label_thresholds=label_thresholds,
+        label_preset='guarded_v1',
+    )
     return train_ds, test_ds

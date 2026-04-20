@@ -30,11 +30,14 @@ def run_strategy(rows, hold_bars=8):
         sigma = max(float(r['sigma']), 1e-6)
         breakout_sig = int(r['breakout_signal'])
         reversion_sig = int(r['reversion_signal'])
+        bear = float(r.get('bear_score') or 0.0)
+        bull = float(r.get('bull_score') or 0.0)
+        direction = 1.0 if bull >= bear else -1.0
         if reversion_sig:
-            pos = -sign(close - ema20)
+            pos = direction
             hold = hold_bars
         elif breakout_sig:
-            pos = sign(close - ema20)
+            pos = direction
             hold = hold_bars
         elif hold > 0:
             hold -= 1
@@ -128,4 +131,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
