@@ -589,15 +589,26 @@ class KHAOS_KAN(nn.Module):
             # 【优化修改】：打破严格的凸组合限制，解决 public_below_directional_violation_rate 接近 100% 的问题
             # 将加权平均改为“以 directional_reversion 为基座，向上叠加残差”的方式，
             # 确保 reversion_pred 能够突破 max(bear, bull) 的上限限制，满足 loss.py 中的可行域约束。
-            # Ansatz Hard-Wiring: Unlearnable physical distance gating
-            # The directional_gate determines if there is a clear trend.
-            # We detach it so the network cannot cheat by minimizing it to avoid loss.
-            directional_gate_hard = torch.sigmoid(10.0 * (torch.abs(bull_score_h - bear_score_h) - 0.05)).detach()
+            # Ansatz Hard-Wiring: 提取物理特征中的 Compression (index 13)
+            # 门控1: 压缩率门控 (Compression Gate) - 突破信号必须在压缩期之后
+            compression = x[:, -1, 13]
+            compression_gate_hard = torch.sigmoid(50.0 * (compression - 0.0001)).unsqueeze(-1).detach()
             
+            # 门控2: 方向一致性门控 (Directional Gate) - 反转或趋势必须有明确的方向底座
+            directional_gate_hard = torch.sigmoid(10.0 * (torch.abs(bull_score_h - bear_score_h) - 0.05)).detach()
+
+            # 应用硬接线门控到 Breakout
+            # breakout_event_logits 形状为 [batch, 2*horizon]，而 gate 形状为 [batch, 2, horizon]
+            breakout_event_logits = (
+                breakout_event_logits.view(batch_size, 2, self.horizon_count)
+                * directional_gate_hard
+                * compression_gate_hard.unsqueeze(-1)
+            ).view(batch_size, -1)
+
             reversion_residual = public_reversion_gate.unsqueeze(-1) * torch.relu(
                 public_reversion_score_h - directional_reversion_h + 0.15
             )
-            
+
             # Apply the detached gate to the public reversion output.
             # If there is no clear direction (directional_gate_hard ~ 0), the reversion event is strictly bounded by directional_reversion_h.
             gated_residual = directional_gate_hard * reversion_residual
