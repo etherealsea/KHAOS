@@ -259,10 +259,12 @@ def _compute_breakout_discovery_components(log_close, log_high, log_low, returns
     mfe_norm = mfe / sigma_safe
     mae_norm = mae / sigma_safe
     
-    # 3. Score calculation (MFE_norm * exp(-λ * MAE_norm))
-    # Lambda = 1.2 penalizes drawdowns heavily
-    score = mfe_norm * np.exp(-1.2 * mae_norm)
-    aux_score = np.maximum(mfe_norm - 0.8 * mae_norm, 0.0)
+    # 3. Score calculation (Iter14: Continuous Expected Value Regression)
+    # Instead of an exponential penalty that collapses the target space to 0,
+    # we compute a continuous Expected Value (EV) proxy based on normalized excursion.
+    # We penalize MAE directly but linearly to allow the model to learn the full distribution.
+    score = mfe_norm - 1.2 * mae_norm
+    aux_score = mfe_norm + 0.5 * np.maximum(1.0 - mae_norm, 0.0)
 
     return {
         'mfe_norm': mfe_norm.astype(np.float32),
@@ -288,10 +290,10 @@ def fit_breakout_discovery_thresholds(log_close, log_high, log_low, returns, sig
     valid_target = _valid_prefix(components[target_key], forecast_horizon)
     valid_mae = _valid_prefix(components['mae_norm'], forecast_horizon)
     
-    # We use 0.95 (top 5%) for event threshold as requested by user
+    # For Iter14 EV Regression, we don't strictly need these to clip at 0.5 anymore
     return {
-        'event_target_threshold': _robust_quantile(valid_target, 0.95, floor=0.5),
-        'hard_negative_target_threshold': _robust_quantile(valid_target, 0.30, floor=0.1),
+        'event_target_threshold': _robust_quantile(valid_target, 0.95, floor=-2.0),
+        'hard_negative_target_threshold': _robust_quantile(valid_target, 0.30, floor=-5.0),
         'hard_negative_mae_threshold': _robust_quantile(valid_mae, 0.85, floor=1.5),
     }
 
@@ -352,8 +354,8 @@ def build_breakout_discovery_targets(
         forecast_horizon=forecast_horizon,
     )
     return (
-        np.clip(breakout_target, 0.0, 10.0).astype(np.float32),
-        np.clip(breakout_aux, 0.0, 10.0).astype(np.float32),
+        np.clip(breakout_target, -10.0, 10.0).astype(np.float32),
+        np.clip(breakout_aux, -10.0, 10.0).astype(np.float32),
         breakout_event,
         breakout_hard_negative,
     )
@@ -382,9 +384,10 @@ def _compute_reversion_discovery_components(log_close, ema20, sigma, entropy, hu
     mfe_norm = mfe / sigma_safe
     mae_norm = mae / sigma_safe
     
-    # 3. Score calculation (MFE_norm * exp(-λ * MAE_norm))
-    score = mfe_norm * np.exp(-1.2 * mae_norm)
-    aux_score = np.maximum(mfe_norm - 0.8 * mae_norm, 0.0)
+    # 3. Score calculation (Iter14: Continuous Expected Value Regression)
+    # Reversion uses a similar linear expected value formulation
+    score = mfe_norm - 1.2 * mae_norm
+    aux_score = mfe_norm + 0.5 * np.maximum(1.0 - mae_norm, 0.0)
 
     return {
         'mfe_norm': mfe_norm.astype(np.float32),
@@ -409,10 +412,10 @@ def fit_reversion_discovery_thresholds(log_close, ema20, sigma, entropy, hurst, 
     valid_target = _valid_prefix(components[target_key], forecast_horizon)
     valid_mae = _valid_prefix(components['mae_norm'], forecast_horizon)
     
-    # Use 0.95 (top 5%) for high-precision event threshold
+    # For Iter14 EV Regression, we don't strictly need these to clip at 0.5 anymore
     return {
-        'event_target_threshold': _robust_quantile(valid_target, 0.95, floor=0.5),
-        'hard_negative_target_threshold': _robust_quantile(valid_target, 0.30, floor=0.1),
+        'event_target_threshold': _robust_quantile(valid_target, 0.95, floor=-2.0),
+        'hard_negative_target_threshold': _robust_quantile(valid_target, 0.30, floor=-5.0),
         'hard_negative_mae_threshold': _robust_quantile(valid_mae, 0.85, floor=1.5),
     }
 
@@ -470,8 +473,8 @@ def build_reversion_discovery_targets(
         forecast_horizon=forecast_horizon,
     )
     return (
-        np.clip(target, 0.0, 10.0).astype(np.float32),
-        np.clip(aux_target, 0.0, 10.0).astype(np.float32),
+        np.clip(target, -10.0, 10.0).astype(np.float32),
+        np.clip(aux_target, -10.0, 10.0).astype(np.float32),
         reversion_event,
         reversion_hard_negative,
     )

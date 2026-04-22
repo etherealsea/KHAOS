@@ -218,12 +218,17 @@ def compute_threshold_selection_utility(candidate, event_type='generic', score_p
     signal_health = compute_signal_health(candidate.get('signal_frequency', 0.0), signal_cap)
     candidate['signal_health'] = signal_health
     if is_soft_iter12_profile(score_profile):
+        # 【Iter14 EV Regression】: signal_space_mean 和 signal_quality_mean 变成了连续 EV，不再局限于 [0, 1]
+        # 为了保证不同指标权重可比，对 EV 均值做一层软归一化处理（除以 3.0 并截断），以体现高 EV 的正向作用。
+        norm_space = float(np.clip(candidate.get('signal_space_mean', 0.0) / 3.0, 0.0, 1.5))
+        norm_quality = float(np.clip(candidate.get('signal_quality_mean', 0.0) / 3.0, 0.0, 1.5))
+        
         utility = (
             0.42 * float(candidate.get('precision', 0.0)) +
             0.18 * float(candidate.get('recall', 0.0)) +
             0.20 * max(1.0 - float(candidate.get('hard_negative_rate', 0.0)), 0.0) +
-            0.12 * float(candidate.get('signal_space_mean', 0.0)) +
-            0.08 * float(candidate.get('signal_quality_mean', 0.0))
+            0.12 * norm_space +
+            0.08 * norm_quality
         )
         candidate['selection_utility'] = utility
         return utility
@@ -497,12 +502,12 @@ def compose_metric_scores(main_scores, aux_scores, score_profile='default', even
     if aux_values.size != primary.size:
         aux_values = np.zeros_like(primary)
     
-    primary = np.clip(primary, 0.0, 1.0)
+    # 【Iter14 EV Regression】：取消对 primary 概率的 [0, 1] 强行截断，
+    # 允许连续 EV 目标保持自身的数值范围。
+    # primary = np.clip(primary, 0.0, 1.0)
     
-    # 【Iter13 彻底重构】：在评估融合阶段，对无上界的 aux_values 进行归一化
-    # 避免它污染原本被限制在 [0, 1] 的 primary 概率，导致阈值拟合时出现 >1.0 的畸形数值。
-    # 除以 2.0 是为了适应目标波动率幅度的一般量级
-    aux_values = np.tanh(np.maximum(aux_values, 0.0) / 2.0)
+    # 同样取消对 aux_values 的 tanh 归一化，直接使用其连续值。
+    # aux_values = np.tanh(np.maximum(aux_values, 0.0) / 2.0)
     
     coherent = np.minimum(primary, aux_values)
     if event_type == 'reversion':
@@ -540,26 +545,17 @@ def compute_iter13_structural_components(summary):
     summary = summary or {}
     public_violation_rate = _clip01(summary.get('public_below_directional_violation_rate', 1.0))
     
-    # 【Iter13 彻底重构】：由于 kan.py 已经将输出通过 Sigmoid 映射为真实概率
-    # directional_floor 的均值将非常小（在无聊背景下通常只有 0.01~0.03）
-    # 不能再直接将这个绝对数值当作 quality。我们需要将其相对放大，
-    # 以正确评估模型在罕见正样本中的结构响应。
+    # 【Iter14 EV Regression】：由于 kan.py 现在输出连续的期望值 (EV)
+    # directional_floor 不再是微小的概率，而是具有实际数值的 EV (通常 > 0.5 才有意义)
+    # 不再使用基于标签频率的放大系数，而是直接对 EV 进行软归一化。
     raw_floor_mean = max(float(summary.get('directional_floor_mean', 0.0)), 0.0)
     raw_event_mean = max(
         float(summary.get('directional_floor_reversion_event_mean', raw_floor_mean)),
         0.0,
     )
     
-    # 动态获取真实的先验频率，默认保护值为 0.04
-    label_frequency = summary.get('prior_label_frequency', summary.get('reversion_label_frequency', 0.04))
-    label_frequency = max(float(label_frequency), 0.01) # 防止除零或极端放大
-    
-    # 用 1.0 / label_frequency 作为动态缩放因子
-    # 如果先验频率是 4%，那么均值 0.04 就会被缩放到 1.0 (满分)
-    scale_factor = 1.0 / label_frequency
-    
-    directional_floor_mean = _clip01(raw_floor_mean * scale_factor)
-    directional_floor_event_mean = _clip01(raw_event_mean * scale_factor)
+    directional_floor_mean = _clip01(raw_floor_mean / 2.5)
+    directional_floor_event_mean = _clip01(raw_event_mean / 2.5)
     
     directional_support_rate = _clip01(
         summary.get(
