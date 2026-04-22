@@ -536,13 +536,13 @@ def _clip01(value):
     return float(np.clip(float(value), 0.0, 1.0))
 
 
-def compute_iter12_structural_components(summary):
+def compute_iter13_structural_components(summary):
     summary = summary or {}
     public_violation_rate = _clip01(summary.get('public_below_directional_violation_rate', 1.0))
     
     # 【Iter13 彻底重构】：由于 kan.py 已经将输出通过 Sigmoid 映射为真实概率
     # directional_floor 的均值将非常小（在无聊背景下通常只有 0.01~0.03）
-    # 不能再直接将这个绝对数值当作 quality。我们需要将其相对放大（例如乘以 20），
+    # 不能再直接将这个绝对数值当作 quality。我们需要将其相对放大，
     # 以正确评估模型在罕见正样本中的结构响应。
     raw_floor_mean = max(float(summary.get('directional_floor_mean', 0.0)), 0.0)
     raw_event_mean = max(
@@ -550,8 +550,14 @@ def compute_iter12_structural_components(summary):
         0.0,
     )
     
-    # 乘以 20 作为一个基础缩放因子，让 0.04 左右的概率均值能映射回约 0.8 的健康分数段
-    scale_factor = 20.0
+    # 动态获取真实的先验频率，默认保护值为 0.04
+    label_frequency = summary.get('prior_label_frequency', summary.get('reversion_label_frequency', 0.04))
+    label_frequency = max(float(label_frequency), 0.01) # 防止除零或极端放大
+    
+    # 用 1.0 / label_frequency 作为动态缩放因子
+    # 如果先验频率是 4%，那么均值 0.04 就会被缩放到 1.0 (满分)
+    scale_factor = 1.0 / label_frequency
+    
     directional_floor_mean = _clip01(raw_floor_mean * scale_factor)
     directional_floor_event_mean = _clip01(raw_event_mean * scale_factor)
     
@@ -675,7 +681,7 @@ def compute_checkpoint_score(
             event_type='reversion',
             score_profile=profile,
         )
-        structural_components = compute_iter12_structural_components(structural_summary)
+        structural_components = compute_iter13_structural_components(structural_summary)
         if direction_macro_f1 is None:
             return (
                 0.30 * breakout_quality +
@@ -1127,12 +1133,13 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             support_margin = directional_floor_values[:aligned_size] - directional_reversion_values[:aligned_size]
             if np.any(support_mask):
                 directional_support_rate = float(np.mean(support_margin[support_mask] > 1e-6))
-    structural_components = compute_iter12_structural_components(
+    structural_components = compute_iter13_structural_components(
         {
             'public_below_directional_violation_rate': public_below_directional_violation_rate,
             'directional_floor_mean': directional_floor_mean,
             'directional_floor_reversion_event_mean': directional_floor_reversion_event_mean,
             'directional_support_rate': directional_support_rate,
+            'prior_label_frequency': reversion_metrics.get('label_frequency', 0.04) # 传入真实的标签频率作为先验校准
         }
     )
     selected_breakout = _flatten_debug_batches(bucket['debug_batches']['selected_horizon_breakout'])
@@ -2553,7 +2560,7 @@ def compute_recent_precision_score(
             )
         )
         recent_public_violation.append(float(summary['public_below_directional_violation_rate']))
-        structural_components = compute_iter12_structural_components(summary)
+        structural_components = compute_iter13_structural_components(summary)
         recent_public_feasibility.append(structural_components['public_feasibility'])
         recent_directional_support_rate.append(structural_components['directional_support_rate'])
         recent_directional_floor_quality.append(structural_components['directional_floor_quality'])
