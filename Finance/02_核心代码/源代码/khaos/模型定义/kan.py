@@ -643,56 +643,29 @@ class KHAOS_KAN(nn.Module):
                 )
             )
             
-            # 【优化修改】：打破严格的凸组合限制，解决 public_below_directional_violation_rate 接近 100% 的问题
-            # 将加权平均改为“以 directional_reversion 为基座，向上叠加残差”的方式，
-            # 确保 reversion_pred 能够突破 max(bear, bull) 的上限限制，满足 loss.py 中的可行域约束。
-            # Ansatz Hard-Wiring: 提取物理特征中的 Compression (index 13)
-            # 门控1: 压缩率门控 (Compression Gate) - 突破信号必须在压缩期之后
+            # 【Iter13 彻底重构】：拆除所有阻断性质的乘法物理门控（compression_gate, directional_gate）
+            # 这些硬接线门控被证明会导致严重的“冷启动死锁”与“躺平塌缩”。
+            # 我们将特征直接加性融合或放行，让 KAN 网络自行学习是否利用这些信息，而不是人工预设阈值。
+            
+            # 直接提取之前为了计算 gate 用的物理特征作为 info 记录，不再做乘法阻断
             compression = x[:, -1, 13]
             directional_separation = torch.abs(bull_score_h - bear_score_h)
-            compression_gate = self._build_soft_gate(
-                compression.unsqueeze(-1),
-                center=self.compression_gate_center,
-                slope=self._resolve_gate_slope(
-                    self.compression_gate_slope_start,
-                    self.compression_gate_slope_end,
-                ),
-                gate_floor=self.gate_floor_breakout,
-            )
             
-            # 门控2: 方向一致性门控 (Directional Gate) - 反转或趋势必须有明确的方向底座
-            directional_gate = self._build_soft_gate(
-                directional_separation,
-                center=self.directional_gate_center,
-                slope=self._resolve_gate_slope(
-                    self.directional_gate_slope_start,
-                    self.directional_gate_slope_end,
-                ),
-                gate_floor=self.gate_floor_reversion,
-            )
+            # 保留 dummy gates 仅为了向后兼容 metrics 和 info 字典结构，但不再乘入 logits
+            compression_gate = torch.ones_like(compression.unsqueeze(-1))
+            directional_gate = torch.ones_like(directional_separation)
+            gate_floor_hit = torch.zeros_like(directional_gate)
+            
+            # Breakout 不再被乘法 gate 阻断，直接沿用网络原本的预测
+            # breakout_event_logits 保持不变
 
-            # 应用硬接线门控到 Breakout
-            # breakout_event_logits 形状为 [batch, 2*horizon]，而 gate 形状为 [batch, 2, horizon]
-            breakout_gate = torch.maximum(
-                compression_gate.unsqueeze(-1) * directional_gate,
-                torch.full_like(directional_gate, self.gate_floor_breakout),
-            )
-            gate_floor_hit = (
-                (breakout_gate <= self.gate_floor_breakout + 1e-4) |
-                (directional_gate <= self.gate_floor_reversion + 1e-4)
-            ).to(dtype=x.dtype)
-            breakout_event_logits = (
-                breakout_event_logits.view(batch_size, 2, self.horizon_count)
-                * breakout_gate
-            ).view(batch_size, -1)
-
+            # Reversion 也不再被 directional_gate 阻断，只做残差加性融合
             reversion_residual = public_reversion_gate.unsqueeze(-1) * torch.relu(
                 public_reversion_score_h - directional_reversion_h + 0.15
             )
-
-            # Apply the detached gate to the public reversion output.
-            # If there is no clear direction (directional_gate_hard ~ 0), the reversion event is strictly bounded by directional_reversion_h.
-            gated_residual = directional_gate * reversion_residual
+            
+            # 直接融合，不再受 directional_gate 抑制
+            gated_residual = reversion_residual
             
             reversion_event_logits = directional_reversion_h + gated_residual
         else:
