@@ -3815,7 +3815,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--window_size', type=int, default=20)
+    parser.add_argument('--window_size', type=int, default=60)
     parser.add_argument('--horizon', type=int, default=4)
     parser.add_argument('--horizon_search_spec', type=str, default=None)
     parser.add_argument('--horizon_family_mode', type=str, default='legacy')
