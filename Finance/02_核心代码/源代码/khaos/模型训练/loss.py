@@ -614,37 +614,43 @@ class PhysicsLoss(nn.Module):
         reversion_down_context = self._get_flag(event_flags, 'reversion_down_context')
         reversion_up_context = self._get_flag(event_flags, 'reversion_up_context')
         continuation_pressure = self._get_flag(event_flags, 'continuation_pressure')
-        prob_breakout = self._pair_to_event_prob(pred[..., 0, :])
-        prob_reversion = self._pair_to_event_prob(pred[..., 1, :])
-        # 【Iter13 彻底重构】：引入 Focal Loss 替代硬编码降权，平滑降低易分负样本权重
+        # 【Iter14 EV Regression】：采用非对称 Huber Loss (Smooth L1 Loss) 处理连续期望值回归
+        # 加大对正向高价值机会（target > 0 且预测不足）的惩罚，允许在低价值区域有一定误差。
+        pred_breakout = self._pair_to_event_prob(pred[..., 0, :])
+        pred_reversion = self._pair_to_event_prob(pred[..., 1, :])
+        
+        target_breakout = target[..., 0]
+        target_reversion = target[..., 1]
+        
         with torch.amp.autocast(device_type=pred.device.type, enabled=False):
-            # focal loss gamma parameter
-            gamma = 2.0
-            
-            # breakout focal bce
-            pt_breakout = torch.where(breakout_event > 0.5, prob_breakout, 1 - prob_breakout)
-            focal_weight_breakout = (1 - pt_breakout) ** gamma
-            bce_breakout = F.binary_cross_entropy(
-                prob_breakout.float(),
-                breakout_event.float(),
+            # Breakout EV Regression Loss
+            diff_breakout = target_breakout.float() - pred_breakout.float()
+            # 非对称权重：如果目标大于0且预测偏低，加大惩罚；如果目标为负，则正常惩罚
+            asym_weight_breakout = torch.where((target_breakout > 0) & (diff_breakout > 0), 2.0, 1.0)
+            huber_breakout = F.smooth_l1_loss(
+                pred_breakout.float(),
+                target_breakout.float(),
                 reduction='none',
-            ) * focal_weight_breakout
+                beta=1.0
+            ) * asym_weight_breakout
             
-            # reversion focal bce
-            pt_reversion = torch.where(reversion_event > 0.5, prob_reversion, 1 - prob_reversion)
-            focal_weight_reversion = (1 - pt_reversion) ** gamma
-            bce_reversion = F.binary_cross_entropy(
-                prob_reversion.float(),
-                reversion_event.float(),
+            # Reversion EV Regression Loss
+            diff_reversion = target_reversion.float() - pred_reversion.float()
+            asym_weight_reversion = torch.where((target_reversion > 0) & (diff_reversion > 0), 2.0, 1.0)
+            huber_reversion = F.smooth_l1_loss(
+                pred_reversion.float(),
+                target_reversion.float(),
                 reduction='none',
-            ) * focal_weight_reversion
+                beta=1.0
+            ) * asym_weight_reversion
             
-        main_loss = (bce_breakout + bce_reversion).unsqueeze(1)
+        main_loss = (huber_breakout + huber_reversion).unsqueeze(1)
         
         # Aux Loss Clamping & Gradient Hook
-        aux_pred_act = torch.relu(aux_pred)
+        # 取消 torch.relu(aux_pred)，因为现在是回归模型，aux_pred 也可以为负
+        aux_pred_act = aux_pred
         if aux_pred_act.requires_grad:
-            aux_pred_act.register_hook(lambda grad: torch.clamp(grad, min=-1.5, max=1.5))
+            aux_pred_act.register_hook(lambda grad: torch.clamp(grad, min=-2.0, max=2.0))
             
         aux_loss = self.aux_loss_fn(aux_pred_act, aux_target).mean(dim=1, keepdim=True)
         # Hard clamp to prevent Aux from dominating Main Loss

@@ -495,8 +495,9 @@ class KHAOS_KAN(nn.Module):
         reversion_local_pooled = torch.sum(local_x * reversion_weights.unsqueeze(-1), dim=1)
         reversion_gate = torch.sigmoid(self.reversion_local_gate(torch.cat([shared_state, reversion_local_pooled], dim=1)))
         reversion_state = torch.tanh(reversion_gate * reversion_local_pooled + (1.0 - reversion_gate) * shared_state)
-        breakout_event_logits = torch.sigmoid(self.breakout_head(breakout_state))
-        reversion_event_logits = torch.sigmoid(self.reversion_head(reversion_state))
+        # Iter14 EV Regression: Continuous output bounded to [-10, 10]
+        breakout_event_logits = 10.0 * torch.tanh(self.breakout_head(breakout_state) / 5.0)
+        reversion_event_logits = 10.0 * torch.tanh(self.reversion_head(reversion_state) / 5.0)
         aux_logits_by_horizon = self._reshape_aux_logits(
             self.aux_head(torch.cat([shared_state, pooled - last_state], dim=1))
         )
@@ -613,9 +614,10 @@ class KHAOS_KAN(nn.Module):
             )
             breakout_state = torch.tanh(transition_context + breakout_residual_gate * (short_state - mid_state))
         # 对未硬接线的 arch 版本，使用 sigmoid 保证概率约束
-        breakout_event_logits = torch.sigmoid(self.breakout_head(breakout_state))
-        bear_score_h = torch.sigmoid(self.bear_reversion_head(bear_state)).view(batch_size, 2, self.horizon_count)
-        bull_score_h = torch.sigmoid(self.bull_reversion_head(bull_state)).view(batch_size, 2, self.horizon_count)
+        # Iter14 EV Regression: Continuous outputs bounded to [-10, 10]
+        breakout_event_logits = 10.0 * torch.tanh(self.breakout_head(breakout_state) / 5.0)
+        bear_score_h = (10.0 * torch.tanh(self.bear_reversion_head(bear_state) / 5.0)).view(batch_size, 2, self.horizon_count)
+        bull_score_h = (10.0 * torch.tanh(self.bull_reversion_head(bull_state) / 5.0)).view(batch_size, 2, self.horizon_count)
         directional_reversion_h = (
             direction_mix_gate.unsqueeze(-1) * bear_score_h +
             (1.0 - direction_mix_gate.unsqueeze(-1)) * bull_score_h
@@ -626,7 +628,7 @@ class KHAOS_KAN(nn.Module):
         )
         public_reversion_score_h = torch.maximum(bear_score_h, bull_score_h)
         if self.arch_version == 'iterA5_multiscale':
-            public_reversion_score_h = torch.sigmoid(self.public_reversion_head(public_reversion_state)).view(batch_size, 2, self.horizon_count)
+            public_reversion_score_h = (10.0 * torch.tanh(self.public_reversion_head(public_reversion_state) / 5.0)).view(batch_size, 2, self.horizon_count)
         public_reversion_gate = torch.zeros_like(direction_mix_gate)
         compression_gate = torch.ones(batch_size, 1, device=x.device, dtype=x.dtype)
         directional_gate = torch.ones(batch_size, 2, self.horizon_count, device=x.device, dtype=x.dtype)
