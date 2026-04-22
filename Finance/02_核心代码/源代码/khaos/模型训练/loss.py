@@ -250,6 +250,28 @@ LOSS_WEIGHT_PRESETS = {
         'signal_calibration': 0.24,
         'horizon_margin': 0.22,
     },
+    'shortT_discovery_guarded_v3': {
+        'main': 1.0,
+        'aux': 0.32,
+        'rank': 0.24,
+        'breakout_event_gap': 0.24,
+        'reversion_event_gap': 0.30,
+        'p3': 0.06,
+        'p4': 0.06,
+        'p6': 0.08,
+        'p7': 0.10,
+        'breakout_hard_negative': 0.18,
+        'reversion_hard_negative': 0.24,
+        'direction_consistency': 0.16,
+        'continuation_suppression': 0.12,
+        'horizon_event': 0.28,
+        'horizon_aux': 0.16,
+        'horizon_align': 0.18,
+        'horizon_hard_negative': 0.18,
+        'horizon_entropy': 0.03,
+        'signal_calibration': 0.10,
+        'horizon_margin': 0.14,
+    },
     'horizon_precision_v1': {
         'main': 1.0,
         'aux': 0.32,
@@ -309,6 +331,20 @@ LOSS_CURRICULUM_PRESETS = {
             'signal_calibration',
         ),
         'scale_constraint_weight': True,
+    },
+    'shortT_discovery_guarded_v3': {
+        'stage_keys': (
+            'breakout_hard_negative',
+            'reversion_hard_negative',
+            'continuation_suppression',
+            'horizon_hard_negative',
+        ),
+        'stage_schedule': (
+            (0.30, 0.35),
+            (0.60, 0.65),
+            (1.00, 1.00),
+        ),
+        'scale_constraint_weight': False,
     },
 }
 
@@ -380,6 +416,21 @@ class PhysicsLoss(nn.Module):
         self.constraint_config = dict(self.base_constraint_config)
         if not self.curriculum_config:
             return
+        stage_keys = tuple(self.curriculum_config.get('stage_keys', ()))
+        stage_schedule = tuple(self.curriculum_config.get('stage_schedule', ()))
+        if stage_keys and stage_schedule:
+            progress = min(max((int(epoch) + 1) / float(self.total_epochs), 0.0), 1.0)
+            stage_factor = 1.0
+            for fraction, factor in stage_schedule:
+                if progress <= float(fraction) + 1e-12:
+                    stage_factor = float(factor)
+                    break
+            for key in stage_keys:
+                if key in self.weights:
+                    self.weights[key] = self.base_weights[key] * stage_factor
+            if self.curriculum_config.get('scale_constraint_weight', False):
+                self.constraint_config['weight'] = float(self.base_constraint_config.get('weight', 0.0)) * stage_factor
+            return
         total_epochs = max(int(total_epochs), 1)
         warmup_fraction = float(self.curriculum_config.get('warmup_fraction', 0.0))
         start_factor = float(self.curriculum_config.get('start_factor', 1.0))
@@ -438,6 +489,11 @@ class PhysicsLoss(nn.Module):
             return preferred_scores.new_tensor(0.0)
         diff = preferred_scores[selected] - alternate_scores[selected]
         return torch.relu(margin - diff).mean()
+
+    def _signal_band_penalty(self, pred_freq, target_freq, low_ratio=0.4, high_ratio=1.6):
+        lower = torch.clamp(target_freq * low_ratio, min=0.0)
+        upper = torch.maximum(target_freq * high_ratio, lower + 1e-4)
+        return torch.relu(lower - pred_freq) + torch.relu(pred_freq - upper)
 
     def _masked_violation_stats(self, violation, mask):
         selected = mask > 0.5
@@ -546,14 +602,10 @@ class PhysicsLoss(nn.Module):
         entropy_per_task = (-horizon_weights.clamp_min(1e-8).log() * horizon_weights).sum(dim=-1)
         entropy_loss = entropy_per_task.mean(dim=1, keepdim=True)
 
-        trade_block = pred.new_zeros(pred.size(0), 1)
-        if trade_masks is not None and trade_masks.shape[-1] > TRADE_MASK_INDEX['trade_block']:
-            trade_block = trade_masks[..., TRADE_MASK_INDEX['trade_block']].to(
-                device=pred.device,
-                dtype=pred.dtype,
-            ).unsqueeze(1)
-        signal_strength = torch.relu(pred[..., 0, 1:2]) + torch.relu(pred[..., 1, 1:2])
-        calibration_loss = trade_block * signal_strength
+        event_prob = torch.sigmoid(event_logits)
+        pred_freq = (event_prob * valid_mask).sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1e-6)
+        target_freq = (event_flags_by_horizon * valid_mask).sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1e-6)
+        calibration_loss = self._signal_band_penalty(pred_freq, target_freq).mean(dim=1, keepdim=True)
 
         horizon_per_sample = (
             self.weights.get('horizon_event', 0.0) * event_loss +
@@ -610,10 +662,24 @@ class PhysicsLoss(nn.Module):
 
         breakout_event = self._get_flag(event_flags, 'breakout_event')
         reversion_event = self._get_flag(event_flags, 'reversion_event')
+        breakout_hard_negative = self._get_flag(event_flags, 'breakout_hard_negative')
+        reversion_hard_negative = self._get_flag(event_flags, 'reversion_hard_negative')
+        reversion_down_context = self._get_flag(event_flags, 'reversion_down_context')
+        reversion_up_context = self._get_flag(event_flags, 'reversion_up_context')
+        continuation_pressure = self._get_flag(event_flags, 'continuation_pressure')
         prob_breakout = self._pair_to_event_prob(pred[..., 0, :])
         prob_reversion = self._pair_to_event_prob(pred[..., 1, :])
-        bce_breakout = F.binary_cross_entropy(prob_breakout, breakout_event, reduction='none')
-        bce_reversion = F.binary_cross_entropy(prob_reversion, reversion_event, reduction='none')
+        with torch.amp.autocast(device_type=pred.device.type, enabled=False):
+            bce_breakout = F.binary_cross_entropy(
+                prob_breakout.float(),
+                breakout_event.float(),
+                reduction='none',
+            )
+            bce_reversion = F.binary_cross_entropy(
+                prob_reversion.float(),
+                reversion_event.float(),
+                reduction='none',
+            )
         main_loss = (bce_breakout + bce_reversion).unsqueeze(1)
         aux_loss = self.aux_loss_fn(torch.relu(aux_pred), aux_target).mean(dim=1, keepdim=True)
 
@@ -636,15 +702,51 @@ class PhysicsLoss(nn.Module):
         transition_breakout = torch.relu(compression + torch.relu(-dEnt) + torch.relu(ddEnt))
         transition_reversion = torch.relu(torch.relu(H - 0.55) + torch.relu(-Ent) + torch.relu(dEnt))
 
-        breakout_event_gap_loss = pred.new_tensor(0.0)
-        reversion_event_gap_loss = pred.new_tensor(0.0)
+        breakout_event_gap_loss = self._event_margin_loss(
+            prob_breakout,
+            breakout_event > 0.5,
+            breakout_hard_negative > 0.5,
+            aux_target[:, 0],
+            margin=0.08,
+            scale=0.10,
+        )
+        reversion_event_gap_loss = self._event_margin_loss(
+            prob_reversion,
+            reversion_event > 0.5,
+            reversion_hard_negative > 0.5,
+            aux_target[:, 1],
+            margin=0.10,
+            scale=0.12,
+        )
+        breakout_hard_negative_loss = (prob_breakout * breakout_hard_negative).mean()
+        reversion_hard_negative_loss = (prob_reversion * reversion_hard_negative).mean()
         constraint_penalty = pred.new_zeros(pred.size(0))
-        continuation_suppression = pred.new_zeros(pred.size(0))
+        continuation_suppression = continuation_pressure * prob_reversion
         bear_over_bull_violation_rate = pred.new_tensor(0.0)
         bull_over_bear_violation_rate = pred.new_tensor(0.0)
         public_below_directional_violation_rate = pred.new_tensor(0.0)
         continuation_public_violation_rate = pred.new_tensor(0.0)
         direction_consistency_loss = pred.new_tensor(0.0)
+        if debug_info is not None:
+            bear_debug = debug_info.get('bear_score')
+            bull_debug = debug_info.get('bull_score')
+            if bear_debug is not None and bull_debug is not None:
+                bear_pref = torch.relu(bear_debug[:, 1, :]).mean(dim=-1)
+                bull_pref = torch.relu(bull_debug[:, 1, :]).mean(dim=-1)
+                direction_consistency_loss = (
+                    self._direction_margin_loss(
+                        bear_pref,
+                        bull_pref,
+                        reversion_down_context,
+                        margin=0.08,
+                    ) +
+                    self._direction_margin_loss(
+                        bull_pref,
+                        bear_pref,
+                        reversion_up_context,
+                        margin=0.08,
+                    )
+                )
 
         horizon_per_sample = pred.new_zeros(pred.size(0), 1)
         horizon_rank = pred.new_tensor(0.0)
@@ -657,11 +759,29 @@ class PhysicsLoss(nn.Module):
                 horizon_payload=horizon_payload,
             )
 
-        # Multiply all strict physical penalties by lambda_phys to ensure Curriculum Learning
+        signal_calibration_breakout = self._signal_band_penalty(
+            prob_breakout.mean().unsqueeze(0),
+            breakout_event.mean().unsqueeze(0),
+        ).squeeze(0)
+        signal_calibration_reversion = self._signal_band_penalty(
+            prob_reversion.mean().unsqueeze(0),
+            reversion_event.mean().unsqueeze(0),
+        ).squeeze(0)
+        signal_calibration = 0.5 * (signal_calibration_breakout + signal_calibration_reversion)
+        structured_loss = (
+            self.weights.get('breakout_event_gap', 0.0) * breakout_event_gap_loss +
+            self.weights.get('reversion_event_gap', 0.0) * reversion_event_gap_loss +
+            self.weights.get('breakout_hard_negative', 0.0) * breakout_hard_negative_loss +
+            self.weights.get('reversion_hard_negative', 0.0) * reversion_hard_negative_loss +
+            self.weights.get('direction_consistency', 0.0) * direction_consistency_loss +
+            self.weights.get('continuation_suppression', 0.0) * continuation_suppression.mean() +
+            self.weights.get('signal_calibration', 0.0) * signal_calibration
+        )
         per_sample_loss = (
             self.weights.get('main', 1.0) * main_loss +
             self.weights.get('aux', 0.35) * aux_loss +
-            horizon_per_sample
+            horizon_per_sample +
+            structured_loss
         )
         
         # Rank loss also adapts via lambda_phys
@@ -677,9 +797,12 @@ class PhysicsLoss(nn.Module):
             'p7_false_reversion': p7_false_reversion.mean().item(),
             'rank': rank_loss.item(),
             'event_gap_loss': (breakout_event_gap_loss + reversion_event_gap_loss).item(),
+            'breakout_hard_negative': breakout_hard_negative_loss.item(),
+            'reversion_hard_negative': reversion_hard_negative_loss.item(),
             'direction_consistency': direction_consistency_loss.item(),
             'continuation_suppression': continuation_suppression.mean().item(),
             'constraint_penalty': constraint_penalty.mean().item(),
+            'signal_calibration_structured': signal_calibration.item(),
         }
         logs.update(horizon_logs)
         return per_sample_loss, rank_loss, logs

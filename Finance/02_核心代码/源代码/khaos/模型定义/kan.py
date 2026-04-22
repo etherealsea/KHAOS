@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 from .attention import AttentionResidualBlock
 from .revin import RevIN
 
@@ -228,11 +229,26 @@ class KHAOS_KAN(nn.Module):
         arch_version='iterA2_base',
         horizon_count=1,
         horizon_family_mode='legacy',
+        gate_mode='soft_annealed',
+        gate_floor_breakout=0.25,
+        gate_floor_reversion=0.35,
+        gate_anneal_fraction=0.40,
     ):
         super().__init__()
         self.arch_version = arch_version
         self.horizon_count = max(int(horizon_count), 1)
         self.horizon_family_mode = str(horizon_family_mode or 'legacy')
+        self.gate_mode = str(gate_mode or 'soft_annealed')
+        self.gate_floor_breakout = float(gate_floor_breakout)
+        self.gate_floor_reversion = float(gate_floor_reversion)
+        self.gate_anneal_fraction = max(float(gate_anneal_fraction), 1e-6)
+        self.gate_progress = 0.0
+        self.compression_gate_center = 0.0001
+        self.directional_gate_center = 0.05
+        self.compression_gate_slope_start = 4.0
+        self.compression_gate_slope_end = 16.0
+        self.directional_gate_slope_start = 2.0
+        self.directional_gate_slope_end = 8.0
         self.multiscale_versions = {'iterA3_multiscale', 'iterA4_multiscale', 'iterA5_multiscale'}
         self.input_norm = RevIN(num_features=input_dim, affine=True)
         self.d_model = input_dim
@@ -366,6 +382,28 @@ class KHAOS_KAN(nn.Module):
         denom = prior.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         return prior / denom
 
+    def set_epoch_progress(self, epoch, total_epochs):
+        total_epochs = max(int(total_epochs) - 1, 1)
+        self.gate_progress = float(np.clip(float(epoch) / float(total_epochs), 0.0, 1.0))
+
+    def _resolve_gate_slope(self, slope_start, slope_end):
+        if self.gate_mode != 'soft_annealed':
+            return float(slope_end)
+        anneal_progress = min(self.gate_progress / self.gate_anneal_fraction, 1.0)
+        return float(slope_start + (slope_end - slope_start) * anneal_progress)
+
+    def _build_soft_gate(self, signal, center, slope, gate_floor):
+        gate_floor = float(np.clip(gate_floor, 0.0, 1.0))
+        if self.gate_mode == 'disabled':
+            return torch.ones_like(signal)
+        if self.gate_mode == 'legacy_hard':
+            return torch.maximum(
+                torch.sigmoid(slope * (signal - center)),
+                torch.full_like(signal, gate_floor),
+            )
+        sigmoid_gate = torch.sigmoid(slope * (signal - center))
+        return gate_floor + (1.0 - gate_floor) * sigmoid_gate
+
     def _reshape_aux_logits(self, aux_logits):
         if self.horizon_count <= 1:
             return aux_logits.unsqueeze(-1)
@@ -486,29 +524,40 @@ class KHAOS_KAN(nn.Module):
                 'directional_floor': torch.relu(reversion_event_logits),
             },
         )
-        direction_gate = torch.full_like(breakout_pred, 0.5)
-        public_reversion_gate = torch.zeros_like(direction_gate)
-        breakout_residual_gate = torch.zeros_like(direction_gate)
+        direction_mix_gate = torch.full_like(breakout_pred, 0.5)
+        public_reversion_gate = torch.zeros_like(direction_mix_gate)
+        breakout_residual_gate = torch.zeros_like(direction_mix_gate)
+        compression_gate = torch.ones(breakout_pred.size(0), 1, device=breakout_pred.device, dtype=breakout_pred.dtype)
+        directional_gate = torch.ones_like(horizon_info['directional_floor'])
+        gate_floor_hit = torch.zeros_like(directional_gate)
         main_pred = torch.stack([breakout_pred, reversion_pred], dim=1)
         info = {
             'attn': attn_weights,
             'pool': pool_weights,
             'breakout_local_pool': local_weights,
             'reversion_local_pool': reversion_weights,
-            'direction_gate': direction_gate,
+            'direction_gate': direction_mix_gate,
             'public_reversion_gate': public_reversion_gate,
             'breakout_residual_gate': breakout_residual_gate,
+            'compression_gate': compression_gate,
+            'directional_gate': directional_gate,
+            'gate_floor_hit': gate_floor_hit,
             'bear_score': horizon_info['bear_score'],
             'bull_score': horizon_info['bull_score'],
             'public_reversion_score': horizon_info['public_reversion_score'],
             'directional_reversion': horizon_info['directional_reversion'],
             'directional_floor': horizon_info['directional_floor'],
-            'direction_gate_mean': direction_gate.mean(),
-            'direction_gate_std': direction_gate.std(unbiased=False),
+            'direction_gate_mean': direction_mix_gate.mean(),
+            'direction_gate_std': direction_mix_gate.std(unbiased=False),
             'public_reversion_gate_mean': public_reversion_gate.mean(),
             'public_reversion_gate_std': public_reversion_gate.std(unbiased=False),
             'breakout_residual_gate_mean': breakout_residual_gate.mean(),
             'breakout_residual_gate_std': breakout_residual_gate.std(unbiased=False),
+            'compression_gate_mean': compression_gate.mean(),
+            'compression_gate_std': compression_gate.std(unbiased=False),
+            'directional_gate_mean': directional_gate.mean(),
+            'directional_gate_std': directional_gate.std(unbiased=False),
+            'gate_floor_hit_rate': gate_floor_hit.mean(),
             'directional_floor_mean': horizon_info['directional_floor'].mean(),
             'transition_context_score': torch.sigmoid(breakout_pred),
             'reversion_context_score': torch.sigmoid(reversion_pred),
@@ -542,7 +591,7 @@ class KHAOS_KAN(nn.Module):
                 global_state,
             )
 
-        direction_gate = torch.sigmoid(
+        direction_mix_gate = torch.sigmoid(
             self.direction_gate(
                 torch.cat(
                     [reversion_context, short_state - mid_state, last_state - global_state],
@@ -551,7 +600,7 @@ class KHAOS_KAN(nn.Module):
             )
         )
         breakout_state = transition_context
-        breakout_residual_gate = torch.zeros_like(direction_gate)
+        breakout_residual_gate = torch.zeros_like(direction_mix_gate)
         if self.arch_version in {'iterA4_multiscale', 'iterA5_multiscale'}:
             breakout_residual_gate = torch.sigmoid(
                 self.breakout_residual_gate(
@@ -565,7 +614,10 @@ class KHAOS_KAN(nn.Module):
         breakout_event_logits = F.softplus(self.breakout_head(breakout_state))
         bear_score_h = F.softplus(self.bear_reversion_head(bear_state)).view(batch_size, 2, self.horizon_count)
         bull_score_h = F.softplus(self.bull_reversion_head(bull_state)).view(batch_size, 2, self.horizon_count)
-        directional_reversion_h = direction_gate.unsqueeze(-1) * bear_score_h + (1.0 - direction_gate.unsqueeze(-1)) * bull_score_h
+        directional_reversion_h = (
+            direction_mix_gate.unsqueeze(-1) * bear_score_h +
+            (1.0 - direction_mix_gate.unsqueeze(-1)) * bull_score_h
+        )
         directional_floor_h = torch.maximum(
             directional_reversion_h,
             torch.maximum(bear_score_h, bull_score_h) - 0.08,
@@ -573,7 +625,10 @@ class KHAOS_KAN(nn.Module):
         public_reversion_score_h = torch.maximum(bear_score_h, bull_score_h)
         if self.arch_version == 'iterA5_multiscale':
             public_reversion_score_h = F.softplus(self.public_reversion_head(public_reversion_state)).view(batch_size, 2, self.horizon_count)
-        public_reversion_gate = torch.zeros_like(direction_gate)
+        public_reversion_gate = torch.zeros_like(direction_mix_gate)
+        compression_gate = torch.ones(batch_size, 1, device=x.device, dtype=x.dtype)
+        directional_gate = torch.ones(batch_size, 2, self.horizon_count, device=x.device, dtype=x.dtype)
+        gate_floor_hit = torch.zeros_like(directional_gate)
         
         if self.arch_version in {'iterA4_multiscale', 'iterA5_multiscale'}:
             public_reversion_gate = torch.sigmoid(
@@ -592,17 +647,41 @@ class KHAOS_KAN(nn.Module):
             # Ansatz Hard-Wiring: 提取物理特征中的 Compression (index 13)
             # 门控1: 压缩率门控 (Compression Gate) - 突破信号必须在压缩期之后
             compression = x[:, -1, 13]
-            compression_gate_hard = torch.sigmoid(50.0 * (compression - 0.0001)).unsqueeze(-1).detach()
+            directional_separation = torch.abs(bull_score_h - bear_score_h)
+            compression_gate = self._build_soft_gate(
+                compression.unsqueeze(-1),
+                center=self.compression_gate_center,
+                slope=self._resolve_gate_slope(
+                    self.compression_gate_slope_start,
+                    self.compression_gate_slope_end,
+                ),
+                gate_floor=self.gate_floor_breakout,
+            )
             
             # 门控2: 方向一致性门控 (Directional Gate) - 反转或趋势必须有明确的方向底座
-            directional_gate_hard = torch.sigmoid(10.0 * (torch.abs(bull_score_h - bear_score_h) - 0.05)).detach()
+            directional_gate = self._build_soft_gate(
+                directional_separation,
+                center=self.directional_gate_center,
+                slope=self._resolve_gate_slope(
+                    self.directional_gate_slope_start,
+                    self.directional_gate_slope_end,
+                ),
+                gate_floor=self.gate_floor_reversion,
+            )
 
             # 应用硬接线门控到 Breakout
             # breakout_event_logits 形状为 [batch, 2*horizon]，而 gate 形状为 [batch, 2, horizon]
+            breakout_gate = torch.maximum(
+                compression_gate.unsqueeze(-1) * directional_gate,
+                torch.full_like(directional_gate, self.gate_floor_breakout),
+            )
+            gate_floor_hit = (
+                (breakout_gate <= self.gate_floor_breakout + 1e-4) |
+                (directional_gate <= self.gate_floor_reversion + 1e-4)
+            ).to(dtype=x.dtype)
             breakout_event_logits = (
                 breakout_event_logits.view(batch_size, 2, self.horizon_count)
-                * directional_gate_hard
-                * compression_gate_hard.unsqueeze(-1)
+                * breakout_gate
             ).view(batch_size, -1)
 
             reversion_residual = public_reversion_gate.unsqueeze(-1) * torch.relu(
@@ -611,7 +690,7 @@ class KHAOS_KAN(nn.Module):
 
             # Apply the detached gate to the public reversion output.
             # If there is no clear direction (directional_gate_hard ~ 0), the reversion event is strictly bounded by directional_reversion_h.
-            gated_residual = directional_gate_hard * reversion_residual
+            gated_residual = directional_gate * reversion_residual
             
             reversion_event_logits = directional_reversion_h + gated_residual
         else:
@@ -657,20 +736,28 @@ class KHAOS_KAN(nn.Module):
             'bear_mix': bear_mix,
             'bull_mix': bull_mix,
             'public_reversion_mix': public_reversion_mix,
-            'direction_gate': direction_gate,
+            'direction_gate': direction_mix_gate,
             'public_reversion_gate': public_reversion_gate,
             'breakout_residual_gate': breakout_residual_gate,
+            'compression_gate': compression_gate,
+            'directional_gate': directional_gate,
+            'gate_floor_hit': gate_floor_hit,
             'bear_score': horizon_info['bear_score'],
             'bull_score': horizon_info['bull_score'],
             'public_reversion_score': horizon_info['public_reversion_score'],
             'directional_reversion': horizon_info['directional_reversion'],
             'directional_floor': horizon_info['directional_floor'],
-            'direction_gate_mean': direction_gate.mean(),
-            'direction_gate_std': direction_gate.std(unbiased=False),
+            'direction_gate_mean': direction_mix_gate.mean(),
+            'direction_gate_std': direction_mix_gate.std(unbiased=False),
             'public_reversion_gate_mean': public_reversion_gate.mean(),
             'public_reversion_gate_std': public_reversion_gate.std(unbiased=False),
             'breakout_residual_gate_mean': breakout_residual_gate.mean(),
             'breakout_residual_gate_std': breakout_residual_gate.std(unbiased=False),
+            'compression_gate_mean': compression_gate.mean(),
+            'compression_gate_std': compression_gate.std(unbiased=False),
+            'directional_gate_mean': directional_gate.mean(),
+            'directional_gate_std': directional_gate.std(unbiased=False),
+            'gate_floor_hit_rate': gate_floor_hit.mean(),
             'directional_floor_mean': horizon_info['directional_floor'].mean(),
             'transition_context_score': torch.sigmoid(self.transition_probe(transition_context)),
             'reversion_context_score': torch.sigmoid(self.reversion_probe(reversion_context)),
