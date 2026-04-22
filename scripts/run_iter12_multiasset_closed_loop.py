@@ -68,6 +68,11 @@ SMOKE_PRESET = {
     "breakout_precision_floor": 0.0,
     "reversion_precision_floor": 0.0,
     "resume_mode": "auto",
+    "gate_mode": "soft_annealed",
+    "gate_floor_breakout": 0.25,
+    "gate_floor_reversion": 0.35,
+    "gate_anneal_fraction": 0.40,
+    "horizon_search_spec": "6,10,14,20",
 }
 FORMAL_PRESET = {
     "run_label": "formal",
@@ -109,6 +114,11 @@ FORMAL_PRESET = {
     "breakout_precision_floor": 0.0,
     "reversion_precision_floor": 0.0,
     "resume_mode": "auto",
+    "gate_mode": "soft_annealed",
+    "gate_floor_breakout": 0.25,
+    "gate_floor_reversion": 0.35,
+    "gate_anneal_fraction": 0.40,
+    "horizon_search_spec": "6,10,14,20",
 }
 PHASE_PRESETS = {
     "smoke": SMOKE_PRESET,
@@ -443,6 +453,11 @@ def main() -> None:
         add_optional_arg(argv, "--signal_frequency_cap_ratio", config["signal_frequency_cap_ratio"])
         add_optional_arg(argv, "--breakout_precision_floor", config["breakout_precision_floor"])
         add_optional_arg(argv, "--reversion_precision_floor", config["reversion_precision_floor"])
+        add_optional_arg(argv, "--gate_mode", config.get("gate_mode"))
+        add_optional_arg(argv, "--gate_floor_breakout", config.get("gate_floor_breakout"))
+        add_optional_arg(argv, "--gate_floor_reversion", config.get("gate_floor_reversion"))
+        add_optional_arg(argv, "--gate_anneal_fraction", config.get("gate_anneal_fraction"))
+        add_optional_arg(argv, "--horizon_search_spec", config.get("horizon_search_spec"))
         if not config["deterministic"]:
             argv.append("--non_deterministic")
         if config["skip_dataset_cache_prewarm"]:

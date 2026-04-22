@@ -3129,6 +3129,8 @@ def train(args):
         kan.train()
         if hasattr(criterion, 'set_epoch'):
             criterion.set_epoch(epoch, args.epochs)
+        if hasattr(kan, 'set_epoch_progress'):
+            kan.set_epoch_progress(epoch, args.epochs)
         global_train_sampler.set_epoch(epoch)
         amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
         
@@ -3857,6 +3859,11 @@ if __name__ == "__main__":
     parser.add_argument('--public_violation_cap', type=float, default=0.20)
     parser.add_argument('--breakout_precision_floor', type=float, default=0.0)
     parser.add_argument('--reversion_precision_floor', type=float, default=0.0)
+    parser.add_argument('--gate_mode', type=str, default='soft_annealed', choices=['soft_annealed', 'legacy_hard', 'disabled'])
+    parser.add_argument('--gate_floor_breakout', type=float, default=0.25)
+    parser.add_argument('--gate_floor_reversion', type=float, default=0.35)
+    parser.add_argument('--gate_anneal_fraction', type=float, default=0.40)
+    parser.add_argument('--horizon_search_spec', type=str, default=None)
     parser.add_argument('--kill_keep_review_epoch', type=int, default=0)
     parser.add_argument('--kill_keep_public_violation_rate_max', type=float, default=0.25)
     parser.add_argument('--kill_keep_signal_frequency_max', type=float, default=1.0)
