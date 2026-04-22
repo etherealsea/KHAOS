@@ -149,10 +149,10 @@ PRECISION_FIRST_PROFILE_CONFIG = {
         'threshold_grid_max': 0.995,
         'threshold_grid_points': 14,
     },
-    'iter12_soft_guarded_precision_first': {
-        'min_precision': 0.0,
+    'iter13_precision_first': {
+        'min_precision': 0.0, # 移除不合理的精度下限限制
         'max_hard_negative_rate': 1.0,
-        'threshold_grid_min': 0.20,
+        'threshold_grid_min': 0.20, # 下调分位数搜索下限，适应 Sigmoid 真实概率
         'threshold_grid_max': 0.95,
         'threshold_grid_points': 16,
     },
@@ -166,7 +166,7 @@ def resolve_event_selection_mode(score_profile='default'):
 
 
 def is_soft_iter12_profile(score_profile='default'):
-    return str(score_profile or 'default') == 'iter12_soft_guarded_precision_first'
+    return str(score_profile or 'default') in ['iter12_soft_guarded_precision_first', 'iter13_precision_first']
 
 
 def resolve_event_oversignal_cap(label_frequency, event_type='generic', score_profile='default'):
@@ -179,7 +179,7 @@ def resolve_event_oversignal_cap(label_frequency, event_type='generic', score_pr
         if event_type == 'breakout':
             return min(label_frequency + 0.02, 0.22)
         return min(label_frequency + 0.02, 0.20)
-    if score_profile == 'iter12_soft_guarded_precision_first':
+    if score_profile in ('iter12_soft_guarded_precision_first', 'iter13_precision_first'):
         if event_type == 'reversion':
             return min(max(label_frequency * 1.6, label_frequency + 0.03, 0.03), 0.28)
         if event_type == 'breakout':
@@ -539,15 +539,26 @@ def _clip01(value):
 def compute_iter12_structural_components(summary):
     summary = summary or {}
     public_violation_rate = _clip01(summary.get('public_below_directional_violation_rate', 1.0))
-    directional_floor_mean = max(float(summary.get('directional_floor_mean', 0.0)), 0.0)
-    directional_floor_event_mean = max(
-        float(summary.get('directional_floor_reversion_event_mean', directional_floor_mean)),
+    
+    # 【Iter13 彻底重构】：由于 kan.py 已经将输出通过 Sigmoid 映射为真实概率
+    # directional_floor 的均值将非常小（在无聊背景下通常只有 0.01~0.03）
+    # 不能再直接将这个绝对数值当作 quality。我们需要将其相对放大（例如乘以 20），
+    # 以正确评估模型在罕见正样本中的结构响应。
+    raw_floor_mean = max(float(summary.get('directional_floor_mean', 0.0)), 0.0)
+    raw_event_mean = max(
+        float(summary.get('directional_floor_reversion_event_mean', raw_floor_mean)),
         0.0,
     )
+    
+    # 乘以 20 作为一个基础缩放因子，让 0.04 左右的概率均值能映射回约 0.8 的健康分数段
+    scale_factor = 20.0
+    directional_floor_mean = _clip01(raw_floor_mean * scale_factor)
+    directional_floor_event_mean = _clip01(raw_event_mean * scale_factor)
+    
     directional_support_rate = _clip01(
         summary.get(
             'directional_support_rate',
-            summary.get('directional_floor_quality', directional_floor_event_mean),
+            _clip01(0.35 * directional_floor_mean + 0.65 * directional_floor_event_mean)
         )
     )
     public_feasibility = _clip01(1.0 - public_violation_rate)
