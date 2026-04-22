@@ -617,28 +617,28 @@ class PhysicsLoss(nn.Module):
         continuation_pressure = self._get_flag(event_flags, 'continuation_pressure')
         prob_breakout = self._pair_to_event_prob(pred[..., 0, :])
         prob_reversion = self._pair_to_event_prob(pred[..., 1, :])
+        # 【Iter13 彻底重构】：引入 Focal Loss 替代硬编码降权，平滑降低易分负样本权重
         with torch.amp.autocast(device_type=pred.device.type, enabled=False):
+            # focal loss gamma parameter
+            gamma = 2.0
+            
+            # breakout focal bce
+            pt_breakout = torch.where(breakout_event > 0.5, prob_breakout, 1 - prob_breakout)
+            focal_weight_breakout = (1 - pt_breakout) ** gamma
             bce_breakout = F.binary_cross_entropy(
                 prob_breakout.float(),
                 breakout_event.float(),
                 reduction='none',
-            )
+            ) * focal_weight_breakout
+            
+            # reversion focal bce
+            pt_reversion = torch.where(reversion_event > 0.5, prob_reversion, 1 - prob_reversion)
+            focal_weight_reversion = (1 - pt_reversion) ** gamma
             bce_reversion = F.binary_cross_entropy(
                 prob_reversion.float(),
                 reversion_event.float(),
                 reduction='none',
-            )
-            
-            # Asymmetric Negative Downweighting
-            # Only punish negatives if they produce a false alarm > 0.2 (Hard Negative).
-            # Otherwise, scale their loss down by 90% to prevent them from drowning the positive signals.
-            weight_breakout = torch.ones_like(bce_breakout)
-            weight_breakout[(breakout_event < 0.5) & (prob_breakout < 0.2)] = 0.1
-            bce_breakout = bce_breakout * weight_breakout
-            
-            weight_reversion = torch.ones_like(bce_reversion)
-            weight_reversion[(reversion_event < 0.5) & (prob_reversion < 0.2)] = 0.1
-            bce_reversion = bce_reversion * weight_reversion
+            ) * focal_weight_reversion
             
         main_loss = (bce_breakout + bce_reversion).unsqueeze(1)
         
@@ -736,13 +736,13 @@ class PhysicsLoss(nn.Module):
             reversion_event.mean().unsqueeze(0),
         ).squeeze(0)
         signal_calibration = 0.5 * (signal_calibration_breakout + signal_calibration_reversion)
+        # 【Iter13 彻底重构】：清洗多余的结构化 Loss（移除 continuation_suppression 和 direction_consistency_loss）
+        # 让网络通过特征融合自动学习，不再互相拉扯梯度
         structured_loss = (
             self.weights.get('breakout_event_gap', 0.0) * breakout_event_gap_loss +
             self.weights.get('reversion_event_gap', 0.0) * reversion_event_gap_loss +
             self.weights.get('breakout_hard_negative', 0.0) * breakout_hard_negative_loss +
             self.weights.get('reversion_hard_negative', 0.0) * reversion_hard_negative_loss +
-            self.weights.get('direction_consistency', 0.0) * direction_consistency_loss +
-            self.weights.get('continuation_suppression', 0.0) * continuation_suppression.mean() +
             self.weights.get('signal_calibration', 0.0) * signal_calibration +
             1.5 * gate_balance_penalty # Strong penalty to prevent gate collapse
         )
