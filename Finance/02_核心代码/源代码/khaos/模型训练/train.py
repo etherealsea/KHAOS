@@ -496,8 +496,14 @@ def compose_metric_scores(main_scores, aux_scores, score_profile='default', even
     aux_values = np.asarray(aux_scores, dtype=np.float64).reshape(-1)
     if aux_values.size != primary.size:
         aux_values = np.zeros_like(primary)
-    primary = np.maximum(primary, 0.0)
-    aux_values = np.maximum(aux_values, 0.0)
+    
+    primary = np.clip(primary, 0.0, 1.0)
+    
+    # 【Iter13 彻底重构】：在评估融合阶段，对无上界的 aux_values 进行归一化
+    # 避免它污染原本被限制在 [0, 1] 的 primary 概率，导致阈值拟合时出现 >1.0 的畸形数值。
+    # 除以 2.0 是为了适应目标波动率幅度的一般量级
+    aux_values = np.tanh(np.maximum(aux_values, 0.0) / 2.0)
+    
     coherent = np.minimum(primary, aux_values)
     if event_type == 'reversion':
         return 0.48 * primary + 0.22 * aux_values + 0.30 * coherent

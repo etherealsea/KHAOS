@@ -403,10 +403,9 @@ class PhysicsLoss(nn.Module):
         return event_flags[..., idx]
 
     def _pair_to_event_prob(self, pair_scores):
-        scores = torch.relu(pair_scores)
-        denom = scores.sum(dim=-1, keepdim=False) + 2.0
-        prob_event = (scores[..., 1] + 1.0) / denom
-        return prob_event.clamp(1e-6, 1.0 - 1e-6)
+        # 【Iter13 彻底重构】：由于模型已经输出 Sigmoid 概率，直接返回即可，
+        # 不再使用 EDL 公式 (s1+1)/(s0+s1+2)，防止输出被错误地压迫到 [0.33, 0.67] 区间。
+        return pair_scores
 
     def _pairwise_rank_loss(self, scores, strengths):
         pos_mask = strengths >= torch.quantile(strengths.detach(), 0.75)
