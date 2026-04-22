@@ -14,10 +14,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.20,
         'breakout_event_gap': 0.18,
         'reversion_event_gap': 0.28,
-        'p3': 0.10,
-        'p4': 0.12,
-        'p6': 0.12,
-        'p7': 0.15,
         'breakout_hard_negative': 0.24,
         'reversion_hard_negative': 0.42,
         'direction_consistency': 0.18,
@@ -36,10 +32,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.24,
         'breakout_event_gap': 0.26,
         'reversion_event_gap': 0.30,
-        'p3': 0.10,
-        'p4': 0.12,
-        'p6': 0.12,
-        'p7': 0.15,
         'breakout_hard_negative': 0.32,
         'reversion_hard_negative': 0.40,
         'direction_consistency': 0.10,
@@ -58,10 +50,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.24,
         'breakout_event_gap': 0.28,
         'reversion_event_gap': 0.34,
-        'p3': 0.10,
-        'p4': 0.12,
-        'p6': 0.12,
-        'p7': 0.15,
         'breakout_hard_negative': 0.32,
         'reversion_hard_negative': 0.42,
         'direction_consistency': 0.08,
@@ -80,10 +68,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.24,
         'breakout_event_gap': 0.34,
         'reversion_event_gap': 0.24,
-        'p3': 0.10,
-        'p4': 0.10,
-        'p6': 0.12,
-        'p7': 0.14,
         'breakout_hard_negative': 0.46,
         'reversion_hard_negative': 0.32,
         'direction_consistency': 0.12,
@@ -102,10 +86,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.24,
         'breakout_event_gap': 0.30,
         'reversion_event_gap': 0.30,
-        'p3': 0.10,
-        'p4': 0.10,
-        'p6': 0.12,
-        'p7': 0.14,
         'breakout_hard_negative': 0.38,
         'reversion_hard_negative': 0.38,
         'direction_consistency': 0.12,
@@ -124,10 +104,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.24,
         'breakout_event_gap': 0.28,
         'reversion_event_gap': 0.32,
-        'p3': 0.10,
-        'p4': 0.10,
-        'p6': 0.12,
-        'p7': 0.14,
         'breakout_hard_negative': 0.36,
         'reversion_hard_negative': 0.40,
         'direction_consistency': 0.16,
@@ -146,10 +122,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.26,
         'breakout_event_gap': 0.34,
         'reversion_event_gap': 0.46,
-        'p3': 0.10,
-        'p4': 0.10,
-        'p6': 0.12,
-        'p7': 0.15,
         'breakout_hard_negative': 0.46,
         'reversion_hard_negative': 0.58,
         'direction_consistency': 0.24,
@@ -168,10 +140,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.26,
         'breakout_event_gap': 0.36,
         'reversion_event_gap': 0.40,
-        'p3': 0.10,
-        'p4': 0.10,
-        'p6': 0.12,
-        'p7': 0.15,
         'breakout_hard_negative': 0.48,
         'reversion_hard_negative': 0.56,
         'direction_consistency': 0.24,
@@ -190,10 +158,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.32,
         'breakout_event_gap': 0.18,
         'reversion_event_gap': 0.20,
-        'p3': 0.08,
-        'p4': 0.08,
-        'p6': 0.10,
-        'p7': 0.12,
         'breakout_hard_negative': 0.18,
         'reversion_hard_negative': 0.22,
         'direction_consistency': 0.16,
@@ -212,10 +176,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.28,
         'breakout_event_gap': 0.28,
         'reversion_event_gap': 0.34,
-        'p3': 0.08,
-        'p4': 0.08,
-        'p6': 0.10,
-        'p7': 0.12,
         'breakout_hard_negative': 0.32,
         'reversion_hard_negative': 0.40,
         'direction_consistency': 0.20,
@@ -234,10 +194,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.30,
         'breakout_event_gap': 0.32,
         'reversion_event_gap': 0.40,
-        'p3': 0.08,
-        'p4': 0.08,
-        'p6': 0.10,
-        'p7': 0.12,
         'breakout_hard_negative': 0.36,
         'reversion_hard_negative': 0.46,
         'direction_consistency': 0.28,
@@ -256,10 +212,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.24,
         'breakout_event_gap': 0.24,
         'reversion_event_gap': 0.30,
-        'p3': 0.06,
-        'p4': 0.06,
-        'p6': 0.08,
-        'p7': 0.10,
         'breakout_hard_negative': 0.18,
         'reversion_hard_negative': 0.24,
         'direction_consistency': 0.16,
@@ -278,10 +230,6 @@ LOSS_WEIGHT_PRESETS = {
         'rank': 0.24,
         'breakout_event_gap': 0.36,
         'reversion_event_gap': 0.48,
-        'p3': 0.08,
-        'p4': 0.10,
-        'p6': 0.10,
-        'p7': 0.14,
         'breakout_hard_negative': 0.48,
         'reversion_hard_negative': 0.60,
         'direction_consistency': 0.22,
@@ -687,18 +635,10 @@ class PhysicsLoss(nn.Module):
         pred_rev = torch.relu(pred[..., 1, :])
         if pred_vol.dim() != 2 or pred_vol.shape[1] != 2:
             print(f"DEBUG loss.py: pred.shape={pred.shape}, pred_vol.shape={pred_vol.shape}")
-        p3 = torch.relu(Ent - 0.7) * torch.relu(0.0 - pred_vol[..., 1])
         res_score = Res.abs() / sigma_ref
         ema_score = EMA_Div.abs() / sigma_ref
         alignment = (Res + EMA_Div).abs() / (Res.abs() + EMA_Div.abs() + 1e-6)
         reversion_setup = torch.relu(res_score - 1.0) * torch.relu(ema_score - 0.5) * alignment
-        p4 = reversion_setup * torch.relu(0.0 - pred[..., 1, 1])
-        p6_lyapunov = torch.relu(MLE) * torch.relu(0.0 - pred_vol[..., 1])
-        vol_mean = Vol.mean()
-        p7_csd = torch.relu(H - 0.6) * torch.relu(vol_mean - Vol) * torch.relu(MLE - 0.1) * torch.relu(0.0 - pred_vol[..., 1])
-        continuation_bias = torch.relu(H - 0.55) * torch.relu(MLE) * torch.relu(Vol - vol_mean)
-        weak_dislocation = torch.relu(0.5 - reversion_setup)
-        p7_false_reversion = continuation_bias * weak_dislocation * pred_rev[..., 1]
         transition_breakout = torch.relu(compression + torch.relu(-dEnt) + torch.relu(ddEnt))
         transition_reversion = torch.relu(torch.relu(H - 0.55) + torch.relu(-Ent) + torch.relu(dEnt))
 
@@ -790,11 +730,6 @@ class PhysicsLoss(nn.Module):
         logs = {
             'main': main_loss.mean().item(),
             'aux': aux_loss.mean().item(),
-            'p3_ent_vol': p3.mean().item(),
-            'p4_reversion_setup': p4.mean().item(),
-            'p6_mle_chaos': p6_lyapunov.mean().item(),
-            'p7_csd': p7_csd.mean().item(),
-            'p7_false_reversion': p7_false_reversion.mean().item(),
             'rank': rank_loss.item(),
             'event_gap_loss': (breakout_event_gap_loss + reversion_event_gap_loss).item(),
             'breakout_hard_negative': breakout_hard_negative_loss.item(),

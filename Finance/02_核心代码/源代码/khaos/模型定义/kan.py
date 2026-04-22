@@ -175,7 +175,7 @@ class KANHead(nn.Module):
         for idx, layer in enumerate(self.layers):
             x = layer(x)
             if idx < len(self.layers) - 1:
-                x = torch.tanh(x)
+                x = torch.nn.functional.silu(x)
         return x
 
     def regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
