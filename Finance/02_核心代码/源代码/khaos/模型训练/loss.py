@@ -628,8 +628,28 @@ class PhysicsLoss(nn.Module):
                 reversion_event.float(),
                 reduction='none',
             )
+            
+            # Asymmetric Negative Downweighting
+            # Only punish negatives if they produce a false alarm > 0.2 (Hard Negative).
+            # Otherwise, scale their loss down by 90% to prevent them from drowning the positive signals.
+            weight_breakout = torch.ones_like(bce_breakout)
+            weight_breakout[(breakout_event < 0.5) & (prob_breakout < 0.2)] = 0.1
+            bce_breakout = bce_breakout * weight_breakout
+            
+            weight_reversion = torch.ones_like(bce_reversion)
+            weight_reversion[(reversion_event < 0.5) & (prob_reversion < 0.2)] = 0.1
+            bce_reversion = bce_reversion * weight_reversion
+            
         main_loss = (bce_breakout + bce_reversion).unsqueeze(1)
-        aux_loss = self.aux_loss_fn(torch.relu(aux_pred), aux_target).mean(dim=1, keepdim=True)
+        
+        # Aux Loss Clamping & Gradient Hook
+        aux_pred_act = torch.relu(aux_pred)
+        if aux_pred_act.requires_grad:
+            aux_pred_act.register_hook(lambda grad: torch.clamp(grad, min=-1.5, max=1.5))
+            
+        aux_loss = self.aux_loss_fn(aux_pred_act, aux_target).mean(dim=1, keepdim=True)
+        # Hard clamp to prevent Aux from dominating Main Loss
+        aux_loss = torch.clamp(aux_loss, max=1.0)
 
         pred_vol = pred[..., 0, :]
         pred_rev = torch.relu(pred[..., 1, :])
@@ -667,7 +687,15 @@ class PhysicsLoss(nn.Module):
         public_below_directional_violation_rate = pred.new_tensor(0.0)
         continuation_public_violation_rate = pred.new_tensor(0.0)
         direction_consistency_loss = pred.new_tensor(0.0)
+        gate_balance_penalty = pred.new_tensor(0.0)
+        
         if debug_info is not None:
+            # Gate Balance Regularization
+            gate_mean = debug_info.get('direction_gate_mean', None)
+            if gate_mean is not None:
+                # Force the gate to stay active and close to 0.5, punishing mode collapse (0.0 or 1.0)
+                gate_balance_penalty = (gate_mean - 0.5) ** 2
+                
             bear_debug = debug_info.get('bear_score')
             bull_debug = debug_info.get('bull_score')
             if bear_debug is not None and bull_debug is not None:
@@ -715,7 +743,8 @@ class PhysicsLoss(nn.Module):
             self.weights.get('reversion_hard_negative', 0.0) * reversion_hard_negative_loss +
             self.weights.get('direction_consistency', 0.0) * direction_consistency_loss +
             self.weights.get('continuation_suppression', 0.0) * continuation_suppression.mean() +
-            self.weights.get('signal_calibration', 0.0) * signal_calibration
+            self.weights.get('signal_calibration', 0.0) * signal_calibration +
+            1.5 * gate_balance_penalty # Strong penalty to prevent gate collapse
         )
         per_sample_loss = (
             self.weights.get('main', 1.0) * main_loss +

@@ -1,29 +1,61 @@
-# Iter12 神经网络深度优化方案：废除物理惩罚与修复 KAN 坍塌
+# Iter12 神经网络深度优化方案：基于数学特性的损失函数重构
 
-## 1. 摘要
-根据前期分析与业务诉求，模型不需要在所有物理状态下都被强制学习和区分，只需专注于捕捉交易信号。本方案将彻底移除损失函数中导致梯度冲突的物理惩罚项（P3/P4/P6等），完全依托 Iter12 引入的前向软门控（Soft Gating）来进行物理约束；同时修复 KAN 网络内部因 `Tanh` 激活函数导致的 B样条坍塌问题。
+## 1. 严谨的数学与科学分析
 
-## 2. 现状分析
-- **损失函数撕裂**：`loss.py` 中的 `p3, p4, p6, p7` 等物理惩罚项，强制要求模型在排列熵（Ent）或李雅普诺夫指数（MLE）较高时预测无波动。这使得主损失（捕捉交易机会）与物理损失发生严重拔河，污染了正常交易信号，导致假阳性（Hard Negative）极高。
-- **B样条坍塌（B-Spline Collapse）**：`kan.py` 的 `KANHead` 在层与层之间使用了 `torch.tanh(x)` 进行激活。在遇到极端物理脉冲时，`Tanh` 会将特征挤压到 `[-1, 1]` 的边界极值处，落入 B样条的梯度死区，导致权重无法更新，最终引发 `catastrophic_output_collapse`（输出变为一条直线）。
+当前 KHAOS_KAN 模型在本地训练中表现出“高准确率（95%），但极低召回率（<1%）与极低信号频率（0.5%）”，其本质是模型陷入了**极端类别不平衡（Class Imbalance）下的局部最优解（Trivial Solution）**。
 
-## 3. 具体修改方案
+### 1.1 BCE Loss 在 4% vs 96% 不平衡下的梯度主导效应
+二元交叉熵（BCE）的损失函数对 Logits $x$ 的梯度为：$\frac{\partial L}{\partial x} = p - y$。
+- 在 4% 的正样本（事件区，$y=1$）上，梯度为 $p - 1$。
+- 在 96% 的负样本（无事件区，$y=0$）上，梯度为 $p$。
 
-### 3.1 净化目标函数 (`Finance/02_核心代码/源代码/khaos/模型训练/loss.py`)
-- **移除冗余物理惩罚计算**：删除 `p3`、`p4`、`p6_lyapunov`、`p7_csd`、`p7_false_reversion` 以及 `continuation_bias` 等变量的计算逻辑。
-- **清理日志与汇总**：将上述移除的变量从 `logs` 字典中剔除。
-- **清理权重预设**：从 `LOSS_WEIGHT_PRESETS` 的所有配置字典中删除 `p3`, `p4`, `p6`, `p7` 的权重定义。
-- **保留核心**：仅保留主损失（BCE）、辅助任务损失（Aux）、事件间隔（Event Gap）、强负样本（Hard Negative）以及门控相关的结构化损失。
+由于负样本数量是正样本的 24 倍，在每一个 Batch 的反向传播中，即使模型对负样本的预测概率 $p$ 已经很小（如 0.1），累积的负向梯度（$24 \times 0.1 = 2.4$）依然会压倒正样本传来的微弱正向梯度（$1 \times (0.1 - 1) = -0.9$）。这迫使模型在所有区域都尽可能输出 0，从而导致召回率和信号频率锐减。
 
-### 3.2 修复 KAN 结构死区 (`Finance/02_核心代码/源代码/khaos/模型定义/kan.py`)
-- **替换/移除 Tanh 激活**：在 `KANHead.forward` 方法中，去掉 `x = torch.tanh(x)`。由于 KAN 本身的 B样条已经具备强大的非线性映射能力，额外的 `Tanh` 截断反而有害。可将其替换为 `x = torch.nn.functional.silu(x)` 或直接移除（推荐替换为 SiLU 以保留平滑的非线性且无硬性边界）。
-- **确认 Soft Gating**：确认前向传播末端的门控（`compression_gate`, `directional_gate`）作为唯一的物理先验拦截器，接管被删除的损失函数惩罚职能。
+### 1.2 辅助任务梯度喧宾夺主 (Gradient Domination)
+在训练日志中，主损失（BCE）为 `0.8729`，而辅助损失（Aux Loss，预测连续值的 Smooth L1）高达 `2.5902`。
+从数学优化角度看，多任务学习中共享层的参数更新方向 $\Delta \theta$ 主要由范数（Norm）最大的梯度决定。当 Aux 梯度远大于主任务梯度时，网络 75% 的容量都在做“回归曲线拟合”，而真正用于捕捉离散交易信号的分类能力被严重削弱。
 
-## 4. 假设与决策
-- **决策**：完全信任 Ansatz Hard-Wiring（架构级硬接线），即通过前向传播时的物理门控来阻断错误信号，而不是通过 Loss 惩罚来纠正。
-- **假设**：去除 `Tanh` 后，物理特征的极端值能够顺畅通过 B样条的基底，梯度流恢复正常，从而解决输出坍塌问题。
+### 1.3 方向门控的模式坍塌 (Mode Collapse in Mixture of Experts)
+`direction_mix_gate` 均值为 0.01（即 100% 偏向空头分支），这是混合专家模型（MoE）中典型的**赢者通吃（Winner-takes-all）坍塌**。在训练早期，如果空头分支偶然获得了略优的损失下降，网络会通过 Sigmoid 门控迅速将权重 $g$ 推向 0，切断多头分支的梯度流（因为 $\frac{\partial L}{\partial w_{bull}} \propto (1-g)$）。多头分支变成死神经元，导致模型宏观方向 F1 极度偏置。
 
-## 5. 验证步骤
-1. 修改完成后，运行 `python test_loss.py`（或类似本地测试脚本）确保损失函数剔除无误且维度对齐。
-2. 运行 `python test_model_gating.py` 确保 KAN 前向传播正常。
-3. 使用 `run_iter12_multiasset_closed_loop.py --phase smoke` 跑 1-2 个 Epoch，观察训练日志，确认不再触发 `catastrophic_output_collapse`，且 `main` loss 能够正常下降。
+---
+
+## 2. 彻底的优化与修改方案
+
+为了从根源上解决上述数学陷阱，建议对 `loss.py` 和 `kan.py` 进行以下三项核心重构：
+
+### 2.1 非对称负样本降权 (Asymmetric Negative Downweighting)
+**科学依据**：与其在整个 96% 的负样本空间中艰难寻优，不如引入非对称掩码（Mask），让模型“忽略”那些预测分数已经很低的无聊波动，只惩罚那些错报高分的“硬负样本（Hard Negatives）”。
+**代码修改（`loss.py`）**：
+在 BCE Loss 计算后，对真实标签为 0 且预测概率 $< 0.2$ 的样本，将其 Loss 权重强制乘以 $0.1$（降权 90%）。
+```python
+# 示例伪代码
+neg_mask = (event_target < 0.5)
+weight = torch.ones_like(bce_loss)
+weight[neg_mask & (prob_pred < 0.2)] = 0.1
+bce_loss = bce_loss * weight
+```
+*预期效果*：释放模型的“胆量”，信号频率将迅速从 0.5% 恢复到健康的 4-5%。
+
+### 2.2 辅助损失钳制与局部梯度截断 (Aux Loss Clamping & Hook)
+**科学依据**：确保分类主任务对共享时序特征提取器具有绝对的梯度主导权。
+**代码修改（`loss.py`）**：
+1.  **钳制 Loss**：在将 `aux_loss` 加入总损失前，强制限制其上限（例如 `aux_loss = torch.clamp(aux_loss, max=1.0)`）。
+2.  **梯度挂钩（Gradient Hook）**：为防止局部极端值引发梯度雪崩，在 `aux_pred` 上注册 Hook，将反向传播的梯度截断在 `[-1.5, 1.5]`。
+```python
+if aux_pred_act.requires_grad:
+    aux_pred_act.register_hook(lambda grad: torch.clamp(grad, min=-1.5, max=1.5))
+```
+
+### 2.3 门控平衡正则化 (Gate Balance Regularization)
+**科学依据**：通过显式惩罚偏离最大熵状态的门控分布，强制网络保持多分支（多头/空头）的活性，打破模式坍塌。
+**代码修改（`loss.py`）**：
+在 `PhysicsLoss.forward` 中提取 `direction_gate_mean`，如果偏离 0.5，则施加 MSE 惩罚。
+```python
+gate_mean = debug_info.get('direction_gate_mean', 0.5)
+balance_penalty = (gate_mean - 0.5) ** 2
+main_loss += 0.5 * balance_penalty  # 强迫门控回到中间地带
+```
+
+## 3. 总结
+本方案摒弃了简单的参数微调，而是从损失函数曲面、梯度流向和正则化约束的底层数学逻辑出发，通过**非对称降权**恢复召回率，通过**梯度截断**保卫主任务，通过**平衡正则化**拯救死神经元。这套组合拳将彻底重塑 KHAOS_KAN 的训练轨迹。

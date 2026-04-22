@@ -602,13 +602,14 @@ class KHAOS_KAN(nn.Module):
         breakout_state = transition_context
         breakout_residual_gate = torch.zeros_like(direction_mix_gate)
         if self.arch_version in {'iterA4_multiscale', 'iterA5_multiscale'}:
+            # 给残差门控加上正向 Bias，鼓励初期相信短期波动
             breakout_residual_gate = torch.sigmoid(
                 self.breakout_residual_gate(
                     torch.cat(
                         [transition_context, short_state - mid_state, last_state - shared_state],
                         dim=1,
                     )
-                )
+                ) + 1.0
             )
             breakout_state = torch.tanh(transition_context + breakout_residual_gate * (short_state - mid_state))
         # 对未硬接线的 arch 版本，使用 sigmoid 保证概率约束
