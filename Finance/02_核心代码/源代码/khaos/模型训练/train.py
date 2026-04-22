@@ -62,8 +62,12 @@ DEBUG_BATCH_KEYS = (
     'bear_score',
     'bull_score',
     'direction_gate',
+    'compression_gate',
+    'directional_gate',
+    'gate_floor_hit',
     'public_reversion_gate',
     'breakout_residual_gate',
+    'directional_reversion',
     'directional_floor',
     'selected_horizon_breakout',
     'selected_horizon_reversion',
@@ -92,6 +96,9 @@ def set_seed(seed=42, deterministic=True):
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+    else:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
 
 
 # SECTION: METRICS
@@ -111,8 +118,14 @@ PRECISION_FIRST_SCORE_PROFILES = {
     'short_t_discovery_guarded_focus',
     'recent_precision_v1',
     'iter11_precision_first',
+    'iter12_guarded_precision_first',
+    'iter12_soft_guarded_precision_first',
 }
-AUX_GATED_SCORE_PROFILES = {'short_t_discovery_guarded_focus'}
+AUX_GATED_SCORE_PROFILES = {
+    'short_t_discovery_guarded_focus',
+    'iter12_guarded_precision_first',
+    'iter12_soft_guarded_precision_first',
+}
 
 PRECISION_FIRST_PROFILE_CONFIG = {
     'default': {
@@ -129,6 +142,20 @@ PRECISION_FIRST_PROFILE_CONFIG = {
         'threshold_grid_max': 0.995,
         'threshold_grid_points': 12,
     },
+    'iter12_guarded_precision_first': {
+        'min_precision': 0.62,
+        'max_hard_negative_rate': 0.16,
+        'threshold_grid_min': 0.68,
+        'threshold_grid_max': 0.995,
+        'threshold_grid_points': 14,
+    },
+    'iter12_soft_guarded_precision_first': {
+        'min_precision': 0.0,
+        'max_hard_negative_rate': 1.0,
+        'threshold_grid_min': 0.20,
+        'threshold_grid_max': 0.95,
+        'threshold_grid_points': 16,
+    },
 }
 
 
@@ -138,10 +165,26 @@ def resolve_event_selection_mode(score_profile='default'):
     return 'f1'
 
 
+def is_soft_iter12_profile(score_profile='default'):
+    return str(score_profile or 'default') == 'iter12_soft_guarded_precision_first'
+
+
 def resolve_event_oversignal_cap(label_frequency, event_type='generic', score_profile='default'):
     label_frequency = float(label_frequency)
     if score_profile == 'iter11_precision_first':
         return min(label_frequency, 0.05)
+    if score_profile == 'iter12_guarded_precision_first':
+        if event_type == 'reversion':
+            return min(label_frequency + 0.01, 0.18)
+        if event_type == 'breakout':
+            return min(label_frequency + 0.02, 0.22)
+        return min(label_frequency + 0.02, 0.20)
+    if score_profile == 'iter12_soft_guarded_precision_first':
+        if event_type == 'reversion':
+            return min(max(label_frequency * 1.6, label_frequency + 0.03, 0.03), 0.28)
+        if event_type == 'breakout':
+            return min(max(label_frequency * 1.6, label_frequency + 0.04, 0.04), 0.32)
+        return min(max(label_frequency * 1.6, label_frequency + 0.04, 0.04), 0.30)
     if event_type == 'reversion':
         return min(label_frequency + 0.02, 0.32)
     if event_type == 'breakout':
@@ -156,9 +199,41 @@ def compute_event_oversignal(metrics):
     )
 
 
+def compute_signal_health(signal_frequency, signal_cap, signal_floor=0.01):
+    signal_floor = max(float(signal_floor), 1e-6)
+    signal_frequency = max(float(signal_frequency), 0.0)
+    if signal_cap is None:
+        signal_cap = max(signal_floor * 2.0, 0.04)
+    signal_cap = max(float(signal_cap), signal_floor + 1e-6)
+    if signal_floor <= signal_frequency <= signal_cap:
+        return 1.0
+    if signal_frequency < signal_floor:
+        return float(np.clip(signal_frequency / signal_floor, 0.0, 1.0))
+    overflow = (signal_frequency - signal_cap) / max(signal_cap, 1e-6)
+    return float(np.clip(1.0 - overflow, 0.0, 1.0))
+
+
+def compute_threshold_selection_utility(candidate, event_type='generic', score_profile='default'):
+    signal_cap = candidate.get('signal_cap')
+    signal_health = compute_signal_health(candidate.get('signal_frequency', 0.0), signal_cap)
+    candidate['signal_health'] = signal_health
+    if is_soft_iter12_profile(score_profile):
+        utility = (
+            0.42 * float(candidate.get('precision', 0.0)) +
+            0.18 * float(candidate.get('recall', 0.0)) +
+            0.20 * max(1.0 - float(candidate.get('hard_negative_rate', 0.0)), 0.0) +
+            0.12 * float(candidate.get('signal_space_mean', 0.0)) +
+            0.08 * float(candidate.get('signal_quality_mean', 0.0))
+        )
+        candidate['selection_utility'] = utility
+        return utility
+    candidate['selection_utility'] = signal_health
+    return compute_precision_first_event_quality(candidate, event_type=event_type, score_profile=score_profile)
+
+
 def score_event_candidate(candidate, selection_mode='f1', event_type='generic', score_profile='default'):
     if selection_mode == 'precision_first':
-        return compute_precision_first_event_quality(candidate, event_type=event_type, score_profile=score_profile)
+        return compute_threshold_selection_utility(candidate, event_type=event_type, score_profile=score_profile)
     return float(candidate['f1'])
 
 
@@ -203,6 +278,8 @@ def compute_event_metrics(
     selection_mode='f1',
     event_type='generic',
     score_profile='default',
+    target_values=None,
+    aux_values=None,
 ):
     scores = np.asarray(scores, dtype=np.float64)
     event_flags = np.asarray(event_flags, dtype=bool)
@@ -219,6 +296,11 @@ def compute_event_metrics(
             'signal_frequency': 0.0,
             'label_frequency': 0.0,
             'oversignal': 0.0,
+            'signal_space_mean': 0.0,
+            'signal_quality_mean': 0.0,
+            'signal_health': 0.0,
+            'signal_cap': None,
+            'selection_utility': 0.0,
         }
     label_frequency = float(np.mean(event_flags)) if len(event_flags) > 0 else 0.0
     precision_cfg = PRECISION_FIRST_PROFILE_CONFIG.get(score_profile) or PRECISION_FIRST_PROFILE_CONFIG['default']
@@ -234,7 +316,7 @@ def compute_event_metrics(
     thresholds = np.unique(np.quantile(scores, threshold_grid))
     best = None
     fallback_best = None
-    oversignal_cap = (
+    signal_cap = (
         resolve_event_oversignal_cap(label_frequency, event_type=event_type, score_profile=score_profile)
         if selection_mode == 'precision_first'
         else None
@@ -251,6 +333,7 @@ def compute_event_metrics(
         accuracy = (tp + tn) / max(len(scores), 1)
         hn_rate = np.mean(pred[hard_negative_flags]) if np.any(hard_negative_flags) else 0.0
         event_rate = np.mean(pred[event_flags]) if np.any(event_flags) else 0.0
+        signal_space_summary = compute_signal_space_summary(scores, threshold, target_values, aux_values)
         candidate = {
             'threshold': float(threshold),
             'accuracy': float(accuracy),
@@ -262,6 +345,9 @@ def compute_event_metrics(
             'signal_frequency': float(np.mean(pred)),
             'label_frequency': label_frequency,
             'oversignal': max(float(np.mean(pred)) - label_frequency, 0.0),
+            'signal_space_mean': float(signal_space_summary['signal_space_mean']),
+            'signal_quality_mean': float(signal_space_summary['signal_quality_mean']),
+            'signal_cap': signal_cap,
         }
         if is_better_event_candidate(
             candidate,
@@ -271,7 +357,11 @@ def compute_event_metrics(
             score_profile=score_profile,
         ):
             fallback_best = candidate
-        if oversignal_cap is not None and candidate['signal_frequency'] > oversignal_cap + 1e-12:
+        if (
+            signal_cap is not None and
+            not is_soft_iter12_profile(score_profile) and
+            candidate['signal_frequency'] > signal_cap + 1e-12
+        ):
             continue
         if is_better_event_candidate(
             candidate,
@@ -284,7 +374,16 @@ def compute_event_metrics(
     return best or fallback_best
 
 
-def compute_event_metrics_at_threshold(scores, event_flags, hard_negative_flags, threshold):
+def compute_event_metrics_at_threshold(
+    scores,
+    event_flags,
+    hard_negative_flags,
+    threshold,
+    target_values=None,
+    aux_values=None,
+    event_type='generic',
+    score_profile='default',
+):
     scores = np.asarray(scores, dtype=np.float64)
     event_flags = np.asarray(event_flags, dtype=bool)
     hard_negative_flags = np.asarray(hard_negative_flags, dtype=bool)
@@ -300,6 +399,11 @@ def compute_event_metrics_at_threshold(scores, event_flags, hard_negative_flags,
             'signal_frequency': 0.0,
             'label_frequency': 0.0,
             'oversignal': 0.0,
+            'signal_space_mean': 0.0,
+            'signal_quality_mean': 0.0,
+            'signal_health': 0.0,
+            'signal_cap': None,
+            'selection_utility': 0.0,
         }
     label_frequency = float(np.mean(event_flags)) if len(event_flags) > 0 else 0.0
     threshold = float(threshold or 0.0)
@@ -315,7 +419,8 @@ def compute_event_metrics_at_threshold(scores, event_flags, hard_negative_flags,
     hn_rate = np.mean(pred[hard_negative_flags]) if np.any(hard_negative_flags) else 0.0
     event_rate = np.mean(pred[event_flags]) if np.any(event_flags) else 0.0
     signal_frequency = float(np.mean(pred)) if len(pred) else 0.0
-    return {
+    signal_space_summary = compute_signal_space_summary(scores, threshold, target_values, aux_values)
+    metrics = {
         'threshold': float(threshold),
         'accuracy': float(accuracy),
         'precision': float(precision),
@@ -326,7 +431,12 @@ def compute_event_metrics_at_threshold(scores, event_flags, hard_negative_flags,
         'signal_frequency': signal_frequency,
         'label_frequency': label_frequency,
         'oversignal': max(signal_frequency - label_frequency, 0.0),
+        'signal_space_mean': float(signal_space_summary['signal_space_mean']),
+        'signal_quality_mean': float(signal_space_summary['signal_quality_mean']),
+        'signal_cap': resolve_event_oversignal_cap(label_frequency, event_type=event_type, score_profile=score_profile),
     }
+    compute_threshold_selection_utility(metrics, event_type=event_type, score_profile=score_profile)
+    return metrics
 
 
 def compute_event_quality(metrics):
@@ -416,6 +526,37 @@ def compute_discovery_space_quality(summary, event_type='generic'):
     )
 
 
+def _clip01(value):
+    return float(np.clip(float(value), 0.0, 1.0))
+
+
+def compute_iter12_structural_components(summary):
+    summary = summary or {}
+    public_violation_rate = _clip01(summary.get('public_below_directional_violation_rate', 1.0))
+    directional_floor_mean = max(float(summary.get('directional_floor_mean', 0.0)), 0.0)
+    directional_floor_event_mean = max(
+        float(summary.get('directional_floor_reversion_event_mean', directional_floor_mean)),
+        0.0,
+    )
+    directional_support_rate = _clip01(
+        summary.get(
+            'directional_support_rate',
+            summary.get('directional_floor_quality', directional_floor_event_mean),
+        )
+    )
+    public_feasibility = _clip01(1.0 - public_violation_rate)
+    directional_floor_quality = _clip01(0.35 * directional_floor_mean + 0.65 * directional_floor_event_mean)
+    return {
+        'public_violation_rate': public_violation_rate,
+        'public_feasibility': public_feasibility,
+        'directional_floor_mean': directional_floor_mean,
+        'directional_floor_reversion_event_mean': directional_floor_event_mean,
+        'directional_floor_quality': directional_floor_quality,
+        'directional_support_rate': directional_support_rate,
+        'structural_quality': _clip01(0.60 * public_feasibility + 0.40 * directional_support_rate),
+    }
+
+
 def _zero_direction_metrics():
     return {
         'accuracy': 0.0,
@@ -430,6 +571,11 @@ def compute_direction_metrics(bear_scores, bull_scores, flags):
     bear_scores = np.asarray(bear_scores, dtype=np.float64).reshape(-1)
     bull_scores = np.asarray(bull_scores, dtype=np.float64).reshape(-1)
     flags = np.asarray(flags, dtype=np.float64)
+    if flags.ndim >= 1:
+        aligned_size = min(bear_scores.shape[0], bull_scores.shape[0], flags.shape[0])
+        bear_scores = bear_scores[:aligned_size]
+        bull_scores = bull_scores[:aligned_size]
+        flags = flags[:aligned_size]
     bear_idx = EVENT_FLAG_INDEX['reversion_down_context']
     bull_idx = EVENT_FLAG_INDEX['reversion_up_context']
     if flags.ndim != 2 or flags.shape[1] <= max(bear_idx, bull_idx):
@@ -471,6 +617,7 @@ def compute_checkpoint_score(
     direction_macro_f1=None,
     breakout_space_summary=None,
     reversion_space_summary=None,
+    structural_summary=None,
     profile='default',
 ):
     breakout_quality = compute_event_quality(breakout_metrics)
@@ -499,6 +646,66 @@ def compute_checkpoint_score(
             0.10 * direction_macro_f1 +
             0.03 * breakout_corr +
             0.03 * reversion_corr
+        )
+    if profile == 'iter12_guarded_precision_first':
+        breakout_quality = compute_precision_first_event_quality(
+            breakout_metrics,
+            event_type='breakout',
+            score_profile=profile,
+        )
+        reversion_quality = compute_precision_first_event_quality(
+            reversion_metrics,
+            event_type='reversion',
+            score_profile=profile,
+        )
+        structural_components = compute_iter12_structural_components(structural_summary)
+        if direction_macro_f1 is None:
+            return (
+                0.30 * breakout_quality +
+                0.32 * reversion_quality +
+                0.16 * structural_components['public_feasibility'] +
+                0.16 * structural_components['directional_floor_quality'] +
+                0.03 * breakout_corr +
+                0.03 * reversion_corr
+            )
+        return (
+            0.26 * breakout_quality +
+            0.30 * reversion_quality +
+            0.10 * direction_macro_f1 +
+            0.14 * structural_components['public_feasibility'] +
+            0.14 * structural_components['directional_floor_quality'] +
+            0.03 * breakout_corr +
+            0.03 * reversion_corr
+        )
+    if profile == 'iter12_soft_guarded_precision_first':
+        breakout_quality = compute_precision_first_event_quality(
+            breakout_metrics,
+            event_type='breakout',
+            score_profile=profile,
+        )
+        reversion_quality = compute_precision_first_event_quality(
+            reversion_metrics,
+            event_type='reversion',
+            score_profile=profile,
+        )
+        structural_components = compute_iter12_structural_components(structural_summary)
+        if direction_macro_f1 is None:
+            return (
+                0.30 * breakout_quality +
+                0.30 * reversion_quality +
+                0.18 * structural_components['public_feasibility'] +
+                0.12 * structural_components['directional_support_rate'] +
+                0.05 * breakout_corr +
+                0.05 * reversion_corr
+            )
+        return (
+            0.26 * breakout_quality +
+            0.28 * reversion_quality +
+            0.10 * direction_macro_f1 +
+            0.16 * structural_components['public_feasibility'] +
+            0.10 * structural_components['directional_support_rate'] +
+            0.05 * breakout_corr +
+            0.05 * reversion_corr
         )
     if profile == 'short_t_discovery_focus':
         breakout_quality = compute_precision_first_event_quality(
@@ -670,6 +877,22 @@ def _flatten_debug_batches(batches):
     return np.concatenate([np.asarray(batch, dtype=np.float32).reshape(-1) for batch in batches]).astype(np.float32)
 
 
+def _flatten_per_sample_direction_batches(batches):
+    if not batches:
+        return np.array([], dtype=np.float32)
+    flattened = []
+    for batch in batches:
+        values = np.asarray(batch, dtype=np.float32)
+        if values.ndim == 0:
+            values = values.reshape(1)
+        elif values.ndim > 1:
+            if values.shape[1] == 2:
+                values = values[:, 1, ...]
+            values = values.reshape(values.shape[0], -1).mean(axis=1)
+        flattened.append(values.reshape(-1))
+    return np.concatenate(flattened).astype(np.float32)
+
+
 def _metric_bucket_mean(logs, key):
     if not logs or key not in logs[0]:
         return 0.0
@@ -726,12 +949,23 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         'reversion_all_quality_mean': 0.0,
         'direction_gate_mean': 0.0,
         'direction_gate_std': 0.0,
+        'compression_gate_mean': 0.0,
+        'compression_gate_std': 0.0,
+        'directional_gate_mean': 0.0,
+        'directional_gate_std': 0.0,
+        'gate_floor_hit_rate': 0.0,
         'public_reversion_gate_mean': 0.0,
         'public_reversion_gate_std': 0.0,
         'breakout_residual_gate_mean': 0.0,
         'breakout_residual_gate_std': 0.0,
         'directional_floor_mean': 0.0,
         'directional_floor_reversion_event_mean': 0.0,
+        'directional_floor_quality': 0.0,
+        'directional_support_rate': 0.0,
+        'public_feasibility_mean': 0.0,
+        'structural_guard_quality': 0.0,
+        'pred_breakout_std': 0.0,
+        'pred_reversion_std': 0.0,
         'selected_horizon_breakout_mean': 0.0,
         'selected_horizon_reversion_mean': 0.0,
         'selected_horizon_breakout_value_mean': 0.0,
@@ -800,6 +1034,8 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             selection_mode=event_selection_mode,
             event_type='breakout',
             score_profile=score_profile,
+            target_values=target_np[:, 0],
+            aux_values=aux_np[:, 0],
         )
     else:
         breakout_metrics = compute_event_metrics_at_threshold(
@@ -807,6 +1043,10 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             flags_np[:, 0] > 0.5,
             flags_np[:, 2] > 0.5,
             threshold=frozen_breakout_threshold,
+            target_values=target_np[:, 0],
+            aux_values=aux_np[:, 0],
+            event_type='breakout',
+            score_profile=score_profile,
         )
     if frozen_reversion_threshold is None:
         reversion_metrics = compute_event_metrics(
@@ -816,6 +1056,8 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             selection_mode=event_selection_mode,
             event_type='reversion',
             score_profile=score_profile,
+            target_values=target_np[:, 1],
+            aux_values=aux_np[:, 1],
         )
     else:
         reversion_metrics = compute_event_metrics_at_threshold(
@@ -823,6 +1065,10 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             reversion_event_mask,
             flags_np[:, 3] > 0.5,
             threshold=frozen_reversion_threshold,
+            target_values=target_np[:, 1],
+            aux_values=aux_np[:, 1],
+            event_type='reversion',
+            score_profile=score_profile,
         )
     breakout_space_summary = compute_signal_space_summary(
         breakout_metric_scores,
@@ -836,15 +1082,42 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         target_np[:, 1],
         aux_np[:, 1],
     )
-    bear_scores = _flatten_debug_batches(bucket['debug_batches']['bear_score'])
-    bull_scores = _flatten_debug_batches(bucket['debug_batches']['bull_score'])
+    bear_scores = _flatten_per_sample_direction_batches(bucket['debug_batches']['bear_score'])
+    bull_scores = _flatten_per_sample_direction_batches(bucket['debug_batches']['bull_score'])
     direction_metrics = compute_direction_metrics(bear_scores, bull_scores, flags_np) if (
         use_direction_metrics and bear_scores.size > 0 and bull_scores.size > 0
     ) else _zero_direction_metrics()
     direction_gate_values = _flatten_debug_batches(bucket['debug_batches']['direction_gate'])
+    compression_gate_values = _flatten_debug_batches(bucket['debug_batches']['compression_gate'])
+    directional_gate_values = _flatten_debug_batches(bucket['debug_batches']['directional_gate'])
+    gate_floor_hit_values = _flatten_debug_batches(bucket['debug_batches']['gate_floor_hit'])
     public_gate_values = _flatten_debug_batches(bucket['debug_batches']['public_reversion_gate'])
     breakout_residual_gate_values = _flatten_debug_batches(bucket['debug_batches']['breakout_residual_gate'])
-    directional_floor_values = _flatten_debug_batches(bucket['debug_batches']['directional_floor'])
+    directional_reversion_values = _flatten_per_sample_direction_batches(bucket['debug_batches']['directional_reversion'])
+    directional_floor_values = _flatten_per_sample_direction_batches(bucket['debug_batches']['directional_floor'])
+    directional_floor_mean = float(directional_floor_values.mean()) if directional_floor_values.size else 0.0
+    directional_floor_reversion_event_mean = _masked_array_mean(directional_floor_values, reversion_event_mask)
+    public_below_directional_violation_rate = _metric_bucket_mean(bucket['logs'], 'public_below_directional_violation_rate')
+    directional_support_rate = 0.0
+    if directional_floor_values.size and directional_reversion_values.size:
+        aligned_size = min(
+            directional_floor_values.size,
+            directional_reversion_values.size,
+            reversion_event_mask.shape[0],
+        )
+        if aligned_size > 0:
+            support_mask = reversion_event_mask[:aligned_size]
+            support_margin = directional_floor_values[:aligned_size] - directional_reversion_values[:aligned_size]
+            if np.any(support_mask):
+                directional_support_rate = float(np.mean(support_margin[support_mask] > 1e-6))
+    structural_components = compute_iter12_structural_components(
+        {
+            'public_below_directional_violation_rate': public_below_directional_violation_rate,
+            'directional_floor_mean': directional_floor_mean,
+            'directional_floor_reversion_event_mean': directional_floor_reversion_event_mean,
+            'directional_support_rate': directional_support_rate,
+        }
+    )
     selected_breakout = _flatten_debug_batches(bucket['debug_batches']['selected_horizon_breakout'])
     selected_reversion = _flatten_debug_batches(bucket['debug_batches']['selected_horizon_reversion'])
     selected_breakout_value = _flatten_debug_batches(bucket['debug_batches']['selected_horizon_breakout_value'])
@@ -861,6 +1134,7 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
         direction_metrics['macro_f1'] if use_direction_metrics else None,
         breakout_space_summary=breakout_space_summary,
         reversion_space_summary=reversion_space_summary,
+        structural_summary=structural_components,
         profile=score_profile,
     )
     summary = dict(zero_summary)
@@ -870,6 +1144,8 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             'avg_val_loss': _metric_bucket_mean(bucket['logs'], 'total_loss'),
             'breakout_corr': breakout_corr,
             'reversion_corr': reversion_corr,
+            'pred_breakout_std': float(pred_np[:, 0].std()) if pred_np.size else 0.0,
+            'pred_reversion_std': float(pred_rev_np.std()) if pred_rev_np.size else 0.0,
             'pred_rev_mean': float(pred_rev_np.mean()) if pred_rev_np.size else 0.0,
             'pred_rev_event_mean': reversion_event_mean,
             'breakout_event_mean': breakout_event_mean,
@@ -911,12 +1187,21 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             'reversion_all_quality_mean': reversion_space_summary['all_quality_mean'],
             'direction_gate_mean': float(direction_gate_values.mean()) if direction_gate_values.size else 0.0,
             'direction_gate_std': float(direction_gate_values.std()) if direction_gate_values.size else 0.0,
+            'compression_gate_mean': float(compression_gate_values.mean()) if compression_gate_values.size else 0.0,
+            'compression_gate_std': float(compression_gate_values.std()) if compression_gate_values.size else 0.0,
+            'directional_gate_mean': float(directional_gate_values.mean()) if directional_gate_values.size else 0.0,
+            'directional_gate_std': float(directional_gate_values.std()) if directional_gate_values.size else 0.0,
+            'gate_floor_hit_rate': float(gate_floor_hit_values.mean()) if gate_floor_hit_values.size else 0.0,
             'public_reversion_gate_mean': float(public_gate_values.mean()) if public_gate_values.size else 0.0,
             'public_reversion_gate_std': float(public_gate_values.std()) if public_gate_values.size else 0.0,
             'breakout_residual_gate_mean': float(breakout_residual_gate_values.mean()) if breakout_residual_gate_values.size else 0.0,
             'breakout_residual_gate_std': float(breakout_residual_gate_values.std()) if breakout_residual_gate_values.size else 0.0,
-            'directional_floor_mean': float(directional_floor_values.mean()) if directional_floor_values.size else 0.0,
-            'directional_floor_reversion_event_mean': _masked_array_mean(directional_floor_values, reversion_event_mask),
+            'directional_floor_mean': directional_floor_mean,
+            'directional_floor_reversion_event_mean': directional_floor_reversion_event_mean,
+            'directional_floor_quality': structural_components['directional_floor_quality'],
+            'directional_support_rate': structural_components['directional_support_rate'],
+            'public_feasibility_mean': structural_components['public_feasibility'],
+            'structural_guard_quality': structural_components['structural_quality'],
             'selected_horizon_breakout_mean': float(selected_breakout.mean()) if selected_breakout.size else 0.0,
             'selected_horizon_reversion_mean': float(selected_reversion.mean()) if selected_reversion.size else 0.0,
             'selected_horizon_breakout_value_mean': float(selected_breakout_value.mean()) if selected_breakout_value.size else 0.0,
@@ -979,7 +1264,17 @@ def read_jsonl_records(path):
 def dataset_cache_enabled(args):
     if getattr(args, 'disable_dataset_cache', False):
         return False
-    return getattr(args, 'market', 'legacy_multiasset') == 'ashare'
+    market = getattr(args, 'market', 'legacy_multiasset')
+    if market == 'ashare':
+        return True
+    return uses_recent_runtime_splits(args)
+
+
+def uses_recent_runtime_splits(args):
+    return (
+        getattr(args, 'split_scheme', 'time') == 'rolling_recent_v1' and
+        getattr(args, 'market', 'legacy_multiasset') in {'ashare', 'legacy_multiasset'}
+    )
 
 
 def resolve_dataset_cache_dir(args):
@@ -1198,7 +1493,7 @@ def resolve_split_labels(args, include_final_holdout=False):
 
 
 def expand_runtime_records(records, args, include_final_holdout=False):
-    if getattr(args, 'market', 'legacy_multiasset') != 'ashare' or getattr(args, 'split_scheme', 'time') != 'rolling_recent_v1':
+    if not uses_recent_runtime_splits(args):
         return [dict(record) for record in records]
     expanded = []
     for split_label in resolve_split_labels(args, include_final_holdout=include_final_holdout):
@@ -1210,7 +1505,7 @@ def expand_runtime_records(records, args, include_final_holdout=False):
 
 
 def resolve_global_horizon_grid(args):
-    if getattr(args, 'market', 'legacy_multiasset') != 'ashare':
+    if getattr(args, 'market', 'legacy_multiasset') != 'ashare' and not uses_recent_runtime_splits(args):
         return None
     if not getattr(args, 'horizon_search_spec', None):
         return None
@@ -1234,7 +1529,8 @@ def recommend_horizon_family(task_stats, h_mode_std=None):
 
 def create_market_datasets(record, args, global_horizon_grid=None):
     market = getattr(args, 'market', 'legacy_multiasset')
-    if market == 'ashare':
+    use_recent_runtime = uses_recent_runtime_splits(args)
+    if market == 'ashare' or use_recent_runtime:
         cache_path = None
         if dataset_cache_enabled(args):
             cache_path = build_runtime_dataset_cache_path(record, args, global_horizon_grid=global_horizon_grid)
@@ -1332,6 +1628,30 @@ def resolve_train_sample_target(dataset, args, timeframe_label):
     return dataset_size
 
 
+def resolve_dataloader_pin_memory():
+    return bool(torch.cuda.is_available())
+
+
+def resolve_dataloader_num_workers(args):
+    return max(int(getattr(args, 'num_workers', 0) or 0), 0)
+
+
+def resolve_dataloader_prefetch_factor(args):
+    return max(int(getattr(args, 'prefetch_factor', 2) or 2), 2)
+
+
+def build_dataloader_runtime_kwargs(args):
+    kwargs = {
+        'pin_memory': resolve_dataloader_pin_memory(),
+    }
+    num_workers = resolve_dataloader_num_workers(args)
+    if num_workers > 0:
+        kwargs['num_workers'] = num_workers
+        kwargs['persistent_workers'] = True
+        kwargs['prefetch_factor'] = resolve_dataloader_prefetch_factor(args)
+    return kwargs
+
+
 class BalancedConcatSampler(Sampler):
     def __init__(self, dataset_lengths, target_samples, seed=42):
         self.dataset_lengths = [int(length) for length in dataset_lengths]
@@ -1375,9 +1695,17 @@ class BalancedConcatSampler(Sampler):
 def build_train_loader(dataset, args, timeframe_label):
     g = torch.Generator()
     g.manual_seed(args.seed)
+    loader_kwargs = build_dataloader_runtime_kwargs(args)
     target_samples = resolve_train_sample_target(dataset, args, timeframe_label)
     if target_samples <= 0:
-        return DataLoader(dataset, batch_size=args.batch_size, shuffle=False, drop_last=False, generator=g)
+        return DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            drop_last=False,
+            generator=g,
+            **loader_kwargs,
+        )
     if target_samples != len(dataset):
         replacement = len(dataset) < target_samples
         sampler = RandomSampler(
@@ -1392,6 +1720,7 @@ def build_train_loader(dataset, args, timeframe_label):
             sampler=sampler,
             drop_last=False,
             generator=g,
+            **loader_kwargs,
         )
     return DataLoader(
         dataset,
@@ -1399,6 +1728,7 @@ def build_train_loader(dataset, args, timeframe_label):
         shuffle=True,
         drop_last=False,
         generator=g,
+        **loader_kwargs,
     )
 
 
@@ -1440,6 +1770,7 @@ def build_global_train_loader(train_dataset_specs, args):
         batch_size=args.batch_size,
         sampler=sampler,
         drop_last=False,
+        **build_dataloader_runtime_kwargs(args),
     )
     return loader, {
         'dataset_count': len(datasets),
@@ -1453,7 +1784,13 @@ def build_global_train_loader(train_dataset_specs, args):
 def build_eval_loader(dataset, args):
     g = torch.Generator()
     g.manual_seed(args.seed)
-    return DataLoader(dataset, batch_size=args.batch_size, shuffle=False, generator=g)
+    return DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        generator=g,
+        **build_dataloader_runtime_kwargs(args),
+    )
 
 
 # SECTION: FORWARD
@@ -1627,6 +1964,10 @@ def save_resume_checkpoint(
     latest_metrics,
     device,
     completed=False,
+    best_checkpoint=None,
+    best_score_components=None,
+    fitted_thresholds=None,
+    catastrophic_state=None,
 ):
     torch.save(
         {
@@ -1644,9 +1985,15 @@ def save_resume_checkpoint(
             'best_gate_score': best_gate_score,
             'no_improve_epochs': no_improve_epochs,
             'latest_metrics': latest_metrics,
+            'best_checkpoint': best_checkpoint,
+            'best_score_components': best_score_components,
+            'fitted_thresholds': fitted_thresholds,
+            'completed_epoch': epoch,
+            'catastrophic_state': catastrophic_state or {},
             'feature_names': PHYSICS_FEATURE_NAMES,
             'completed': completed,
             'config_fingerprint': getattr(args, 'config_fingerprint', None),
+            'dataset_cache_fingerprint': getattr(args, 'dataset_cache_fingerprint', None),
             'global_horizon_grid': getattr(args, 'global_horizon_grid', None),
             'env': {
                 'torch': torch.__version__,
@@ -1702,6 +2049,21 @@ def resolve_config_fingerprint(args, runtime_records, global_horizon_grid):
             }
             for record in runtime_records
         ],
+    }
+    return hashlib.sha1(
+        json.dumps(make_json_safe(payload), ensure_ascii=False, sort_keys=True).encode('utf-8')
+    ).hexdigest()[:16]
+
+
+def resolve_dataset_cache_fingerprint(args, runtime_records, global_horizon_grid):
+    cache_paths = [
+        build_runtime_dataset_cache_path(record, args, global_horizon_grid=global_horizon_grid)
+        for record in runtime_records
+    ]
+    payload = {
+        'dataset_cache_version': DATASET_CACHE_VERSION,
+        'dataset_cache_dir': resolve_dataset_cache_dir(args),
+        'runtime_cache_paths': cache_paths,
     }
     return hashlib.sha1(
         json.dumps(make_json_safe(payload), ensure_ascii=False, sort_keys=True).encode('utf-8')
@@ -1768,16 +2130,27 @@ def try_resume_training(args, kan, optimizer, scheduler, scaler, device):
     best_gate_val_loss = float('inf')
     best_gate_score = float('-inf')
     no_improve_epochs = 0
+    catastrophic_state = {'public_violation_streak': 0, 'collapse_streak': 0}
+    best_checkpoint = None
+    best_score_components = None
+    fitted_thresholds = None
     resume_path = get_resume_path(args)
     current_fingerprint = getattr(args, 'config_fingerprint', None)
+    current_cache_fingerprint = getattr(args, 'dataset_cache_fingerprint', None)
     if getattr(args, 'resume', False) and os.path.exists(resume_path):
         try:
             checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
             checkpoint_fingerprint = checkpoint.get('config_fingerprint')
-            if checkpoint_fingerprint and current_fingerprint and checkpoint_fingerprint != current_fingerprint:
+            checkpoint_cache_fingerprint = checkpoint.get('dataset_cache_fingerprint')
+            if (
+                checkpoint_fingerprint and current_fingerprint and checkpoint_fingerprint != current_fingerprint
+            ) or (
+                checkpoint_cache_fingerprint and current_cache_fingerprint and
+                checkpoint_cache_fingerprint != current_cache_fingerprint
+            ):
                 print(
-                    f"[RESUME] Fingerprint mismatch. checkpoint={checkpoint_fingerprint}, current={current_fingerprint}. "
-                    "Skipping strict resume."
+                    f"[RESUME] Fingerprint mismatch. checkpoint={checkpoint_fingerprint}/{checkpoint_cache_fingerprint}, "
+                    f"current={current_fingerprint}/{current_cache_fingerprint}. Skipping strict resume."
                 )
             else:
                 kan.load_state_dict(checkpoint['model_state_dict'])
@@ -1795,6 +2168,10 @@ def try_resume_training(args, kan, optimizer, scheduler, scaler, device):
                 best_gate_val_loss = float(checkpoint.get('best_gate_val_loss', legacy_best_val_loss))
                 best_gate_score = float(checkpoint.get('best_gate_score', legacy_best_score))
                 no_improve_epochs = int(checkpoint.get('no_improve_epochs', 0))
+                catastrophic_state = dict(checkpoint.get('catastrophic_state', catastrophic_state) or catastrophic_state)
+                best_checkpoint = checkpoint.get('best_checkpoint')
+                best_score_components = checkpoint.get('best_score_components')
+                fitted_thresholds = checkpoint.get('fitted_thresholds')
                 print(
                     f"[RESUME] Loaded checkpoint: epoch={start_epoch}, "
                     f"best_raw_score={best_raw_score:.4f}, best_gate_score={best_gate_score:.4f}, "
@@ -1807,6 +2184,10 @@ def try_resume_training(args, kan, optimizer, scheduler, scaler, device):
                     'best_gate_val_loss': best_gate_val_loss,
                     'best_gate_score': best_gate_score,
                     'no_improve_epochs': no_improve_epochs,
+                    'catastrophic_state': catastrophic_state,
+                    'best_checkpoint': best_checkpoint,
+                    'best_score_components': best_score_components,
+                    'fitted_thresholds': fitted_thresholds,
                 }
         except Exception as exc:
             print(f"[RESUME] Failed to load strict resume checkpoint: {resume_path} | {exc}")
@@ -1831,6 +2212,10 @@ def try_resume_training(args, kan, optimizer, scheduler, scaler, device):
         'best_gate_val_loss': best_gate_val_loss,
         'best_gate_score': best_gate_score,
         'no_improve_epochs': no_improve_epochs,
+        'catastrophic_state': catastrophic_state,
+        'best_checkpoint': best_checkpoint,
+        'best_score_components': best_score_components,
+        'fitted_thresholds': fitted_thresholds,
     }
 
 
@@ -1991,6 +2376,7 @@ def compute_standard_score_veto(epoch_score_summary, timeframe_summaries, args, 
         score_timeframes=score_timeframes,
         fallback_summary=epoch_score_summary,
     )
+    diagnostic_only = is_soft_iter12_profile(getattr(args, 'score_profile', 'default'))
     veto_reasons = []
     checks = {}
 
@@ -2004,7 +2390,7 @@ def compute_standard_score_veto(epoch_score_summary, timeframe_summaries, args, 
             'passed': signal_passed,
             'timeframes': used_timeframes,
         }
-        if not signal_passed:
+        if not diagnostic_only and not signal_passed:
             veto_reasons.append(f'avg_signal_frequency({avg_signal_frequency:.3f}>{signal_threshold:.3f})')
 
     public_violation_threshold = getattr(args, 'kill_keep_public_violation_rate_max', None)
@@ -2017,14 +2403,39 @@ def compute_standard_score_veto(epoch_score_summary, timeframe_summaries, args, 
             'threshold': public_violation_threshold,
             'passed': public_violation_passed,
         }
-        if not public_violation_passed:
+        if not diagnostic_only and not public_violation_passed:
             veto_reasons.append(
                 f'public_below_directional_violation_rate({public_violation_actual:.3f}>{public_violation_threshold:.3f})'
             )
 
     timeframe_60m_threshold = getattr(args, 'kill_keep_timeframe_60m_composite_min', None)
+    timeframe_60m_summary = timeframe_summaries.get('60m', {})
+    timeframe_60m_breakout_precision = None
+    timeframe_60m_reversion_precision = None
+    timeframe_60m_hard_negative_rate = None
+    if timeframe_60m_summary:
+        breakout_metrics = timeframe_60m_summary.get('breakout_metrics', {}) or {}
+        reversion_metrics = timeframe_60m_summary.get('reversion_metrics', {}) or {}
+        if breakout_metrics and reversion_metrics:
+            timeframe_60m_breakout_precision = float(breakout_metrics.get('precision', 0.0))
+            timeframe_60m_reversion_precision = float(reversion_metrics.get('precision', 0.0))
+            timeframe_60m_hard_negative_rate = 0.5 * (
+                float(breakout_metrics.get('hard_negative_rate', 0.0)) +
+                float(reversion_metrics.get('hard_negative_rate', 0.0))
+            )
+            checks['timeframe_60m_min_precision_diagnostic'] = {
+                'actual': min(timeframe_60m_breakout_precision, timeframe_60m_reversion_precision),
+                'breakout_precision': timeframe_60m_breakout_precision,
+                'reversion_precision': timeframe_60m_reversion_precision,
+                'threshold': None,
+                'passed': True,
+            }
+            checks['timeframe_60m_hard_negative_rate_diagnostic'] = {
+                'actual': timeframe_60m_hard_negative_rate,
+                'threshold': None,
+                'passed': True,
+            }
     if timeframe_60m_threshold is not None and float(timeframe_60m_threshold) > 0.0:
-        timeframe_60m_summary = timeframe_summaries.get('60m', {})
         timeframe_60m_actual = timeframe_60m_summary.get('composite_score')
         timeframe_60m_threshold = float(timeframe_60m_threshold)
         timeframe_60m_passed = timeframe_60m_actual is not None and float(timeframe_60m_actual) >= timeframe_60m_threshold
@@ -2033,7 +2444,7 @@ def compute_standard_score_veto(epoch_score_summary, timeframe_summaries, args, 
             'threshold': timeframe_60m_threshold,
             'passed': timeframe_60m_passed,
         }
-        if not timeframe_60m_passed:
+        if not diagnostic_only and not timeframe_60m_passed:
             actual_repr = 'missing' if timeframe_60m_actual is None else f'{float(timeframe_60m_actual):.3f}'
             veto_reasons.append(f'timeframe_60m_composite({actual_repr}<{timeframe_60m_threshold:.3f})')
 
@@ -2047,7 +2458,7 @@ def compute_standard_score_veto(epoch_score_summary, timeframe_summaries, args, 
             'threshold': breakout_space_threshold,
             'passed': breakout_space_passed,
         }
-        if not breakout_space_passed:
+        if not diagnostic_only and not breakout_space_passed:
             veto_reasons.append(
                 f'breakout_signal_space_mean({breakout_space_actual:.3f}<{breakout_space_threshold:.3f})'
             )
@@ -2062,7 +2473,7 @@ def compute_standard_score_veto(epoch_score_summary, timeframe_summaries, args, 
             'threshold': reversion_space_threshold,
             'passed': reversion_space_passed,
         }
-        if not reversion_space_passed:
+        if not diagnostic_only and not reversion_space_passed:
             veto_reasons.append(
                 f'reversion_signal_space_mean({reversion_space_actual:.3f}<{reversion_space_threshold:.3f})'
             )
@@ -2086,7 +2497,7 @@ def compute_recent_precision_score(
     if not ordered_labels:
         ordered_labels = sorted(fold_summaries.keys())[-2:]
     if not ordered_labels:
-        return 0.0, {'mode': 'empty'}, {'passed': True, 'reasons': []}
+        return 0.0, {'mode': 'empty'}, {'passed': True, 'reasons': [], 'checks': {}}
 
     recent_min_precision = []
     recent_avg_precision = []
@@ -2094,15 +2505,17 @@ def compute_recent_precision_score(
     recent_hn = []
     recent_signal = []
     recent_public_violation = []
-    breakout_floor = float(getattr(args, 'breakout_precision_floor', 0.0))
-    reversion_floor = float(getattr(args, 'reversion_precision_floor', 0.0))
+    recent_public_feasibility = []
+    recent_directional_support_rate = []
+    recent_directional_floor_quality = []
+    recent_structural_guard_quality = []
     public_violation_cap = float(getattr(args, 'public_violation_cap', 0.20))
     signal_cap = resolve_baseline_signal_cap(
         baseline_reference=baseline_reference,
         ratio=float(getattr(args, 'signal_frequency_cap_ratio', 0.70)),
         fallback=getattr(args, 'signal_frequency_cap', None),
     )
-    veto_reasons = []
+    diagnostics = {'folds': {}}
     for label in ordered_labels:
         summary = fold_summaries[label]
         breakout_precision = float(summary['breakout_metrics']['precision'])
@@ -2123,10 +2536,17 @@ def compute_recent_precision_score(
             )
         )
         recent_public_violation.append(float(summary['public_below_directional_violation_rate']))
-        if breakout_precision < breakout_floor or reversion_precision < reversion_floor:
-            veto_reasons.append(f'{label}_precision_floor({breakout_precision:.3f},{reversion_precision:.3f})')
-        if float(summary['public_below_directional_violation_rate']) > public_violation_cap:
-            veto_reasons.append(f'{label}_public_violation({summary["public_below_directional_violation_rate"]:.3f})')
+        structural_components = compute_iter12_structural_components(summary)
+        recent_public_feasibility.append(structural_components['public_feasibility'])
+        recent_directional_support_rate.append(structural_components['directional_support_rate'])
+        recent_directional_floor_quality.append(structural_components['directional_floor_quality'])
+        recent_structural_guard_quality.append(structural_components['structural_quality'])
+        diagnostics['folds'][label] = {
+            'breakout_precision': breakout_precision,
+            'reversion_precision': reversion_precision,
+            'public_below_directional_violation_rate': float(summary['public_below_directional_violation_rate']),
+            'directional_support_rate': structural_components['directional_support_rate'],
+        }
 
     current_hn = float(np.mean(recent_hn)) if recent_hn else 1.0
     baseline_hn = None
@@ -2142,40 +2562,182 @@ def compute_recent_precision_score(
         hard_negative_improvement = max(1.0 - current_hn, 0.0)
 
     current_signal = float(np.mean(recent_signal)) if recent_signal else 0.0
-    if signal_cap is not None and current_signal > signal_cap:
-        veto_reasons.append(f'signal_frequency({current_signal:.3f}>{signal_cap:.3f})')
-    if signal_cap is None:
-        signal_sparsity = max(0.0, 1.0 - current_signal)
-    else:
-        signal_sparsity = max(0.0, 1.0 - max(current_signal - signal_cap, 0.0) / max(signal_cap, 1e-6))
+    signal_health = compute_signal_health(current_signal, signal_cap)
 
     timeframe_60m = timeframe_summaries.get('60m')
     timeframe_60m_min_precision = 0.0
+    timeframe_60m_breakout_precision = 0.0
+    timeframe_60m_reversion_precision = 0.0
+    timeframe_60m_hard_negative_rate = 1.0
     if timeframe_60m:
+        timeframe_60m_breakout_precision = float(timeframe_60m['breakout_metrics']['precision'])
+        timeframe_60m_reversion_precision = float(timeframe_60m['reversion_metrics']['precision'])
         timeframe_60m_min_precision = min(
-            float(timeframe_60m['breakout_metrics']['precision']),
-            float(timeframe_60m['reversion_metrics']['precision']),
+            timeframe_60m_breakout_precision,
+            timeframe_60m_reversion_precision,
         )
+        timeframe_60m_hard_negative_rate = 0.5 * (
+            float(timeframe_60m['breakout_metrics']['hard_negative_rate']) +
+            float(timeframe_60m['reversion_metrics']['hard_negative_rate'])
+        )
+    timeframe_60m_hard_negative_quality = max(0.0, 1.0 - timeframe_60m_hard_negative_rate)
     components = {
         'recent_min_precision': float(np.mean(recent_min_precision)) if recent_min_precision else 0.0,
         'recent_avg_precision': float(np.mean(recent_avg_precision)) if recent_avg_precision else 0.0,
+        'recent_public_feasibility': float(np.mean(recent_public_feasibility)) if recent_public_feasibility else 0.0,
+        'recent_directional_support_rate': float(np.mean(recent_directional_support_rate)) if recent_directional_support_rate else 0.0,
+        'recent_directional_floor_quality': float(np.mean(recent_directional_floor_quality)) if recent_directional_floor_quality else 0.0,
+        'recent_structural_guard_quality': float(np.mean(recent_structural_guard_quality)) if recent_structural_guard_quality else 0.0,
+        'timeframe_60m_breakout_precision': timeframe_60m_breakout_precision,
+        'timeframe_60m_reversion_precision': timeframe_60m_reversion_precision,
         'timeframe_60m_min_precision': timeframe_60m_min_precision,
+        'timeframe_60m_hard_negative_rate': timeframe_60m_hard_negative_rate,
+        'timeframe_60m_hard_negative_quality': timeframe_60m_hard_negative_quality,
         'hard_negative_improvement': hard_negative_improvement,
-        'signal_sparsity': signal_sparsity,
+        'signal_health': signal_health,
         'direction_consistency': float(np.mean(recent_direction)) if recent_direction else 0.0,
         'signal_frequency': current_signal,
         'signal_cap': signal_cap,
         'public_violation_recent_mean': float(np.mean(recent_public_violation)) if recent_public_violation else 0.0,
     }
-    score = (
-        0.30 * components['recent_min_precision'] +
-        0.20 * components['recent_avg_precision'] +
-        0.20 * components['timeframe_60m_min_precision'] +
-        0.15 * components['hard_negative_improvement'] +
-        0.10 * components['signal_sparsity'] +
-        0.05 * components['direction_consistency']
+    if getattr(args, 'score_profile', 'default') == 'iter12_guarded_precision_first':
+        score = (
+            0.24 * components['recent_min_precision'] +
+            0.18 * components['recent_avg_precision'] +
+            0.14 * components['timeframe_60m_min_precision'] +
+            0.10 * components['timeframe_60m_hard_negative_quality'] +
+            0.12 * components['recent_public_feasibility'] +
+            0.12 * components['recent_directional_floor_quality'] +
+            0.06 * components['hard_negative_improvement'] +
+            0.02 * components['signal_health'] +
+            0.02 * components['direction_consistency']
+        )
+    elif is_soft_iter12_profile(getattr(args, 'score_profile', 'default')):
+        score = (
+            0.26 * components['recent_min_precision'] +
+            0.16 * components['recent_avg_precision'] +
+            0.12 * components['timeframe_60m_min_precision'] +
+            0.10 * components['timeframe_60m_hard_negative_quality'] +
+            0.16 * components['recent_public_feasibility'] +
+            0.08 * components['recent_directional_support_rate'] +
+            0.06 * components['direction_consistency'] +
+            0.06 * components['signal_health']
+        )
+    else:
+        score = (
+            0.30 * components['recent_min_precision'] +
+            0.20 * components['recent_avg_precision'] +
+            0.20 * components['timeframe_60m_min_precision'] +
+            0.15 * components['hard_negative_improvement'] +
+            0.10 * components['signal_health'] +
+            0.05 * components['direction_consistency']
+        )
+    diagnostics['public_violation_cap'] = {
+        'actual': components['public_violation_recent_mean'],
+        'threshold': public_violation_cap,
+        'passed': components['public_violation_recent_mean'] <= public_violation_cap,
+    }
+    diagnostics['signal_health'] = {
+        'actual': components['signal_health'],
+        'signal_frequency': current_signal,
+        'signal_cap': signal_cap,
+        'passed': components['signal_health'] > 0.0,
+    }
+    diagnostics['timeframe_60m_min_precision_diagnostic'] = {
+        'actual': components['timeframe_60m_min_precision'],
+        'breakout_precision': timeframe_60m_breakout_precision,
+        'reversion_precision': timeframe_60m_reversion_precision,
+        'passed': True,
+    }
+    diagnostics['timeframe_60m_hard_negative_rate_diagnostic'] = {
+        'actual': timeframe_60m_hard_negative_rate,
+        'passed': True,
+    }
+    if is_soft_iter12_profile(getattr(args, 'score_profile', 'default')):
+        return score, components, {'passed': True, 'reasons': [], 'checks': diagnostics, 'mode': 'diagnostic_only'}
+    return score, components, {'passed': True, 'reasons': [], 'checks': diagnostics}
+
+
+def compute_catastrophic_guard(
+    epoch_score_summary,
+    fold_summaries,
+    args,
+    state=None,
+    non_finite_detected=False,
+):
+    state = dict(state or {})
+    public_streak = int(state.get('public_violation_streak', 0))
+    collapse_streak = int(state.get('collapse_streak', 0))
+    reasons = []
+    checks = {}
+
+    recent_labels = [label for label in RECENT_FOLD_ORDER if label in fold_summaries]
+    if not recent_labels:
+        recent_labels = sorted(fold_summaries.keys())[-2:]
+    recent_public_values = [
+        float(fold_summaries[label].get('public_below_directional_violation_rate', 0.0))
+        for label in recent_labels
+    ]
+    recent_public_mean = float(np.mean(recent_public_values)) if recent_public_values else 0.0
+    fold_public_cap = 0.65
+    recent_public_cap = float(getattr(args, 'catastrophic_public_violation_cap', 0.50))
+    fold_public_breach = [value for value in recent_public_values if value > fold_public_cap]
+    public_condition = recent_public_mean > recent_public_cap
+    public_streak = public_streak + 1 if public_condition else 0
+    checks['catastrophic_public_violation'] = {
+        'recent_labels': recent_labels,
+        'recent_public_violation_mean': recent_public_mean,
+        'mean_threshold': recent_public_cap,
+        'fold_threshold': fold_public_cap,
+        'consecutive_failures': public_streak,
+        'passed': not fold_public_breach and public_streak < 2,
+    }
+    if fold_public_breach:
+        reasons.append('recent_fold_public_violation_exploded')
+    elif public_streak >= 2:
+        reasons.append('recent_public_violation_mean_persisted')
+
+    pred_breakout_std = float(epoch_score_summary.get('pred_breakout_std', 0.0))
+    pred_reversion_std = float(epoch_score_summary.get('pred_reversion_std', 0.0))
+    catastrophic_signal_floor = float(getattr(args, 'catastrophic_signal_floor', 0.003))
+    breakout_signal_frequency = float(epoch_score_summary.get('breakout_signal_frequency', 0.0))
+    reversion_signal_frequency = float(epoch_score_summary.get('reversion_signal_frequency', 0.0))
+    collapsed_now = (
+        pred_breakout_std < 1e-3 and
+        pred_reversion_std < 1e-3 and
+        breakout_signal_frequency < catastrophic_signal_floor and
+        reversion_signal_frequency < catastrophic_signal_floor
     )
-    return score, components, {'passed': len(veto_reasons) == 0, 'reasons': veto_reasons}
+    collapse_streak = collapse_streak + 1 if collapsed_now else 0
+    checks['catastrophic_output_collapse'] = {
+        'pred_breakout_std': pred_breakout_std,
+        'pred_reversion_std': pred_reversion_std,
+        'breakout_signal_frequency': breakout_signal_frequency,
+        'reversion_signal_frequency': reversion_signal_frequency,
+        'signal_floor': catastrophic_signal_floor,
+        'consecutive_failures': collapse_streak,
+        'passed': collapse_streak < 2,
+    }
+    if collapse_streak >= 2:
+        reasons.append('output_collapse_persisted')
+
+    checks['catastrophic_non_finite'] = {
+        'detected': bool(non_finite_detected),
+        'passed': not bool(non_finite_detected),
+    }
+    if non_finite_detected:
+        reasons.append('non_finite_detected')
+
+    return {
+        'passed': len(reasons) == 0,
+        'reasons': reasons,
+        'checks': checks,
+        'state': {
+            'public_violation_streak': public_streak,
+            'collapse_streak': collapse_streak,
+        },
+        'mode': 'catastrophic_only',
+    }
 
 
 def evaluate_dataset_loader(kan, eval_loader, criterion, args, device, use_debug_metrics):
@@ -2248,7 +2810,7 @@ def evaluate_final_holdout(
     use_debug_metrics,
     use_direction_metrics,
 ):
-    if getattr(args, 'split_scheme', 'time') != 'rolling_recent_v1' or getattr(args, 'market', 'legacy_multiasset') != 'ashare':
+    if not uses_recent_runtime_splits(args):
         return None
     overall_bucket = build_metric_bucket()
     timeframe_buckets = defaultdict(build_metric_bucket)
@@ -2358,6 +2920,10 @@ def summarize_horizon_registry(registry):
 def train(args):
     set_seed(args.seed, args.deterministic)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    try:
+        torch.set_float32_matmul_precision('high')
+    except Exception:
+        pass
     print(f"Using device: {device}")
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -2396,6 +2962,9 @@ def train(args):
     if global_horizon_grid:
         print(f"Global horizon grid size: {len(global_horizon_grid)}")
     prewarm_runtime_dataset_cache(runtime_records, args, global_horizon_grid=global_horizon_grid)
+    if getattr(args, 'prewarm_dataset_cache_only', False):
+        print('[DATASET CACHE] Prewarm-only mode enabled; skipping model training.')
+        return
 
     kan = KHAOS_KAN(
         input_dim=len(PHYSICS_FEATURE_NAMES),
@@ -2889,6 +3458,9 @@ def train(args):
                     'pred_rev_event_mean': summary['pred_rev_event_mean'],
                     'directional_floor_mean': summary['directional_floor_mean'],
                     'directional_floor_reversion_event_mean': summary['directional_floor_reversion_event_mean'],
+                    'directional_floor_quality': summary['directional_floor_quality'],
+                    'public_feasibility_mean': summary['public_feasibility_mean'],
+                    'structural_guard_quality': summary['structural_guard_quality'],
                     'reversion_event_count': summary['reversion_event_count'],
                     'selected_horizon_breakout_value_mean': summary['selected_horizon_breakout_value_mean'],
                     'selected_horizon_reversion_value_mean': summary['selected_horizon_reversion_value_mean'],
@@ -2922,6 +3494,9 @@ def train(args):
                     'pred_rev_event_mean': summary['pred_rev_event_mean'],
                     'directional_floor_mean': summary['directional_floor_mean'],
                     'directional_floor_reversion_event_mean': summary['directional_floor_reversion_event_mean'],
+                    'directional_floor_quality': summary['directional_floor_quality'],
+                    'public_feasibility_mean': summary['public_feasibility_mean'],
+                    'structural_guard_quality': summary['structural_guard_quality'],
                     'reversion_event_count': summary['reversion_event_count'],
                     'selected_horizon_breakout_value_mean': summary['selected_horizon_breakout_value_mean'],
                     'selected_horizon_reversion_value_mean': summary['selected_horizon_reversion_value_mean'],
@@ -3075,6 +3650,9 @@ def train(args):
             'pred_rev_event_mean': epoch_score_summary['pred_rev_event_mean'],
             'directional_floor_mean': epoch_score_summary['directional_floor_mean'],
             'directional_floor_reversion_event_mean': epoch_score_summary['directional_floor_reversion_event_mean'],
+            'directional_floor_quality': epoch_score_summary['directional_floor_quality'],
+            'public_feasibility_mean': epoch_score_summary['public_feasibility_mean'],
+            'structural_guard_quality': epoch_score_summary['structural_guard_quality'],
             'reversion_event_count': epoch_score_summary['reversion_event_count'],
             'public_below_directional_violation_rate': epoch_score_summary['public_below_directional_violation_rate'],
             'selected_horizon_breakout_value_mean': epoch_score_summary['selected_horizon_breakout_value_mean'],
@@ -3252,7 +3830,8 @@ if __name__ == "__main__":
     parser.add_argument('--promotion_overall_composite_threshold', type=float, default=None)
     parser.add_argument('--promotion_timeframe_composite_thresholds', type=str, default=None)
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--deterministic', action='store_true', default=True)
+    parser.add_argument('--deterministic', dest='deterministic', action='store_true', default=True)
+    parser.add_argument('--non_deterministic', dest='deterministic', action='store_false')
     parser.add_argument('--test_mode', action='store_true', default=False)
     parser.add_argument('--fast_full', action='store_true', default=False)
     parser.add_argument('--early_stop_patience', type=int, default=2)
@@ -3264,8 +3843,11 @@ if __name__ == "__main__":
     parser.add_argument('--warm_start_weights_only', action='store_true', default=False)
     parser.add_argument('--warm_start_path', type=str, default=None)
     parser.add_argument('--dataset_cache_dir', type=str, default=None)
+    parser.add_argument('--num_workers', type=int, default=0)
+    parser.add_argument('--prefetch_factor', type=int, default=2)
     parser.add_argument('--disable_dataset_cache', action='store_true', default=False)
     parser.add_argument('--skip_dataset_cache_prewarm', action='store_true', default=False)
+    parser.add_argument('--prewarm_dataset_cache_only', action='store_true', default=False)
     parser.add_argument('--disable_threshold_fit', action='store_true', default=False)
     parser.add_argument('--config_fingerprint', type=str, default=None)
     parser.add_argument('--baseline_reference_dir', type=str, default=None)

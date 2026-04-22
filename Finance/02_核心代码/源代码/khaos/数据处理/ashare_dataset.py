@@ -124,39 +124,39 @@ SHORT_T_DISCOVERY_GUARDED_V2_TIMEFRAME_WEIGHT = {
 
 ROLLING_RECENT_SPLITS = {
     'fold_1': {
-        'train_end': '2023-06-30',
-        'val_start': '2023-07-01',
-        'val_end': '2023-12-31',
-        'test_start': '2024-01-01',
-        'test_end': '2024-06-30',
+        'train_end': '2020-12-31',
+        'val_start': '2021-01-01',
+        'val_end': '2021-06-30',
+        'test_start': '2021-07-01',
+        'test_end': '2021-12-31',
     },
     'fold_2': {
-        'train_end': '2023-12-31',
-        'val_start': '2024-01-01',
-        'val_end': '2024-06-30',
-        'test_start': '2024-07-01',
-        'test_end': '2024-12-31',
+        'train_end': '2021-06-30',
+        'val_start': '2021-07-01',
+        'val_end': '2021-12-31',
+        'test_start': '2022-01-01',
+        'test_end': '2022-06-30',
     },
     'fold_3': {
-        'train_end': '2024-06-30',
-        'val_start': '2024-07-01',
-        'val_end': '2024-12-31',
-        'test_start': '2025-01-01',
-        'test_end': '2025-06-30',
+        'train_end': '2021-12-31',
+        'val_start': '2022-01-01',
+        'val_end': '2022-06-30',
+        'test_start': '2022-07-01',
+        'test_end': '2022-12-31',
     },
     'fold_4': {
-        'train_end': '2024-12-31',
-        'val_start': '2025-01-01',
-        'val_end': '2025-06-30',
-        'test_start': '2025-07-01',
-        'test_end': '2025-12-31',
+        'train_end': '2022-06-30',
+        'val_start': '2022-07-01',
+        'val_end': '2022-12-31',
+        'test_start': '2023-01-01',
+        'test_end': '2023-06-30',
     },
     'final_holdout': {
-        'train_end': '2025-06-30',
-        'val_start': '2025-07-01',
-        'val_end': '2025-12-31',
-        'test_start': '2026-01-01',
-        'test_end': None,
+        'train_end': '2022-12-31',
+        'val_start': '2023-01-01',
+        'val_end': '2023-06-30',
+        'test_start': '2023-07-01',
+        'test_end': '2023-12-31',
     },
 }
 
@@ -283,15 +283,31 @@ def normalize_horizon_search_spec(spec):
         'saturation_ratio': 0.01,
         'saturation_patience': 8,
         'saturation_ema': 5,
+        'explicit_horizons': None,
     }
     if spec is None:
         return defaults
     if isinstance(spec, dict):
         parsed = dict(spec)
+    elif isinstance(spec, (list, tuple, set)):
+        parsed = {'explicit_horizons': [int(item) for item in spec if str(item).strip()]}
     elif isinstance(spec, str):
         text = spec.strip()
         if not text:
             parsed = {}
+        elif text.startswith('[') and text.endswith(']'):
+            try:
+                parsed = {'explicit_horizons': [int(item) for item in json.loads(text)]}
+            except Exception:
+                parsed = {}
+        elif ',' in text and '=' not in text and ':' not in text and '{' not in text:
+            parsed = {
+                'explicit_horizons': [
+                    int(item.strip())
+                    for item in text.split(',')
+                    if item.strip()
+                ]
+            }
         else:
             try:
                 parsed = json.loads(text)
@@ -305,12 +321,23 @@ def normalize_horizon_search_spec(spec):
     for key, value in parsed.items():
         if key not in merged:
             continue
+        if key == 'explicit_horizons':
+            if value is None:
+                merged[key] = None
+            else:
+                merged[key] = sorted({max(int(item), 1) for item in value})
+            continue
         if key in {'min_horizon', 'max_horizon', 'saturation_patience', 'saturation_ema'}:
             merged[key] = int(value)
         else:
             merged[key] = float(value)
-    merged['min_horizon'] = max(int(merged['min_horizon']), 20)
-    merged['max_horizon'] = max(int(merged['max_horizon']), merged['min_horizon'])
+    if merged['explicit_horizons']:
+        merged['explicit_horizons'] = sorted({max(int(item), 1) for item in merged['explicit_horizons']})
+        merged['min_horizon'] = int(min(merged['explicit_horizons']))
+        merged['max_horizon'] = int(max(merged['explicit_horizons']))
+    else:
+        merged['min_horizon'] = max(int(merged['min_horizon']), 20)
+        merged['max_horizon'] = max(int(merged['max_horizon']), merged['min_horizon'])
     merged['max_fraction'] = float(np.clip(merged['max_fraction'], 0.02, 0.5))
     merged['saturation_ratio'] = float(np.clip(merged['saturation_ratio'], 1e-4, 0.5))
     merged['saturation_patience'] = max(int(merged['saturation_patience']), 2)
@@ -549,6 +576,13 @@ def _discover_candidate_horizons(utility_by_horizon, candidate_horizons, spec, t
 
 def build_horizon_candidates(train_length, horizon_search_spec):
     spec = normalize_horizon_search_spec(horizon_search_spec)
+    explicit_horizons = spec.get('explicit_horizons') or []
+    if explicit_horizons:
+        upper = _safe_horizon_upper_bound(train_length, spec)
+        selected = [int(item) for item in explicit_horizons if int(item) <= upper]
+        if not selected:
+            selected = [int(explicit_horizons[0])]
+        return selected, spec
     min_horizon = int(spec['min_horizon'])
     upper = _safe_horizon_upper_bound(train_length, spec)
     if upper <= min_horizon:
@@ -558,6 +592,20 @@ def build_horizon_candidates(train_length, horizon_search_spec):
 
 def build_global_horizon_grid(horizon_search_spec, train_lengths=None):
     spec = normalize_horizon_search_spec(horizon_search_spec)
+    explicit_horizons = spec.get('explicit_horizons') or []
+    if explicit_horizons:
+        if train_lengths:
+            safe_uppers = [
+                _safe_horizon_upper_bound(int(train_length), spec)
+                for train_length in train_lengths
+                if int(train_length) > 0
+            ]
+            if safe_uppers:
+                upper = max(safe_uppers)
+                selected = [int(item) for item in explicit_horizons if int(item) <= upper]
+                if selected:
+                    return selected
+        return [int(item) for item in explicit_horizons]
     min_horizon = int(spec['min_horizon'])
     max_horizon = int(spec['max_horizon'])
     if train_lengths:
