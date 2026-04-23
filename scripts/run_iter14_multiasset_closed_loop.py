@@ -37,7 +37,7 @@ SMOKE_PRESET = {
     "dataset_profile": "shortT_discovery_guarded_v2",
     "loss_profile": "shortT_discovery_guarded_v2",
     "constraint_profile": "teacher_feasible_discovery_v1",
-    "score_profile": "iter12_guarded_precision_first",
+    "score_profile": "iter13_precision_first",
     "score_timeframes": DEFAULT_SCORE_TIMEFRAMES,
     "aux_timeframes": DEFAULT_AUX_TIMEFRAMES,
     "split_scheme": DEFAULT_SPLIT_SCHEME,
