@@ -162,8 +162,8 @@ PRECISION_FIRST_PROFILE_CONFIG = {
         'min_precision': 0.0,
         'max_hard_negative_rate': 1.0,
         'threshold_grid_min': 0.85, # 适应EV回归，寻找最头部的15%以内的信号
-        'threshold_grid_max': 0.99, # 允许搜寻到前1%的信号 (1%~15%频率)
-        'threshold_grid_points': 20,
+        'threshold_grid_max': 0.999, # 放宽到最极端的 0.1%，让稀疏的 Reversion 有机会达到 2% 频率
+        'threshold_grid_points': 30, # 提升搜索粒度
     },
 }
 
@@ -564,8 +564,8 @@ def compute_iter13_structural_components(summary):
         raw_event_mean = raw_floor_mean
     raw_event_mean = max(raw_event_mean, 0.0)
 
-    directional_floor_mean = _clip01(raw_floor_mean)
-    directional_floor_event_mean = _clip01(raw_event_mean)
+    directional_floor_mean = _clip01(raw_floor_mean * 5.0)
+    directional_floor_event_mean = _clip01(raw_event_mean * 5.0)
     
     directional_support_rate = _clip01(
         summary.get(
@@ -3890,9 +3890,9 @@ if __name__ == "__main__":
     parser.add_argument('--breakout_precision_floor', type=float, default=0.0)
     parser.add_argument('--reversion_precision_floor', type=float, default=0.0)
     parser.add_argument('--gate_mode', type=str, default='soft_annealed', choices=['soft_annealed', 'legacy_hard', 'disabled'])
-    parser.add_argument('--gate_floor_breakout', type=float, default=0.10)
-    parser.add_argument('--gate_floor_reversion', type=float, default=0.15)
-    parser.add_argument('--gate_anneal_fraction', type=float, default=0.40)
+    parser.add_argument('--gate_floor_breakout', type=float, default=0.05)
+    parser.add_argument('--gate_floor_reversion', type=float, default=0.05)
+    parser.add_argument('--gate_anneal_fraction', type=float, default=0.60)
     parser.add_argument('--horizon_search_spec', type=str, default=None)
     parser.add_argument('--kill_keep_review_epoch', type=int, default=0)
     parser.add_argument('--kill_keep_public_violation_rate_max', type=float, default=0.25)

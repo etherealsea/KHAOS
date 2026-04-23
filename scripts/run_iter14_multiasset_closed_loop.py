@@ -70,9 +70,9 @@ SMOKE_PRESET = {
     "reversion_precision_floor": 0.0,
     "resume_mode": "auto",
     "gate_mode": "soft_annealed",
-    "gate_floor_breakout": 0.10,
-    "gate_floor_reversion": 0.15,
-    "gate_anneal_fraction": 0.40,
+    "gate_floor_breakout": 0.05,
+    "gate_floor_reversion": 0.05,
+    "gate_anneal_fraction": 0.60,
     "horizon_search_spec": "6,10,14,20",
 }
 FORMAL_PRESET = {
@@ -117,9 +117,9 @@ FORMAL_PRESET = {
     "reversion_precision_floor": 0.0,
     "resume_mode": "auto",
     "gate_mode": "soft_annealed",
-    "gate_floor_breakout": 0.10,
-    "gate_floor_reversion": 0.15,
-    "gate_anneal_fraction": 0.40,
+    "gate_floor_breakout": 0.05,
+    "gate_floor_reversion": 0.05,
+    "gate_anneal_fraction": 0.60,
     "horizon_search_spec": "6,10,14,20",
 }
 PHASE_PRESETS = {
