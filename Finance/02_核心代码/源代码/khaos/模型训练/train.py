@@ -26,7 +26,7 @@ from khaos.鏁版嵁澶勭悊.ashare_dataset import (
 )
 from khaos.鏁版嵁澶勭悊.ashare_support import (
     DEFAULT_ASHARE_TIMEFRAMES,
-    LEGACY_ITER9_ASSETS,
+    DEFAULT_MULTI_ASSETS,
     discover_training_files,
     normalize_timeframe_label,
     resolve_training_ready_dir,
@@ -47,7 +47,7 @@ from khaos.数据处理.ashare_dataset import (
 )
 from khaos.数据处理.ashare_support import (
     DEFAULT_ASHARE_TIMEFRAMES,
-    LEGACY_ITER9_ASSETS,
+    DEFAULT_MULTI_ASSETS,
     discover_training_files,
     normalize_timeframe_label,
     resolve_training_ready_dir,
@@ -1469,7 +1469,7 @@ def resolve_training_filters(args):
     market = getattr(args, 'market', 'legacy_multiasset')
     assets = parse_list_arg(getattr(args, 'assets', None))
     if not assets and market != 'ashare':
-        assets = list(LEGACY_ITER9_ASSETS)
+        assets = list(DEFAULT_MULTI_ASSETS)
     timeframes = [normalize_timeframe_label(item) for item in parse_list_arg(getattr(args, 'timeframes', None))]
     if not timeframes and market == 'ashare':
         timeframes = list(DEFAULT_ASHARE_TIMEFRAMES)

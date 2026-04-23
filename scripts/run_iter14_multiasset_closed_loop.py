@@ -14,19 +14,17 @@ DEFAULT_SCORE_TIMEFRAMES = "5m,15m,60m,240m"
 DEFAULT_AUX_TIMEFRAMES = ""
 DEFAULT_SPLIT_SCHEME = "rolling_recent_v1"
 DEFAULT_SPLIT_LABELS = "fold_1,fold_2,fold_3,fold_4"
-ITER12_DISCOVERY_CAPS = {
+ITER14_DISCOVERY_CAPS = {
     "5m": 2048,
     "15m": 4096,
     "60m": 6144,
     "240m": 4096,
-    "1d": 2048,
 }
-ITER12_SMOKE_CAPS = {
+ITER14_SMOKE_CAPS = {
     "5m": 512,
     "15m": 1024,
     "60m": 1536,
     "240m": 1024,
-    "1d": 512,
 }
 SMOKE_PRESET = {
     "run_label": "smoke",
@@ -55,7 +53,7 @@ SMOKE_PRESET = {
     "early_stop_patience": 8,
     "early_stop_min_delta": 0.001,
     "grad_clip": 0.8,
-    "per_timeframe_train_cap": ITER12_SMOKE_CAPS,
+    "per_timeframe_train_cap": ITER14_SMOKE_CAPS,
     "num_workers": 4,
     "prefetch_factor": 4,
     "deterministic": False,
@@ -102,7 +100,7 @@ FORMAL_PRESET = {
     "early_stop_patience": 8,
     "early_stop_min_delta": 0.001,
     "grad_clip": 0.8,
-    "per_timeframe_train_cap": ITER12_DISCOVERY_CAPS,
+    "per_timeframe_train_cap": ITER14_DISCOVERY_CAPS,
     "num_workers": 4,
     "prefetch_factor": 4,
     "deterministic": False,
