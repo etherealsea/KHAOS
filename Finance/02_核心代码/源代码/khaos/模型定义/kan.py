@@ -622,10 +622,7 @@ class KHAOS_KAN(nn.Module):
             direction_mix_gate.unsqueeze(-1) * bear_score_h +
             (1.0 - direction_mix_gate.unsqueeze(-1)) * bull_score_h
         )
-        directional_floor_h = torch.maximum(
-            directional_reversion_h,
-            torch.maximum(bear_score_h, bull_score_h) - 0.08,
-        )
+        directional_floor_h = torch.maximum(bear_score_h, bull_score_h)
         public_reversion_score_h = torch.maximum(bear_score_h, bull_score_h)
         if self.arch_version == 'iterA5_multiscale':
             public_reversion_score_h = (10.0 * torch.tanh(self.public_reversion_head(public_reversion_state) / 5.0)).view(batch_size, 2, self.horizon_count)
@@ -661,17 +658,10 @@ class KHAOS_KAN(nn.Module):
             # Breakout 不再被乘法 gate 阻断，直接沿用网络原本的预测
             # breakout_event_logits 保持不变
 
-            # Reversion 也不再被 directional_gate 阻断，只做残差加性融合
-            reversion_residual = public_reversion_gate.unsqueeze(-1) * torch.relu(
-                public_reversion_score_h - directional_reversion_h + 0.15
-            )
-            
-            # 直接融合，不再受 directional_gate 抑制
-            gated_residual = reversion_residual
-            
-            reversion_event_logits = directional_reversion_h + gated_residual
+            # Reversion 也不再被 directional_gate 阻断，并且直接输出最强方向预测值
+            reversion_event_logits = public_reversion_score_h
         else:
-            reversion_event_logits = directional_reversion_h
+            reversion_event_logits = public_reversion_score_h
         aux_logits_by_horizon = self._reshape_aux_logits(
             self.aux_head(torch.cat([shared_state, transition_context - reversion_context], dim=1))
         )
