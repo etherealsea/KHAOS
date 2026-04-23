@@ -263,7 +263,32 @@ class KHAOS_KAN(nn.Module):
         )
         head_depth = max(2, layers)
 
-        if self.arch_version in self.multiscale_versions:
+        if self.arch_version == 'iterA6_regression':
+            self.global_pool = AttentionPool(self.d_model)
+            self.short_pool = AttentionPool(self.d_model)
+            self.breakout_head = KANHead(
+                self.d_model * 2, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
+            )
+            self.reversion_head = KANHead(
+                self.d_model * 2, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
+            )
+            self.aux_head = nn.Sequential(
+                nn.Linear(self.d_model * 2, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, 2 * self.horizon_count)
+            )
+            if self.horizon_count > 1:
+                self.breakout_horizon_head = nn.Sequential(
+                    nn.Linear(self.d_model * 2, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.horizon_count),
+                )
+                self.reversion_horizon_head = nn.Sequential(
+                    nn.Linear(self.d_model * 2, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.horizon_count),
+                )
+        elif self.arch_version in self.multiscale_versions:
             self.global_pool = AttentionPool(self.d_model)
             self.mid_pool = AttentionPool(self.d_model)
             self.short_pool = AttentionPool(self.d_model)
@@ -566,6 +591,65 @@ class KHAOS_KAN(nn.Module):
         info.update(horizon_info)
         return main_pred, aux_pred, info
 
+    def _forward_itera6_regression(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
+        batch_size = x.size(0)
+        global_state, global_weights = self.global_pool(x)
+
+        short_len = min(5, x.size(1))
+        short_x = x[:, -short_len:, :]
+        short_state, short_weights = self.short_pool(short_x)
+
+        merged_state = torch.cat([global_state, short_state], dim=1)
+
+        breakout_event_logits = 10.0 * torch.tanh(self.breakout_head(merged_state) / 5.0)
+        reversion_event_logits = 10.0 * torch.tanh(self.reversion_head(merged_state) / 5.0)
+
+        aux_logits_by_horizon = self._reshape_aux_logits(self.aux_head(merged_state))
+
+        breakout_horizon_logits = None
+        reversion_horizon_logits = None
+        if self.horizon_count > 1:
+            breakout_horizon_logits = self.breakout_horizon_head(merged_state)
+            reversion_horizon_logits = self.reversion_horizon_head(merged_state)
+
+        bear_score_h = torch.zeros_like(reversion_event_logits)
+        bull_score_h = torch.zeros_like(reversion_event_logits)
+        public_reversion_score_h = reversion_event_logits
+        directional_reversion_h = reversion_event_logits
+        directional_floor_h = torch.ones_like(reversion_event_logits)
+
+        breakout_pred, reversion_pred, aux_pred, horizon_info = self._aggregate_horizon_outputs(
+            breakout_event_logits=breakout_event_logits,
+            reversion_event_logits=reversion_event_logits,
+            aux_logits_by_horizon=aux_logits_by_horizon,
+            breakout_horizon_logits=breakout_horizon_logits,
+            reversion_horizon_logits=reversion_horizon_logits,
+            horizon_prior=horizon_prior,
+            family_mode=family_mode,
+            valid_horizon_mask=valid_horizon_mask,
+            reversion_extras={
+                'bear_score': bear_score_h,
+                'bull_score': bull_score_h,
+                'public_reversion_score': public_reversion_score_h,
+                'directional_reversion': directional_reversion_h,
+                'directional_floor': directional_floor_h,
+            },
+        )
+        main_pred = torch.stack([breakout_pred, reversion_pred], dim=1)
+        info = {
+            'attn': attn_weights,
+            'global_pool': global_weights,
+            'short_pool': short_weights,
+            'bear_score': horizon_info['bear_score'],
+            'bull_score': horizon_info['bull_score'],
+            'public_reversion_score': horizon_info['public_reversion_score'],
+            'directional_reversion': horizon_info['directional_reversion'],
+            'directional_floor': horizon_info['directional_floor'],
+            'directional_floor_mean': horizon_info['directional_floor'].mean(),
+        }
+        info.update(horizon_info)
+        return main_pred, aux_pred, info
+
     def _forward_itera3(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
         batch_size = x.size(0)
         last_state = x[:, -1, :]
@@ -749,7 +833,15 @@ class KHAOS_KAN(nn.Module):
         else:
             x = self.attention_block(x)
             attn_weights = None
-        if self.arch_version in self.multiscale_versions:
+        if self.arch_version == 'iterA6_regression':
+            main_pred, aux_pred, info = self._forward_itera6_regression(
+                x,
+                attn_weights,
+                horizon_prior=horizon_prior,
+                family_mode=family_mode,
+                valid_horizon_mask=valid_horizon_mask,
+            )
+        elif self.arch_version in self.multiscale_versions:
             main_pred, aux_pred, info = self._forward_itera3(
                 x,
                 attn_weights,
