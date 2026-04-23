@@ -38,14 +38,15 @@ SMOKE_PRESET = {
     "loss_profile": "iter14_ev_regression",
     "constraint_profile": "iter14_ev_regression",
     "score_profile": "iter14_precision_first",
-    "score_timeframes": DEFAULT_SCORE_TIMEFRAMES,
-    "aux_timeframes": DEFAULT_AUX_TIMEFRAMES,
-    "split_scheme": DEFAULT_SPLIT_SCHEME,
-    "split_labels": DEFAULT_SPLIT_LABELS,
-    "training_subdir": None,
+    "score_timeframes": "5m,15m,60m,240m,1d",
+    "aux_timeframes": "",
+    "split_scheme": "split_by_month",
+    "split_labels": "val,train",
+    "training_subdir": "training_ready",
     "assets": DEFAULT_ASSETS,
     "timeframes": DEFAULT_TIMEFRAMES,
-    "lr": 7e-4,
+    "lr": 0.0007,
+    "thresholds_frozen": False,
     "window_size": 60,
     "horizon": 10,
     "hidden_dim": 80,
@@ -92,6 +93,7 @@ FORMAL_PRESET = {
     "assets": DEFAULT_ASSETS,
     "timeframes": DEFAULT_TIMEFRAMES,
     "lr": 7e-4,
+    "thresholds_frozen": False,
     "window_size": 60,
     "horizon": 10,
     "hidden_dim": 80,
@@ -215,6 +217,7 @@ def resolve_effective_config(args: argparse.Namespace) -> dict:
         "aux_timeframes": coalesce(args.aux_timeframes, preset["aux_timeframes"]),
         "split_scheme": coalesce(args.split_scheme, preset["split_scheme"]),
         "split_labels": coalesce(args.split_labels, preset["split_labels"]),
+        "thresholds_frozen": coalesce(args.thresholds_frozen, preset["thresholds_frozen"]),
         "training_subdir": coalesce(args.training_subdir, preset["training_subdir"]),
         "lr": coalesce(args.lr, preset["lr"]),
         "window_size": coalesce(args.window_size, preset["window_size"]),
@@ -326,6 +329,7 @@ def main() -> None:
     parser.add_argument("--aux_timeframes", type=str, default=None)
     parser.add_argument("--split_scheme", type=str, default=None)
     parser.add_argument("--split_labels", type=str, default=None)
+    parser.add_argument("--thresholds_frozen", action="store_true", default=None)
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--window_size", type=int, default=None)
     parser.add_argument("--horizon", type=int, default=None)
@@ -420,6 +424,8 @@ def main() -> None:
             "--grad_clip",
             str(config["grad_clip"]),
         ]
+        if config.get("thresholds_frozen", False):
+            argv.append("--thresholds_frozen")
         add_optional_arg(argv, "--training_subdir", config["training_subdir"])
         add_optional_arg(argv, "--dataset_cache_dir", str(dataset_cache_dir))
         add_optional_arg(argv, "--score_timeframes", config["score_timeframes"])
