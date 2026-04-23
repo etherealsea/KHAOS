@@ -322,7 +322,7 @@ def compute_event_metrics(
     threshold_grid = (
         np.linspace(
             float(precision_cfg['threshold_grid_min']),
-            float(precision_cfg['threshold_grid_max']),
+            min(float(precision_cfg['threshold_grid_max']), 0.9999),
             int(precision_cfg['threshold_grid_points']),
         )
         if selection_mode == 'precision_first'
