@@ -161,7 +161,7 @@ def locate_train_py(project_root: Path) -> Path:
 def resolve_project_paths() -> tuple[Path, Path, Path]:
     project_root = Path(__file__).resolve().parents[1]
     train_py = locate_train_py(project_root)
-    report_py = project_root / "scripts" / "generate_iter10_multiasset_report.py"
+    report_py = project_root / "scripts" / "generate_iter14_multiasset_report.py"
     if not report_py.exists():
         raise FileNotFoundError(f"missing report generator: {report_py}")
     return project_root, train_py, report_py
@@ -177,7 +177,7 @@ def resolve_training_ready_dir(data_dir: Path, training_subdir: Optional[str]) -
 def resolve_project_dataset_cache_dir(data_dir: Path, dataset_cache_dir: Optional[str]) -> Path:
     if dataset_cache_dir:
         return Path(dataset_cache_dir).resolve()
-    return (data_dir / "dataset_cache" / "iter12_guarded_recent_v1").resolve()
+    return (data_dir / "dataset_cache" / "iter14_ev_regression_v1").resolve()
 
 
 def format_timeframe_caps(value: Optional[str | dict[str, int]]) -> Optional[str]:
@@ -478,7 +478,7 @@ def main() -> None:
 
     report_title = None
     if not config["prewarm_only"]:
-        report_title = f"iter12 multi-asset {config['run_label']} report"
+        report_title = f"iter14 multi-asset {config['run_label']} report"
         subprocess.run(
             [
                 sys.executable,
@@ -486,7 +486,7 @@ def main() -> None:
                 "--run_dir",
                 str(save_dir),
                 "--out",
-                str(save_dir / "iter12_report.md"),
+                str(save_dir / "iter14_report.md"),
                 "--title",
                 report_title,
             ],

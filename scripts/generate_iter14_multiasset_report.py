@@ -59,8 +59,8 @@ def main():
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).resolve()
-    out_path = Path(args.out).resolve() if args.out else (run_dir / "iter10_report.md")
-    title = args.title or "iter10 multi-asset report"
+    out_path = Path(args.out).resolve() if args.out else (run_dir / "iter14_report.md")
+    title = args.title or "iter14 multi-asset report"
 
     epoch_rows = load_jsonl(run_dir / "epoch_metrics.jsonl")
     per_asset_rows = load_jsonl(run_dir / "per_asset_metrics.jsonl")
@@ -180,7 +180,7 @@ def main():
         lines.append(render_table(detail_headers, detail_rows))
         lines.append("")
 
-    backtest_path = run_dir / "iter10_backtest_summary.csv"
+    backtest_path = run_dir / "iter14_backtest_summary.csv"
     if backtest_path.exists():
         with backtest_path.open("r", encoding="utf-8") as handle:
             backtest_rows = list(csv.DictReader(handle))

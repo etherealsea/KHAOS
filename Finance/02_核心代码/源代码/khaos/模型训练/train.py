@@ -174,7 +174,7 @@ def resolve_event_selection_mode(score_profile='default'):
     return 'f1'
 
 
-def is_soft_iter12_profile(score_profile='default'):
+def is_modern_score_profile(score_profile='default'):
     return str(score_profile or 'default') in ['iter12_soft_guarded_precision_first', 'iter13_precision_first', 'iter14_precision_first']
 
 
@@ -226,7 +226,7 @@ def compute_threshold_selection_utility(candidate, event_type='generic', score_p
     signal_cap = candidate.get('signal_cap')
     signal_health = compute_signal_health(candidate.get('signal_frequency', 0.0), signal_cap)
     candidate['signal_health'] = signal_health
-    if is_soft_iter12_profile(score_profile):
+    if is_modern_score_profile(score_profile):
         # 【Iter14 EV Regression】: signal_space_mean 和 signal_quality_mean 变成了连续 EV，不再局限于 [0, 1]
         # 为了保证不同指标权重可比，对 EV 均值做一层软归一化处理（除以 3.0 并截断），以体现高 EV 的正向作用。
         norm_space = float(np.clip(candidate.get('signal_space_mean', 0.0) / 3.0, 0.0, 1.5))
@@ -374,7 +374,7 @@ def compute_event_metrics(
             fallback_best = candidate
         if (
             signal_cap is not None and
-            not is_soft_iter12_profile(score_profile) and
+            not is_modern_score_profile(score_profile) and
             candidate['signal_frequency'] > signal_cap + 1e-12
         ):
             continue
@@ -551,7 +551,7 @@ def _clip01(value):
     return float(np.clip(float(value), 0.0, 1.0))
 
 
-def compute_iter13_structural_components(summary):
+def compute_iter14_structural_components(summary):
     summary = summary or {}
     public_violation_rate = _clip01(summary.get('public_below_directional_violation_rate', 1.0))
     public_feasibility = _clip01(1.0 - public_violation_rate)
@@ -675,7 +675,7 @@ def compute_checkpoint_score(
             event_type='reversion',
             score_profile=profile,
         )
-        structural_components = compute_iter13_structural_components(structural_summary)
+        structural_components = compute_iter14_structural_components(structural_summary)
         if direction_macro_f1 is None:
             return (
                 0.30 * breakout_quality +
@@ -1127,7 +1127,7 @@ def summarize_metric_bucket(bucket, score_profile='default', use_direction_metri
             support_margin = directional_floor_values[:aligned_size] - directional_reversion_values[:aligned_size]
             if np.any(support_mask):
                 directional_support_rate = float(np.mean(support_margin[support_mask] > 1e-6))
-    structural_components = compute_iter13_structural_components(
+    structural_components = compute_iter14_structural_components(
         {
             'public_below_directional_violation_rate': public_below_directional_violation_rate,
             'directional_floor_mean': directional_floor_mean,
@@ -2394,7 +2394,7 @@ def compute_standard_score_veto(epoch_score_summary, timeframe_summaries, args, 
         score_timeframes=score_timeframes,
         fallback_summary=epoch_score_summary,
     )
-    diagnostic_only = is_soft_iter12_profile(getattr(args, 'score_profile', 'default'))
+    diagnostic_only = is_modern_score_profile(getattr(args, 'score_profile', 'default'))
     veto_reasons = []
     checks = {}
 
@@ -2554,7 +2554,7 @@ def compute_recent_precision_score(
             )
         )
         recent_public_violation.append(float(summary['public_below_directional_violation_rate']))
-        structural_components = compute_iter13_structural_components(summary)
+        structural_components = compute_iter14_structural_components(summary)
         recent_public_feasibility.append(structural_components['public_feasibility'])
         recent_directional_support_rate.append(structural_components['directional_support_rate'])
         recent_directional_floor_quality.append(structural_components['directional_floor_quality'])
@@ -2630,7 +2630,7 @@ def compute_recent_precision_score(
             0.02 * components['signal_health'] +
             0.02 * components['direction_consistency']
         )
-    elif is_soft_iter12_profile(getattr(args, 'score_profile', 'default')):
+    elif is_modern_score_profile(getattr(args, 'score_profile', 'default')):
         score = (
             0.26 * components['recent_min_precision'] +
             0.16 * components['recent_avg_precision'] +
@@ -2671,7 +2671,7 @@ def compute_recent_precision_score(
         'actual': timeframe_60m_hard_negative_rate,
         'passed': True,
     }
-    if is_soft_iter12_profile(getattr(args, 'score_profile', 'default')):
+    if is_modern_score_profile(getattr(args, 'score_profile', 'default')):
         return score, components, {'passed': True, 'reasons': [], 'checks': diagnostics, 'mode': 'diagnostic_only'}
     return score, components, {'passed': True, 'reasons': [], 'checks': diagnostics}
 
