@@ -263,28 +263,29 @@ class KHAOS_KAN(nn.Module):
         )
         head_depth = max(2, layers)
 
-        if self.arch_version == 'iterA6_regression':
+        if self.arch_version == 'iter14_regression':
             self.global_pool = AttentionPool(self.d_model)
+            self.mid_pool = AttentionPool(self.d_model)
             self.short_pool = AttentionPool(self.d_model)
             self.breakout_head = KANHead(
-                self.d_model * 2, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
+                self.d_model * 3, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
             )
             self.reversion_head = KANHead(
-                self.d_model * 2, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
+                self.d_model * 3, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count * 2
             )
             self.aux_head = nn.Sequential(
-                nn.Linear(self.d_model * 2, hidden_dim),
+                nn.Linear(self.d_model * 3, hidden_dim),
                 nn.GELU(),
                 nn.Linear(hidden_dim, 2 * self.horizon_count)
             )
             if self.horizon_count > 1:
                 self.breakout_horizon_head = nn.Sequential(
-                    nn.Linear(self.d_model * 2, hidden_dim),
+                    nn.Linear(self.d_model * 3, hidden_dim),
                     nn.GELU(),
                     nn.Linear(hidden_dim, self.horizon_count),
                 )
                 self.reversion_horizon_head = nn.Sequential(
-                    nn.Linear(self.d_model * 2, hidden_dim),
+                    nn.Linear(self.d_model * 3, hidden_dim),
                     nn.GELU(),
                     nn.Linear(hidden_dim, self.horizon_count),
                 )
@@ -591,15 +592,19 @@ class KHAOS_KAN(nn.Module):
         info.update(horizon_info)
         return main_pred, aux_pred, info
 
-    def _forward_itera6_regression(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
+    def _forward_iter14_regression(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
         batch_size = x.size(0)
         global_state, global_weights = self.global_pool(x)
+
+        mid_len = min(20, x.size(1))
+        mid_x = x[:, -mid_len:, :]
+        mid_state, mid_weights = self.mid_pool(mid_x)
 
         short_len = min(5, x.size(1))
         short_x = x[:, -short_len:, :]
         short_state, short_weights = self.short_pool(short_x)
 
-        merged_state = torch.cat([global_state, short_state], dim=1)
+        merged_state = torch.cat([global_state, mid_state, short_state], dim=1)
 
         breakout_event_logits = 10.0 * torch.tanh(self.breakout_head(merged_state) / 5.0)
         reversion_event_logits = 10.0 * torch.tanh(self.reversion_head(merged_state) / 5.0)
@@ -639,6 +644,7 @@ class KHAOS_KAN(nn.Module):
         info = {
             'attn': attn_weights,
             'global_pool': global_weights,
+            'mid_pool': mid_weights,
             'short_pool': short_weights,
             'bear_score': horizon_info['bear_score'],
             'bull_score': horizon_info['bull_score'],
@@ -833,8 +839,8 @@ class KHAOS_KAN(nn.Module):
         else:
             x = self.attention_block(x)
             attn_weights = None
-        if self.arch_version == 'iterA6_regression':
-            main_pred, aux_pred, info = self._forward_itera6_regression(
+        if self.arch_version == 'iter14_regression':
+            main_pred, aux_pred, info = self._forward_iter14_regression(
                 x,
                 attn_weights,
                 horizon_prior=horizon_prior,
