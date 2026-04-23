@@ -363,7 +363,15 @@ CONSTRAINT_PROFILE_PRESETS = {
         'bear_margin': 0.12,
         'bull_margin': 0.12,
         'reversion_event_margin': 0.12,
-        'continuation_margin': 0.06,
+        'continuation_margin': 0.08,
+    },
+    'iter14_ev_regression': {
+        'enabled': True,
+        'weight': 0.40,
+        'bear_margin': 0.12,
+        'bull_margin': 0.12,
+        'reversion_event_margin': 0.15,
+        'continuation_margin': 0.08,
     },
 }
 
