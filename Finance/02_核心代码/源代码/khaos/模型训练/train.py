@@ -120,6 +120,7 @@ PRECISION_FIRST_SCORE_PROFILES = {
     'iter11_precision_first',
     'iter12_guarded_precision_first',
     'iter12_soft_guarded_precision_first',
+    'iter13_precision_first',
 }
 AUX_GATED_SCORE_PROFILES = {
     'short_t_discovery_guarded_focus',
@@ -199,7 +200,7 @@ def compute_event_oversignal(metrics):
     )
 
 
-def compute_signal_health(signal_frequency, signal_cap, signal_floor=0.01):
+def compute_signal_health(signal_frequency, signal_cap, signal_floor=0.02):
     signal_floor = max(float(signal_floor), 1e-6)
     signal_frequency = max(float(signal_frequency), 0.0)
     if signal_cap is None:
@@ -228,7 +229,8 @@ def compute_threshold_selection_utility(candidate, event_type='generic', score_p
             0.18 * float(candidate.get('recall', 0.0)) +
             0.20 * max(1.0 - float(candidate.get('hard_negative_rate', 0.0)), 0.0) +
             0.12 * norm_space +
-            0.08 * norm_quality
+            0.08 * norm_quality +
+            0.15 * signal_health
         )
         candidate['selection_utility'] = utility
         return utility
@@ -549,13 +551,13 @@ def compute_iter13_structural_components(summary):
     # directional_floor 不再是微小的概率，而是具有实际数值的 EV (通常 > 0.5 才有意义)
     # 不再使用基于标签频率的放大系数，而是直接对 EV 进行软归一化。
     raw_floor_mean = max(float(summary.get('directional_floor_mean', 0.0)), 0.0)
-    raw_event_mean = max(
-        float(summary.get('directional_floor_reversion_event_mean', raw_floor_mean)),
-        0.0,
-    )
-    
-    directional_floor_mean = _clip01(raw_floor_mean / 2.5)
-    directional_floor_event_mean = _clip01(raw_event_mean / 2.5)
+    raw_event_mean = float(summary.get('directional_floor_reversion_event_mean', raw_floor_mean))
+    if raw_event_mean == 0.0:
+        raw_event_mean = raw_floor_mean
+    raw_event_mean = max(raw_event_mean, 0.0)
+
+    directional_floor_mean = _clip01(raw_floor_mean)
+    directional_floor_event_mean = _clip01(raw_event_mean)
     
     directional_support_rate = _clip01(
         summary.get(
