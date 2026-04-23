@@ -121,6 +121,7 @@ PRECISION_FIRST_SCORE_PROFILES = {
     'iter12_guarded_precision_first',
     'iter12_soft_guarded_precision_first',
     'iter13_precision_first',
+    'iter14_precision_first',
 }
 AUX_GATED_SCORE_PROFILES = {
     'short_t_discovery_guarded_focus',
@@ -157,6 +158,13 @@ PRECISION_FIRST_PROFILE_CONFIG = {
         'threshold_grid_max': 0.95,
         'threshold_grid_points': 16,
     },
+    'iter14_precision_first': {
+        'min_precision': 0.0,
+        'max_hard_negative_rate': 1.0,
+        'threshold_grid_min': 0.85, # 适应EV回归，寻找最头部的15%以内的信号
+        'threshold_grid_max': 0.99, # 允许搜寻到前1%的信号 (1%~15%频率)
+        'threshold_grid_points': 20,
+    },
 }
 
 
@@ -167,7 +175,7 @@ def resolve_event_selection_mode(score_profile='default'):
 
 
 def is_soft_iter12_profile(score_profile='default'):
-    return str(score_profile or 'default') in ['iter12_soft_guarded_precision_first', 'iter13_precision_first']
+    return str(score_profile or 'default') in ['iter12_soft_guarded_precision_first', 'iter13_precision_first', 'iter14_precision_first']
 
 
 def resolve_event_oversignal_cap(label_frequency, event_type='generic', score_profile='default'):
@@ -180,7 +188,7 @@ def resolve_event_oversignal_cap(label_frequency, event_type='generic', score_pr
         if event_type == 'breakout':
             return min(label_frequency + 0.02, 0.22)
         return min(label_frequency + 0.02, 0.20)
-    if score_profile in ('iter12_soft_guarded_precision_first', 'iter13_precision_first'):
+    if score_profile in ('iter12_soft_guarded_precision_first', 'iter13_precision_first', 'iter14_precision_first'):
         if event_type == 'reversion':
             return min(max(label_frequency * 1.6, label_frequency + 0.03, 0.03), 0.28)
         if event_type == 'breakout':
@@ -3882,8 +3890,8 @@ if __name__ == "__main__":
     parser.add_argument('--breakout_precision_floor', type=float, default=0.0)
     parser.add_argument('--reversion_precision_floor', type=float, default=0.0)
     parser.add_argument('--gate_mode', type=str, default='soft_annealed', choices=['soft_annealed', 'legacy_hard', 'disabled'])
-    parser.add_argument('--gate_floor_breakout', type=float, default=0.25)
-    parser.add_argument('--gate_floor_reversion', type=float, default=0.35)
+    parser.add_argument('--gate_floor_breakout', type=float, default=0.15)
+    parser.add_argument('--gate_floor_reversion', type=float, default=0.20)
     parser.add_argument('--gate_anneal_fraction', type=float, default=0.40)
     parser.add_argument('--horizon_search_spec', type=str, default=None)
     parser.add_argument('--kill_keep_review_epoch', type=int, default=0)

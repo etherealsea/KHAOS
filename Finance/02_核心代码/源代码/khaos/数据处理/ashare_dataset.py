@@ -186,12 +186,12 @@ def _uses_discovery_targets(dataset_profile):
     return str(dataset_profile or 'iterA2') in {
         'shortT_discovery_v1',
         'shortT_discovery_guarded_v1',
-        'shortT_discovery_guarded_v2',
-    }
-
+    'shortT_discovery_guarded_v2',
+    'iter14_ev_regression',
+}
 
 def _is_guarded_discovery_profile(dataset_profile):
-    return str(dataset_profile or 'iterA2') in {'shortT_discovery_guarded_v1', 'shortT_discovery_guarded_v2'}
+    return str(dataset_profile or 'iterA2') in {'shortT_discovery_guarded_v1', 'shortT_discovery_guarded_v2', 'iter14_ev_regression'}
 
 
 def _resolve_discovery_preset(dataset_profile):
@@ -1198,6 +1198,18 @@ class AshareFinancialDataset(Dataset):
                 0.34 * breakout_hard_negative +
                 0.44 * reversion_hard_negative
             ).astype(np.float32) * trade_profile['sample_weight']
+        elif self.dataset_profile == 'iter14_ev_regression':
+            self.sample_weights = (
+                1.0 +
+                0.88 * np.clip(breakout_target, 0.0, 2.2) +
+                1.00 * np.clip(reversion_target, 0.0, 2.2) +
+                0.34 * np.clip(breakout_aux, 0.0, 2.2) +
+                0.38 * np.clip(reversion_aux, 0.0, 2.2) +
+                0.42 * breakout_event +
+                0.65 * reversion_event +
+                0.34 * breakout_hard_negative +
+                0.55 * reversion_hard_negative
+            ).astype(np.float32) * trade_profile['sample_weight']
         else:
             self.sample_weights = (
                 1.0 +
@@ -1221,7 +1233,7 @@ class AshareFinancialDataset(Dataset):
             reversion_hard_negative=reversion_hard_negative,
             continuation_pressure=continuation_pressure,
         )
-        if self.dataset_profile in {'shortT_discovery_guarded_v1', 'shortT_discovery_guarded_v2'}:
+        if self.dataset_profile in {'shortT_discovery_guarded_v1', 'shortT_discovery_guarded_v2', 'iter14_ev_regression'}:
             self.sample_weights = np.clip(self.sample_weights, 0.70, 8.0).astype(np.float32)
 
         raw_data = np.stack([
@@ -1387,6 +1399,18 @@ class AshareFinancialDataset(Dataset):
                 0.32 * reversion_event.astype(np.float32) +
                 0.20 * breakout_hard_negative.astype(np.float32) +
                 0.30 * reversion_hard_negative.astype(np.float32) +
+                0.22 * continuation_pressure.astype(np.float32)
+            )
+            self.sample_weights = self.sample_weights * timeframe_weight * boundary_penalty * discovery_bias
+        elif self.dataset_profile == 'iter14_ev_regression':
+            timeframe_weight = SHORT_T_DISCOVERY_GUARDED_V2_TIMEFRAME_WEIGHT.get(self.timeframe_label, 1.0)
+            boundary_penalty = _build_shortt_boundary_penalty(df, self.timeframe_label)
+            discovery_bias = (
+                1.0 +
+                0.24 * breakout_event.astype(np.float32) +
+                0.40 * reversion_event.astype(np.float32) +
+                0.22 * breakout_hard_negative.astype(np.float32) +
+                0.40 * reversion_hard_negative.astype(np.float32) +
                 0.22 * continuation_pressure.astype(np.float32)
             )
             self.sample_weights = self.sample_weights * timeframe_weight * boundary_penalty * discovery_bias
