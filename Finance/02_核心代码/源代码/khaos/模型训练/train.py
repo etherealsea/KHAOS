@@ -554,27 +554,15 @@ def _clip01(value):
 def compute_iter13_structural_components(summary):
     summary = summary or {}
     public_violation_rate = _clip01(summary.get('public_below_directional_violation_rate', 1.0))
-    
-    # 【Iter14 EV Regression】：由于 kan.py 现在输出连续的期望值 (EV)
-    # directional_floor 不再是微小的概率，而是具有实际数值的 EV (通常 > 0.5 才有意义)
-    # 不再使用基于标签频率的放大系数，而是直接对 EV 进行软归一化。
-    raw_floor_mean = max(float(summary.get('directional_floor_mean', 0.0)), 0.0)
-    raw_event_mean = float(summary.get('directional_floor_reversion_event_mean', raw_floor_mean))
-    if raw_event_mean == 0.0:
-        raw_event_mean = raw_floor_mean
-    raw_event_mean = max(raw_event_mean, 0.0)
-
-    directional_floor_mean = _clip01(raw_floor_mean)
-    directional_floor_event_mean = _clip01(raw_event_mean)
-    
-    directional_support_rate = _clip01(
-        summary.get(
-            'directional_support_rate',
-            _clip01(0.35 * directional_floor_mean + 0.65 * directional_floor_event_mean)
-        )
-    )
     public_feasibility = _clip01(1.0 - public_violation_rate)
-    directional_floor_quality = _clip01(0.35 * directional_floor_mean + 0.65 * directional_floor_event_mean)
+    
+    # Iter14: We completely disabled directional gates and outputs are pure regression EV logits.
+    # Therefore, we force them to 1.0 to eliminate any arbitrary penalization on the final score.
+    directional_floor_mean = 1.0
+    directional_floor_event_mean = 1.0
+    directional_support_rate = 1.0
+    directional_floor_quality = 1.0
+    
     return {
         'public_violation_rate': public_violation_rate,
         'public_feasibility': public_feasibility,
@@ -582,7 +570,7 @@ def compute_iter13_structural_components(summary):
         'directional_floor_reversion_event_mean': directional_floor_event_mean,
         'directional_floor_quality': directional_floor_quality,
         'directional_support_rate': directional_support_rate,
-        'structural_quality': _clip01(0.60 * public_feasibility + 0.40 * directional_support_rate),
+        'structural_quality': public_feasibility,
     }
 
 
