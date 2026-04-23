@@ -9,8 +9,8 @@ from typing import Optional
 
 
 DEFAULT_ASSETS = "BTCUSD,ETHUSD,ESUSD,SPXUSD,EURUSD,UDXUSD,WTIUSD,XAUUSD"
-DEFAULT_TIMEFRAMES = "5m,15m,60m,240m,1d"
-DEFAULT_SCORE_TIMEFRAMES = "5m,15m,60m,240m,1d"
+DEFAULT_TIMEFRAMES = "5m,15m,60m,240m"
+DEFAULT_SCORE_TIMEFRAMES = "5m,15m,60m,240m"
 DEFAULT_AUX_TIMEFRAMES = ""
 DEFAULT_SPLIT_SCHEME = "rolling_recent_v1"
 DEFAULT_SPLIT_LABELS = "fold_1,fold_2,fold_3,fold_4"
@@ -38,7 +38,7 @@ SMOKE_PRESET = {
     "loss_profile": "iter14_ev_regression",
     "constraint_profile": "iter14_ev_regression",
     "score_profile": "iter14_precision_first",
-    "score_timeframes": "5m,15m,60m,240m,1d",
+    "score_timeframes": "5m,15m,60m,240m",
     "aux_timeframes": "",
     "split_scheme": "split_by_month",
     "split_labels": "val,train",

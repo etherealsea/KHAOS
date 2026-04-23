@@ -162,8 +162,8 @@ PRECISION_FIRST_PROFILE_CONFIG = {
         'min_precision': 0.0,
         'max_hard_negative_rate': 1.0,
         'threshold_grid_min': 0.85, # 适应EV回归，寻找最头部的15%以内的信号
-        'threshold_grid_max': 0.999, # 放宽到最极端的 0.1%，让稀疏的 Reversion 有机会达到 2% 频率
-        'threshold_grid_points': 30, # 提升搜索粒度
+        'threshold_grid_max': 0.9995, # 放宽到最极端的 0.05%，让稀疏的 Reversion 有机会达到合理的频率
+        'threshold_grid_points': 40, # 提升搜索粒度
     },
 }
 
