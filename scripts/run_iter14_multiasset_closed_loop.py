@@ -30,7 +30,7 @@ ITER12_SMOKE_CAPS = {
 }
 SMOKE_PRESET = {
     "run_label": "smoke",
-    "epochs_total": 5,
+    "epochs_total": 20,
     "chunk_size": 2,
     "batch_size": 256,
     "arch_version": "iter14_regression",
