@@ -86,6 +86,16 @@ def _tail_zero(*arrays, forecast_horizon):
         array[-forecast_horizon:] = 0.0
     return arrays
 
+
+def _sigmoid_np(values):
+    values = np.asarray(values, dtype=np.float32)
+    return (1.0 / (1.0 + np.exp(-np.clip(values, -20.0, 20.0)))).astype(np.float32)
+
+
+def _future_step_returns(future_path):
+    zeros = np.zeros((future_path.shape[0], 1), dtype=np.float32)
+    return np.diff(future_path, axis=1, prepend=zeros)
+
 def get_breakout_event_config(forecast_horizon):
     horizon_ratio = np.clip((float(forecast_horizon) - 4.0) / 6.0, 0.0, 1.0)
     return {
@@ -276,7 +286,84 @@ def _compute_breakout_discovery_components(log_close, log_high, log_low, returns
     }
 
 
+def _compute_breakout_event_first_components(log_close, log_high, log_low, returns, sigma, entropy, forecast_horizon):
+    future_path = build_future_path(log_close, forecast_horizon)
+    future_step_returns = _future_step_returns(future_path)
+    sigma_safe = sigma + 1e-8
+    future_high_path = np.stack(
+        [np.roll(log_high, -step) for step in range(1, forecast_horizon + 1)],
+        axis=1,
+    ).astype(np.float32)
+    future_low_path = np.stack(
+        [np.roll(log_low, -step) for step in range(1, forecast_horizon + 1)],
+        axis=1,
+    ).astype(np.float32)
+    for step in range(1, forecast_horizon + 1):
+        future_high_path[-step:, step - 1] = log_high[-step:]
+        future_low_path[-step:, step - 1] = log_low[-step:]
+
+    future_abs_move = np.max(np.abs(future_path), axis=1)
+    future_range = np.max(future_high_path, axis=1) - np.min(future_low_path, axis=1)
+    terminal_abs = np.abs(future_path[:, -1])
+    retrace_norm = np.maximum(future_abs_move - terminal_abs, 0.0) / sigma_safe
+    rv_norm = np.sqrt(np.sum(np.square(future_step_returns), axis=1)) / sigma_safe
+    range_norm = future_range / sigma_safe
+    disp_norm = future_abs_move / sigma_safe
+    path_efficiency = terminal_abs / (future_abs_move + 1e-8)
+    pulse_share = np.max(np.abs(future_step_returns), axis=1) / (
+        np.sum(np.abs(future_step_returns), axis=1) + 1e-8
+    )
+
+    eventness_logit = (
+        0.90 * np.log1p(np.maximum(rv_norm, 0.0)) +
+        0.75 * np.log1p(np.maximum(range_norm, 0.0)) +
+        0.65 * np.log1p(np.maximum(disp_norm, 0.0)) +
+        0.25 * path_efficiency -
+        0.80 * np.log1p(np.maximum(retrace_norm, 0.0)) -
+        0.45 * pulse_share -
+        0.60
+    )
+    eventness = _sigmoid_np(eventness_logit)
+    quality = (
+        disp_norm -
+        0.85 * retrace_norm -
+        0.35 * pulse_share
+    ).astype(np.float32)
+    score = (eventness * quality).astype(np.float32)
+
+    return {
+        'eventness': eventness,
+        'quality': np.clip(quality, -10.0, 10.0).astype(np.float32),
+        'score': np.clip(score, -10.0, 10.0).astype(np.float32),
+        'rv_norm': rv_norm.astype(np.float32),
+        'range_norm': range_norm.astype(np.float32),
+        'disp_norm': disp_norm.astype(np.float32),
+        'retrace_norm': retrace_norm.astype(np.float32),
+        'pulse_share': pulse_share.astype(np.float32),
+        'path_efficiency': path_efficiency.astype(np.float32),
+    }
+
+
 def fit_breakout_discovery_thresholds(log_close, log_high, log_low, returns, sigma, entropy, forecast_horizon, preset='default'):
+    if preset == 'iter15_event_first':
+        components = _compute_breakout_event_first_components(
+            log_close,
+            log_high,
+            log_low,
+            returns,
+            sigma,
+            entropy,
+            forecast_horizon,
+        )
+        valid_eventness = _valid_prefix(components['eventness'], forecast_horizon)
+        valid_score = _valid_prefix(components['score'], forecast_horizon)
+        valid_retrace = _valid_prefix(components['retrace_norm'], forecast_horizon)
+        return {
+            'event_prob_threshold': _robust_quantile(valid_eventness, 0.88, floor=0.55),
+            'event_target_threshold': _robust_quantile(valid_score, 0.86, floor=0.10),
+            'hard_negative_target_threshold': _robust_quantile(valid_score, 0.35, floor=-2.0),
+            'hard_negative_mae_threshold': _robust_quantile(valid_retrace, 0.75, floor=0.25),
+        }
     components = _compute_breakout_discovery_components(
         log_close,
         log_high,
@@ -289,8 +376,6 @@ def fit_breakout_discovery_thresholds(log_close, log_high, log_low, returns, sig
     target_key = 'target_guarded_v1' if preset == 'guarded_v1' else 'target_default'
     valid_target = _valid_prefix(components[target_key], forecast_horizon)
     valid_mae = _valid_prefix(components['mae_norm'], forecast_horizon)
-    
-    # For Iter14 EV Regression, we don't strictly need these to clip at 0.5 anymore
     return {
         'event_target_threshold': _robust_quantile(valid_target, 0.95, floor=-2.0),
         'hard_negative_target_threshold': _robust_quantile(valid_target, 0.30, floor=-5.0),
@@ -309,6 +394,62 @@ def build_breakout_discovery_targets(
     threshold_config=None,
     preset='default',
 ):
+    if preset == 'iter15_event_first':
+        components = _compute_breakout_event_first_components(
+            log_close,
+            log_high,
+            log_low,
+            returns,
+            sigma,
+            entropy,
+            forecast_horizon,
+        )
+        breakout_target = components['score'].copy()
+        breakout_aux = components['quality'].copy()
+        eventness = components['eventness']
+        retrace_norm = components['retrace_norm']
+        pulse_share = components['pulse_share']
+        threshold_cfg = dict(
+            threshold_config or fit_breakout_discovery_thresholds(
+                log_close,
+                log_high,
+                log_low,
+                returns,
+                sigma,
+                entropy,
+                forecast_horizon,
+                preset=preset,
+            )
+        )
+        event_prob_threshold = float(threshold_cfg.get('event_prob_threshold', 0.55))
+        event_target_threshold = float(threshold_cfg['event_target_threshold'])
+        hn_target_threshold = float(threshold_cfg['hard_negative_target_threshold'])
+        hn_retrace_threshold = float(threshold_cfg['hard_negative_mae_threshold'])
+        breakout_event = (
+            (eventness >= event_prob_threshold) &
+            (breakout_target >= event_target_threshold)
+        ).astype(np.float32)
+        breakout_hard_negative = (
+            (eventness >= max(event_prob_threshold - 0.10, 0.45)) &
+            (
+                (breakout_target <= hn_target_threshold) |
+                (retrace_norm >= hn_retrace_threshold) |
+                (pulse_share >= 0.70)
+            )
+        ).astype(np.float32)
+        _tail_zero(
+            breakout_target,
+            breakout_aux,
+            breakout_event,
+            breakout_hard_negative,
+            forecast_horizon=forecast_horizon,
+        )
+        return (
+            np.clip(breakout_target, -10.0, 10.0).astype(np.float32),
+            np.clip(breakout_aux, -10.0, 10.0).astype(np.float32),
+            breakout_event,
+            breakout_hard_negative,
+        )
     components = _compute_breakout_discovery_components(
         log_close,
         log_high,
@@ -342,7 +483,7 @@ def build_breakout_discovery_targets(
 
     breakout_event = (breakout_target >= event_target_threshold).astype(np.float32)
     breakout_hard_negative = (
-        (mae_norm >= hn_mae_threshold) & 
+        (mae_norm >= hn_mae_threshold) &
         (breakout_target <= hn_target_threshold)
     ).astype(np.float32)
 
@@ -399,7 +540,74 @@ def _compute_reversion_discovery_components(log_close, ema20, sigma, entropy, hu
     }
 
 
+def _compute_reversion_event_first_components(log_close, ema20, sigma, entropy, hurst, forecast_horizon):
+    sigma_safe = sigma + 1e-8
+    log_ema20 = np.log(np.maximum(ema20, 1e-8))
+    ekf_track = compute_ekf_track(log_close)
+    ekf_residual = log_close - ekf_track
+    ema_gap = log_close - log_ema20
+    res_score = ekf_residual / sigma_safe
+    ema_score = ema_gap / sigma_safe
+    stretch = res_score + ema_score
+    stretch_sign = np.sign(stretch).astype(np.float32)
+    stretch_sign[stretch_sign == 0] = 1.0
+    stretch_alignment = np.abs(stretch) / (np.abs(res_score) + np.abs(ema_score) + 1e-6)
+    stretch_strength = np.maximum(np.abs(res_score) + np.abs(ema_score) - 1.0, 0.0)
+
+    future_path = build_future_path(log_close, forecast_horizon)
+    signed_future = future_path * stretch_sign[:, None]
+    counter_move = np.maximum(-signed_future, 0.0).max(axis=1) / sigma_safe
+    continuation_move = np.maximum(signed_future, 0.0).max(axis=1) / sigma_safe
+    terminal_counter = np.maximum(-(stretch_sign * future_path[:, -1]), 0.0) / sigma_safe
+
+    eventness_logit = (
+        0.95 * np.log1p(np.maximum(counter_move, 0.0)) +
+        0.55 * np.log1p(np.maximum(terminal_counter, 0.0)) +
+        0.30 * np.clip(stretch_alignment, 0.0, 2.0) +
+        0.25 * np.log1p(np.maximum(stretch_strength, 0.0)) -
+        0.90 * np.log1p(np.maximum(continuation_move, 0.0)) -
+        0.55
+    )
+    eventness = _sigmoid_np(eventness_logit)
+    quality = (
+        counter_move +
+        0.55 * terminal_counter -
+        0.95 * continuation_move
+    ).astype(np.float32)
+    score = (eventness * quality).astype(np.float32)
+
+    return {
+        'eventness': eventness,
+        'quality': np.clip(quality, -10.0, 10.0).astype(np.float32),
+        'score': np.clip(score, -10.0, 10.0).astype(np.float32),
+        'counter_move': counter_move.astype(np.float32),
+        'continuation_move': continuation_move.astype(np.float32),
+        'terminal_counter': terminal_counter.astype(np.float32),
+        'stretch_alignment': stretch_alignment.astype(np.float32),
+        'stretch_strength': stretch_strength.astype(np.float32),
+        'stretch_sign': stretch_sign.astype(np.float32),
+    }
+
+
 def fit_reversion_discovery_thresholds(log_close, ema20, sigma, entropy, hurst, forecast_horizon, preset='default'):
+    if preset == 'iter15_event_first':
+        components = _compute_reversion_event_first_components(
+            log_close,
+            ema20,
+            sigma,
+            entropy,
+            hurst,
+            forecast_horizon,
+        )
+        valid_eventness = _valid_prefix(components['eventness'], forecast_horizon)
+        valid_score = _valid_prefix(components['score'], forecast_horizon)
+        valid_continuation = _valid_prefix(components['continuation_move'], forecast_horizon)
+        return {
+            'event_prob_threshold': _robust_quantile(valid_eventness, 0.87, floor=0.54),
+            'event_target_threshold': _robust_quantile(valid_score, 0.84, floor=0.08),
+            'hard_negative_target_threshold': _robust_quantile(valid_score, 0.35, floor=-2.0),
+            'hard_negative_mae_threshold': _robust_quantile(valid_continuation, 0.72, floor=0.25),
+        }
     components = _compute_reversion_discovery_components(
         log_close,
         ema20,
@@ -411,8 +619,6 @@ def fit_reversion_discovery_thresholds(log_close, ema20, sigma, entropy, hurst, 
     target_key = 'target_guarded_v1' if preset == 'guarded_v1' else 'target_default'
     valid_target = _valid_prefix(components[target_key], forecast_horizon)
     valid_mae = _valid_prefix(components['mae_norm'], forecast_horizon)
-    
-    # For Iter14 EV Regression, we don't strictly need these to clip at 0.5 anymore
     return {
         'event_target_threshold': _robust_quantile(valid_target, 0.95, floor=-2.0),
         'hard_negative_target_threshold': _robust_quantile(valid_target, 0.30, floor=-5.0),
@@ -430,6 +636,58 @@ def build_reversion_discovery_targets(
     threshold_config=None,
     preset='default',
 ):
+    if preset == 'iter15_event_first':
+        components = _compute_reversion_event_first_components(
+            log_close,
+            ema20,
+            sigma,
+            entropy,
+            hurst,
+            forecast_horizon,
+        )
+        target = components['score'].copy()
+        aux_target = components['quality'].copy()
+        eventness = components['eventness']
+        continuation_move = components['continuation_move']
+        threshold_cfg = dict(
+            threshold_config or fit_reversion_discovery_thresholds(
+                log_close,
+                ema20,
+                sigma,
+                entropy,
+                hurst,
+                forecast_horizon,
+                preset=preset,
+            )
+        )
+        event_prob_threshold = float(threshold_cfg.get('event_prob_threshold', 0.54))
+        event_target_threshold = float(threshold_cfg['event_target_threshold'])
+        hn_target_threshold = float(threshold_cfg['hard_negative_target_threshold'])
+        hn_continuation_threshold = float(threshold_cfg['hard_negative_mae_threshold'])
+        reversion_event = (
+            (eventness >= event_prob_threshold) &
+            (target >= event_target_threshold)
+        ).astype(np.float32)
+        reversion_hard_negative = (
+            (eventness >= max(event_prob_threshold - 0.10, 0.44)) &
+            (
+                (target <= hn_target_threshold) |
+                (continuation_move >= hn_continuation_threshold)
+            )
+        ).astype(np.float32)
+        _tail_zero(
+            target,
+            aux_target,
+            reversion_event,
+            reversion_hard_negative,
+            forecast_horizon=forecast_horizon,
+        )
+        return (
+            np.clip(target, -10.0, 10.0).astype(np.float32),
+            np.clip(aux_target, -10.0, 10.0).astype(np.float32),
+            reversion_event,
+            reversion_hard_negative,
+        )
     components = _compute_reversion_discovery_components(
         log_close,
         ema20,
@@ -461,7 +719,7 @@ def build_reversion_discovery_targets(
 
     reversion_event = (target >= event_target_threshold).astype(np.float32)
     reversion_hard_negative = (
-        (mae_norm >= hn_mae_threshold) & 
+        (mae_norm >= hn_mae_threshold) &
         (target <= hn_target_threshold)
     ).astype(np.float32)
 

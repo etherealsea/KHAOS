@@ -289,6 +289,34 @@ class KHAOS_KAN(nn.Module):
                     nn.GELU(),
                     nn.Linear(hidden_dim, self.horizon_count),
                 )
+        elif self.arch_version == 'iter15_event_first':
+            self.global_pool = AttentionPool(self.d_model)
+            self.mid_pool = AttentionPool(self.d_model)
+            self.short_pool = AttentionPool(self.d_model)
+            merged_dim = self.d_model * 3
+            self.breakout_event_head = KANHead(
+                merged_dim, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
+            self.breakout_quality_head = KANHead(
+                merged_dim, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
+            self.reversion_event_head = KANHead(
+                merged_dim, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
+            self.reversion_quality_head = KANHead(
+                merged_dim, hidden_dim, head_depth, grid_size, output_dim=self.horizon_count
+            )
+            if self.horizon_count > 1:
+                self.breakout_horizon_head = nn.Sequential(
+                    nn.Linear(merged_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.horizon_count),
+                )
+                self.reversion_horizon_head = nn.Sequential(
+                    nn.Linear(merged_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, self.horizon_count),
+                )
         elif self.arch_version in self.multiscale_versions:
             self.global_pool = AttentionPool(self.d_model)
             self.mid_pool = AttentionPool(self.d_model)
@@ -656,6 +684,136 @@ class KHAOS_KAN(nn.Module):
         info.update(horizon_info)
         return main_pred, aux_pred, info
 
+    def _forward_iter15_event_first(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
+        batch_size = x.size(0)
+        global_state, global_weights = self.global_pool(x)
+
+        mid_len = min(20, x.size(1))
+        mid_x = x[:, -mid_len:, :]
+        mid_state, mid_weights = self.mid_pool(mid_x)
+
+        short_len = min(5, x.size(1))
+        short_x = x[:, -short_len:, :]
+        short_state, short_weights = self.short_pool(short_x)
+
+        merged_state = torch.cat([global_state, mid_state, short_state], dim=1)
+        device = merged_state.device
+        dtype = merged_state.dtype
+
+        breakout_event_logits = self.breakout_event_head(merged_state)
+        reversion_event_logits = self.reversion_event_head(merged_state)
+        breakout_quality = 6.0 * torch.tanh(self.breakout_quality_head(merged_state) / 4.0)
+        reversion_quality = 6.0 * torch.tanh(self.reversion_quality_head(merged_state) / 4.0)
+
+        breakout_horizon_logits = torch.zeros(batch_size, self.horizon_count, device=device, dtype=dtype)
+        reversion_horizon_logits = torch.zeros(batch_size, self.horizon_count, device=device, dtype=dtype)
+        if self.horizon_count > 1:
+            breakout_horizon_logits = self.breakout_horizon_head(merged_state)
+            reversion_horizon_logits = self.reversion_horizon_head(merged_state)
+
+        prior = self._resolve_horizon_prior(horizon_prior, batch_size, device, dtype)
+        if valid_horizon_mask is not None:
+            valid_mask = valid_horizon_mask.to(device=device, dtype=dtype)
+            if valid_mask.dim() == 1:
+                valid_mask = valid_mask.unsqueeze(0).expand(batch_size, -1)
+            invalid_fill = torch.finfo(dtype).min
+            breakout_horizon_logits = breakout_horizon_logits.masked_fill(valid_mask <= 0.5, invalid_fill)
+            reversion_horizon_logits = reversion_horizon_logits.masked_fill(valid_mask <= 0.5, invalid_fill)
+        else:
+            valid_mask = None
+
+        if self.horizon_count <= 1:
+            breakout_horizon_weights = torch.ones(batch_size, self.horizon_count, device=device, dtype=dtype)
+            reversion_horizon_weights = torch.ones(batch_size, self.horizon_count, device=device, dtype=dtype)
+        elif family_mode == 'single_cycle' and prior is not None:
+            breakout_horizon_weights = prior[:, 0, :]
+            reversion_horizon_weights = prior[:, 1, :]
+        else:
+            breakout_horizon_weights = torch.softmax(breakout_horizon_logits, dim=-1)
+            reversion_horizon_weights = torch.softmax(reversion_horizon_logits, dim=-1)
+
+        breakout_event_prob = torch.sigmoid(breakout_event_logits)
+        reversion_event_prob = torch.sigmoid(reversion_event_logits)
+        breakout_event_score_h = breakout_event_prob * breakout_quality
+        reversion_event_score_h = reversion_event_prob * reversion_quality
+
+        # Iter15: expose aggregated event probability as the main output and keep
+        # quality as the auxiliary output. This avoids collapsing the observable
+        # signal to near-zero simply because quality is signed.
+        breakout_pred = torch.sum(breakout_horizon_weights * breakout_event_prob, dim=-1)
+        reversion_pred = torch.sum(reversion_horizon_weights * reversion_event_prob, dim=-1)
+        breakout_aux = torch.sum(breakout_horizon_weights * breakout_quality, dim=-1)
+        reversion_aux = torch.sum(reversion_horizon_weights * reversion_quality, dim=-1)
+        main_pred = torch.stack([breakout_pred, reversion_pred], dim=1)
+        aux_pred = torch.stack([breakout_aux, reversion_aux], dim=1)
+
+        breakout_selected = torch.argmax(breakout_horizon_weights, dim=-1).to(dtype=dtype)
+        reversion_selected = torch.argmax(reversion_horizon_weights, dim=-1).to(dtype=dtype)
+        breakout_selected_value = torch.gather(
+            breakout_event_score_h,
+            1,
+            breakout_selected.long().unsqueeze(1),
+        ).squeeze(1)
+        reversion_selected_value = torch.gather(
+            reversion_event_score_h,
+            1,
+            reversion_selected.long().unsqueeze(1),
+        ).squeeze(1)
+        entropy_breakout = (-breakout_horizon_weights.clamp_min(1e-8).log() * breakout_horizon_weights).sum(dim=-1)
+        entropy_reversion = (-reversion_horizon_weights.clamp_min(1e-8).log() * reversion_horizon_weights).sum(dim=-1)
+        info = {
+            'attn': attn_weights,
+            'global_pool': global_weights,
+            'mid_pool': mid_weights,
+            'short_pool': short_weights,
+            'event_logits_by_horizon': torch.stack([breakout_event_logits, reversion_event_logits], dim=1),
+            'event_prob_by_horizon': torch.stack([breakout_event_prob, reversion_event_prob], dim=1),
+            'quality_by_horizon': torch.stack([breakout_quality, reversion_quality], dim=1),
+            'event_score_by_horizon': torch.stack([breakout_event_score_h, reversion_event_score_h], dim=1),
+            'horizon_logits': torch.stack([breakout_horizon_logits, reversion_horizon_logits], dim=1),
+            'horizon_weights': torch.stack([breakout_horizon_weights, reversion_horizon_weights], dim=1),
+            'breakout_horizon_weights': breakout_horizon_weights,
+            'reversion_horizon_weights': reversion_horizon_weights,
+            'breakout_horizon_logits': breakout_horizon_logits,
+            'reversion_horizon_logits': reversion_horizon_logits,
+            'breakout_event_prob': torch.sum(breakout_horizon_weights * breakout_event_prob, dim=-1),
+            'reversion_event_prob': torch.sum(reversion_horizon_weights * reversion_event_prob, dim=-1),
+            'selected_horizon_breakout': breakout_selected,
+            'selected_horizon_reversion': reversion_selected,
+            'selected_horizon_breakout_value': breakout_selected_value,
+            'selected_horizon_reversion_value': reversion_selected_value,
+            'horizon_entropy_breakout': entropy_breakout,
+            'horizon_entropy_reversion': entropy_reversion,
+            'direction_gate': torch.full((batch_size,), 0.5, device=device, dtype=dtype),
+            'compression_gate': torch.ones(batch_size, 1, device=device, dtype=dtype),
+            'directional_gate': torch.ones(batch_size, self.horizon_count, device=device, dtype=dtype),
+            'gate_floor_hit': torch.zeros(batch_size, self.horizon_count, device=device, dtype=dtype),
+            'public_reversion_gate': torch.zeros(batch_size, device=device, dtype=dtype),
+            'breakout_residual_gate': torch.zeros(batch_size, device=device, dtype=dtype),
+            'bear_score': torch.zeros(batch_size, 2, self.horizon_count, device=device, dtype=dtype),
+            'bull_score': torch.zeros(batch_size, 2, self.horizon_count, device=device, dtype=dtype),
+            'public_reversion_score': torch.stack([breakout_event_score_h, reversion_event_score_h], dim=1),
+            'directional_reversion': torch.stack([breakout_event_score_h, reversion_event_score_h], dim=1),
+            'directional_floor': torch.zeros(batch_size, 2, self.horizon_count, device=device, dtype=dtype),
+            'direction_gate_mean': torch.tensor(0.5, device=device, dtype=dtype),
+            'direction_gate_std': torch.tensor(0.0, device=device, dtype=dtype),
+            'public_reversion_gate_mean': torch.tensor(0.0, device=device, dtype=dtype),
+            'public_reversion_gate_std': torch.tensor(0.0, device=device, dtype=dtype),
+            'breakout_residual_gate_mean': torch.tensor(0.0, device=device, dtype=dtype),
+            'breakout_residual_gate_std': torch.tensor(0.0, device=device, dtype=dtype),
+            'compression_gate_mean': torch.tensor(1.0, device=device, dtype=dtype),
+            'compression_gate_std': torch.tensor(0.0, device=device, dtype=dtype),
+            'directional_gate_mean': torch.tensor(1.0, device=device, dtype=dtype),
+            'directional_gate_std': torch.tensor(0.0, device=device, dtype=dtype),
+            'gate_floor_hit_rate': torch.tensor(0.0, device=device, dtype=dtype),
+            'directional_floor_mean': torch.tensor(0.0, device=device, dtype=dtype),
+            'transition_context_score': torch.sum(breakout_horizon_weights * breakout_event_prob, dim=-1),
+            'reversion_context_score': torch.sum(reversion_horizon_weights * reversion_event_prob, dim=-1),
+        }
+        if valid_mask is not None:
+            info['valid_horizon_mask'] = valid_mask
+        return main_pred, aux_pred, info
+
     def _forward_itera3(self, x, attn_weights, horizon_prior=None, family_mode=None, valid_horizon_mask=None):
         batch_size = x.size(0)
         last_state = x[:, -1, :]
@@ -847,6 +1005,14 @@ class KHAOS_KAN(nn.Module):
                 family_mode=family_mode,
                 valid_horizon_mask=valid_horizon_mask,
             )
+        elif self.arch_version == 'iter15_event_first':
+            main_pred, aux_pred, info = self._forward_iter15_event_first(
+                x,
+                attn_weights,
+                horizon_prior=horizon_prior,
+                family_mode=family_mode,
+                valid_horizon_mask=valid_horizon_mask,
+            )
         elif self.arch_version in self.multiscale_versions:
             main_pred, aux_pred, info = self._forward_itera3(
                 x,
@@ -872,6 +1038,12 @@ class KHAOS_KAN(nn.Module):
         return main_pred
 
     def get_regularization_loss(self, regularize_activation=1.0, regularize_entropy=1.0):
+        if self.arch_version == 'iter15_event_first':
+            reg_loss = self.breakout_event_head.regularization_loss(regularize_activation, regularize_entropy)
+            reg_loss += self.breakout_quality_head.regularization_loss(regularize_activation, regularize_entropy)
+            reg_loss += self.reversion_event_head.regularization_loss(regularize_activation, regularize_entropy)
+            reg_loss += self.reversion_quality_head.regularization_loss(regularize_activation, regularize_entropy)
+            return reg_loss
         reg_loss = self.breakout_head.regularization_loss(regularize_activation, regularize_entropy)
         if self.arch_version in self.multiscale_versions:
             reg_loss += self.bear_reversion_head.regularization_loss(regularize_activation, regularize_entropy)

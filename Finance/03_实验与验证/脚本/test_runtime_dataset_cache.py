@@ -1,3 +1,4 @@
+import json
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,6 +54,8 @@ SHORT_T_DISCOVERY_GUARDED_V2_TIMEFRAME_WEIGHT = DATASET_MODULE.SHORT_T_DISCOVERY
 SHORT_T_PRECISION_V2_TIMEFRAME_WEIGHT = DATASET_MODULE.SHORT_T_PRECISION_V2_TIMEFRAME_WEIGHT
 build_runtime_dataset_cache_path = TRAIN_MODULE.build_runtime_dataset_cache_path
 create_market_datasets = TRAIN_MODULE.create_market_datasets
+update_horizon_registry = TRAIN_MODULE.update_horizon_registry
+write_horizon_summary_artifact = TRAIN_MODULE.write_horizon_summary_artifact
 
 
 def make_ashare_frame(rows=220, freq='D'):
@@ -348,6 +351,111 @@ class RuntimeDatasetCacheTests(unittest.TestCase):
                         self.assertTrue(torch.equal(sample_1[idx][key], sample_2[idx][key]), msg=key)
                 else:
                     self.assertTrue(torch.equal(sample_1[idx], sample_2[idx]), msg=f'payload_{idx}')
+
+    def test_split_by_month_market_datasets_expose_horizon_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            csv_path = tmp_path / '000001_1d.csv'
+            make_ashare_frame(rows=420, freq='D').to_csv(csv_path, index=False)
+
+            args = SimpleNamespace(
+                market='legacy_multiasset',
+                save_dir=str(tmp_path / 'weights'),
+                dataset_cache_dir=None,
+                disable_dataset_cache=True,
+                window_size=20,
+                horizon=10,
+                train_end=None,
+                val_end=None,
+                test_start=None,
+                fast_full=False,
+                dataset_profile='iter15_event_first',
+                split_scheme='split_by_month',
+                split_label=None,
+                horizon_search_spec='3,5,8,13,20',
+                horizon_family_mode='adaptive_resonance',
+                config_fingerprint='split-by-month-horizon-test',
+            )
+            record = {
+                'path': str(csv_path),
+                'asset_code': '000001',
+                'timeframe': '1d',
+            }
+
+            train_ds, val_ds, test_ds, metadata = create_market_datasets(
+                record,
+                args,
+                global_horizon_grid=[3, 5, 8, 13, 20],
+            )
+
+            self.assertIsNotNone(train_ds)
+            self.assertTrue(val_ds is not None or test_ds is not None)
+            self.assertEqual(metadata['asset_code'], '000001')
+            self.assertEqual(metadata['timeframe'], '1d')
+            self.assertEqual(metadata['split_label'], 'split_by_month')
+            self.assertEqual(metadata['candidate_horizons'], [3, 5, 8, 13, 20])
+            self.assertEqual(metadata['global_horizon_grid'], [3, 5, 8, 13, 20])
+            self.assertEqual(metadata['horizon_family_mode'], 'adaptive_resonance')
+            self.assertIn('horizon_profile', metadata)
+            self.assertEqual(
+                sorted(metadata['horizon_profile']['task_stats'].keys()),
+                ['breakout', 'reversion'],
+            )
+
+    def test_horizon_summary_artifact_becomes_active_when_registry_receives_split_by_month_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            csv_path = tmp_path / '000001_1d.csv'
+            make_ashare_frame(rows=420, freq='D').to_csv(csv_path, index=False)
+
+            args = SimpleNamespace(
+                market='legacy_multiasset',
+                save_dir=str(tmp_path / 'weights'),
+                dataset_cache_dir=None,
+                disable_dataset_cache=True,
+                window_size=20,
+                horizon=10,
+                train_end=None,
+                val_end=None,
+                test_start=None,
+                fast_full=False,
+                dataset_profile='iter15_event_first',
+                split_scheme='split_by_month',
+                split_label=None,
+                horizon_search_spec='3,5,8,13,20',
+                horizon_family_mode='adaptive_resonance',
+                config_fingerprint='horizon-summary-test',
+            )
+            record = {
+                'path': str(csv_path),
+                'asset_code': '000001',
+                'timeframe': '1d',
+            }
+
+            _, _, _, metadata = create_market_datasets(
+                record,
+                args,
+                global_horizon_grid=[3, 5, 8, 13, 20],
+            )
+            registry = {}
+            update_horizon_registry(registry, metadata)
+
+            summary_path = tmp_path / 'horizon_discovery_summary.json'
+            summary = write_horizon_summary_artifact(
+                str(summary_path),
+                registry,
+                [3, 5, 8, 13, 20],
+                'unit-test-fingerprint',
+            )
+            payload = json.loads(summary_path.read_text(encoding='utf-8'))
+
+            self.assertTrue(registry)
+            self.assertEqual(payload['status'], 'active')
+            self.assertIsNone(payload['reason'])
+            self.assertEqual(payload['global_horizon_grid'], [3, 5, 8, 13, 20])
+            self.assertTrue(payload['records'])
+            self.assertTrue(payload['summary'])
+            self.assertEqual(summary, payload['summary'])
 
 
 if __name__ == '__main__':

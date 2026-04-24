@@ -186,15 +186,23 @@ def _uses_discovery_targets(dataset_profile):
     return str(dataset_profile or 'iterA2') in {
         'shortT_discovery_v1',
         'shortT_discovery_guarded_v1',
-    'shortT_discovery_guarded_v2',
-    'iter14_ev_regression',
-}
+        'shortT_discovery_guarded_v2',
+        'iter14_ev_regression',
+        'iter15_event_first',
+    }
 
 def _is_guarded_discovery_profile(dataset_profile):
-    return str(dataset_profile or 'iterA2') in {'shortT_discovery_guarded_v1', 'shortT_discovery_guarded_v2', 'iter14_ev_regression'}
+    return str(dataset_profile or 'iterA2') in {
+        'shortT_discovery_guarded_v1',
+        'shortT_discovery_guarded_v2',
+        'iter14_ev_regression',
+        'iter15_event_first',
+    }
 
 
 def _resolve_discovery_preset(dataset_profile):
+    if str(dataset_profile or 'iterA2') == 'iter15_event_first':
+        return 'iter15_event_first'
     return 'guarded_v1' if _is_guarded_discovery_profile(dataset_profile) else 'default'
 
 
@@ -740,23 +748,44 @@ def _collect_horizon_targets(
         reversion_events.append(reversion_event.astype(np.float32))
         reversion_hard_negatives.append(reversion_hard_negative.astype(np.float32))
 
-        breakout_utilities.append(
-            (
-                1.00 * breakout_event +
-                0.35 * breakout_aux -
-                1.20 * breakout_hard_negative -
-                0.30 * trade_profile['trade_block']
-            ).astype(np.float32)
-        )
-        reversion_utilities.append(
-            (
-                1.00 * reversion_event +
-                0.35 * reversion_aux -
-                1.30 * reversion_hard_negative -
-                0.40 * continuation_pressure -
-                0.30 * trade_profile['trade_block']
-            ).astype(np.float32)
-        )
+        if str(dataset_profile or 'iterA2') == 'iter15_event_first':
+            breakout_utilities.append(
+                (
+                    1.10 * breakout_event +
+                    0.60 * np.clip(breakout_target, 0.0, 3.5) +
+                    0.28 * np.clip(breakout_aux, 0.0, 3.5) -
+                    1.25 * breakout_hard_negative -
+                    0.30 * trade_profile['trade_block']
+                ).astype(np.float32)
+            )
+            reversion_utilities.append(
+                (
+                    1.10 * reversion_event +
+                    0.65 * np.clip(reversion_target, 0.0, 3.5) +
+                    0.32 * np.clip(reversion_aux, 0.0, 3.5) -
+                    1.35 * reversion_hard_negative -
+                    0.40 * continuation_pressure -
+                    0.30 * trade_profile['trade_block']
+                ).astype(np.float32)
+            )
+        else:
+            breakout_utilities.append(
+                (
+                    1.00 * breakout_event +
+                    0.35 * breakout_aux -
+                    1.20 * breakout_hard_negative -
+                    0.30 * trade_profile['trade_block']
+                ).astype(np.float32)
+            )
+            reversion_utilities.append(
+                (
+                    1.00 * reversion_event +
+                    0.35 * reversion_aux -
+                    1.30 * reversion_hard_negative -
+                    0.40 * continuation_pressure -
+                    0.30 * trade_profile['trade_block']
+                ).astype(np.float32)
+            )
 
     breakout_targets = np.stack(breakout_targets, axis=1).astype(np.float32)
     breakout_aux_targets = np.stack(breakout_aux_targets, axis=1).astype(np.float32)
@@ -1210,6 +1239,18 @@ class AshareFinancialDataset(Dataset):
                 0.34 * breakout_hard_negative +
                 0.55 * reversion_hard_negative
             ).astype(np.float32) * trade_profile['sample_weight']
+        elif self.dataset_profile == 'iter15_event_first':
+            self.sample_weights = (
+                1.0 +
+                0.55 * np.clip(breakout_target, 0.0, 2.6) +
+                0.60 * np.clip(reversion_target, 0.0, 2.6) +
+                0.22 * np.clip(breakout_aux, 0.0, 2.6) +
+                0.26 * np.clip(reversion_aux, 0.0, 2.6) +
+                0.90 * breakout_event +
+                1.05 * reversion_event +
+                0.10 * breakout_hard_negative +
+                0.14 * reversion_hard_negative
+            ).astype(np.float32) * trade_profile['sample_weight']
         else:
             self.sample_weights = (
                 1.0 +
@@ -1233,7 +1274,12 @@ class AshareFinancialDataset(Dataset):
             reversion_hard_negative=reversion_hard_negative,
             continuation_pressure=continuation_pressure,
         )
-        if self.dataset_profile in {'shortT_discovery_guarded_v1', 'shortT_discovery_guarded_v2', 'iter14_ev_regression'}:
+        if self.dataset_profile in {
+            'shortT_discovery_guarded_v1',
+            'shortT_discovery_guarded_v2',
+            'iter14_ev_regression',
+            'iter15_event_first',
+        }:
             self.sample_weights = np.clip(self.sample_weights, 0.70, 8.0).astype(np.float32)
 
         raw_data = np.stack([
@@ -1414,6 +1460,18 @@ class AshareFinancialDataset(Dataset):
                 0.22 * continuation_pressure.astype(np.float32)
             )
             self.sample_weights = self.sample_weights * timeframe_weight * boundary_penalty * discovery_bias
+        elif self.dataset_profile == 'iter15_event_first':
+            timeframe_weight = SHORT_T_DISCOVERY_GUARDED_V2_TIMEFRAME_WEIGHT.get(self.timeframe_label, 1.0)
+            boundary_penalty = _build_shortt_boundary_penalty(df, self.timeframe_label)
+            discovery_bias = (
+                1.0 +
+                0.28 * breakout_event.astype(np.float32) +
+                0.42 * reversion_event.astype(np.float32) +
+                0.18 * breakout_hard_negative.astype(np.float32) +
+                0.34 * reversion_hard_negative.astype(np.float32) +
+                0.20 * continuation_pressure.astype(np.float32)
+            )
+            self.sample_weights = self.sample_weights * timeframe_weight * boundary_penalty * discovery_bias
 
     def __len__(self):
         return max(0, self._max_start - self.start_index)
@@ -1501,6 +1559,66 @@ def _build_rolling_split_payloads(df, split_label, window_size, horizon_profile)
         split_payloads['val'] = _build_segment(df, int(val_indices[0]), int(val_indices[-1]), window_size)
     if len(test_indices):
         split_payloads['test'] = _build_segment(df, int(test_indices[0]), int(test_indices[-1]), window_size)
+    return split_payloads, config
+
+
+def _build_month_split_payloads(df, window_size, candidate_horizons=None):
+    time_values = pd.to_datetime(df['time'])
+    month_periods = time_values.dt.to_period('M')
+    unique_months = pd.Index(month_periods.unique()).sort_values()
+    max_horizon = max([int(item) for item in (candidate_horizons or [])], default=int(window_size))
+    purge_gap = int(window_size + max(max_horizon, 1))
+
+    if len(unique_months) < 3:
+        total_len = len(df)
+        train_end = max(int(total_len * 0.70) - 1, 0)
+        val_end = max(int(total_len * 0.85) - 1, train_end)
+        split_payloads = {}
+        if total_len > 0:
+            split_payloads['train'] = {'df': df.iloc[:train_end + 1].copy(), 'start_index': 0}
+        if val_end > train_end + purge_gap:
+            split_payloads['val'] = _build_segment(df, train_end + purge_gap + 1, val_end, window_size)
+        if total_len - 1 > val_end + purge_gap:
+            split_payloads['test'] = _build_segment(df, val_end + purge_gap + 1, total_len - 1, window_size)
+        config = {
+            'scheme': 'split_by_month',
+            'fallback': 'fractional',
+            'train_rows': len(split_payloads.get('train', {}).get('df', [])),
+            'val_rows': len(split_payloads.get('val', {}).get('df', [])) if split_payloads.get('val') else 0,
+            'test_rows': len(split_payloads.get('test', {}).get('df', [])) if split_payloads.get('test') else 0,
+        }
+        return split_payloads, config
+
+    val_month = unique_months[-2]
+    test_month = unique_months[-1]
+    train_indices = np.flatnonzero(month_periods < val_month)
+    if len(train_indices) == 0:
+        return {}, {
+            'scheme': 'split_by_month',
+            'val_month': str(val_month),
+            'test_month': str(test_month),
+        }
+
+    raw_val_indices = np.flatnonzero(month_periods == val_month)
+    val_indices = raw_val_indices[raw_val_indices > int(train_indices[-1]) + purge_gap]
+    raw_test_indices = np.flatnonzero(month_periods == test_month)
+    base_test_start = int(val_indices[-1]) if len(val_indices) else int(train_indices[-1])
+    test_indices = raw_test_indices[raw_test_indices > base_test_start + purge_gap]
+
+    split_payloads = {
+        'train': {'df': df.iloc[:train_indices[-1] + 1].copy(), 'start_index': 0},
+    }
+    if len(val_indices):
+        split_payloads['val'] = _build_segment(df, int(val_indices[0]), int(val_indices[-1]), window_size)
+    if len(test_indices):
+        split_payloads['test'] = _build_segment(df, int(test_indices[0]), int(test_indices[-1]), window_size)
+    config = {
+        'scheme': 'split_by_month',
+        'train_end_month': str(unique_months[-3]),
+        'val_month': str(val_month),
+        'test_month': str(test_month),
+        'purge_gap': purge_gap,
+    }
     return split_payloads, config
 
 
@@ -1600,6 +1718,97 @@ def create_ashare_dataset_splits(
                 'profile_thresholds': shared_profile_thresholds,
             }
         )
+        if return_metadata:
+            return datasets, metadata
+        return datasets
+
+    if split_scheme == 'split_by_month':
+        candidate_horizons = global_horizon_grid or build_global_horizon_grid(
+            horizon_search_spec,
+            train_lengths=[len(df)],
+        )
+        split_payloads, resolved_config = _build_month_split_payloads(
+            df=df,
+            window_size=window_size,
+            candidate_horizons=candidate_horizons or [horizon],
+        )
+        datasets = {}
+        shared_profile_thresholds = None
+        train_payload = split_payloads.get('train')
+        horizon_profile = None
+        if train_payload is not None and horizon_search_spec is not None:
+            horizon_profile = discover_horizon_profile(
+                train_df=train_payload['df'],
+                window_size=window_size,
+                timeframe_label=timeframe_label,
+                horizon_search_spec=horizon_search_spec,
+            )
+        if train_payload is not None:
+            train_dataset_kwargs = {
+                'window_size': window_size,
+                'forecast_horizon': max(horizon_profile['candidate_horizons']) if horizon_profile else horizon,
+                'timeframe_label': timeframe_label,
+                'start_index': train_payload['start_index'],
+                'dataset_profile': dataset_profile,
+            }
+            if horizon_profile is not None:
+                train_dataset_kwargs.update(
+                    {
+                        'horizon_search_spec': horizon_search_spec,
+                        'horizon_family_mode': horizon_family_mode,
+                        'horizon_profile': horizon_profile,
+                        'global_horizon_grid': global_horizon_grid,
+                    }
+                )
+            datasets['train'] = AshareFinancialDataset(
+                train_payload['df'],
+                **train_dataset_kwargs,
+            )
+            shared_profile_thresholds = getattr(datasets['train'], 'profile_thresholds', None)
+        for split_name, payload in split_payloads.items():
+            if payload is None or split_name == 'train':
+                continue
+            dataset_kwargs = {
+                'window_size': window_size,
+                'forecast_horizon': max(horizon_profile['candidate_horizons']) if horizon_profile else horizon,
+                'timeframe_label': timeframe_label,
+                'start_index': payload['start_index'],
+                'dataset_profile': dataset_profile,
+                'profile_thresholds': shared_profile_thresholds,
+            }
+            if horizon_profile is not None:
+                dataset_kwargs.update(
+                    {
+                        'horizon_search_spec': horizon_search_spec,
+                        'horizon_family_mode': horizon_family_mode,
+                        'horizon_profile': horizon_profile,
+                        'global_horizon_grid': global_horizon_grid,
+                    }
+                )
+            datasets[split_name] = AshareFinancialDataset(
+                payload['df'],
+                **dataset_kwargs,
+            )
+        metadata.update(
+            {
+                'split_scheme': split_scheme,
+                'split_label': split_label or 'split_by_month',
+                'split_config': resolved_config,
+                'split_rows': {
+                    split_name: len(payload['df']) for split_name, payload in split_payloads.items() if payload is not None
+                },
+                'profile_thresholds': shared_profile_thresholds,
+            }
+        )
+        if horizon_profile is not None:
+            metadata.update(
+                {
+                    'horizon_profile': horizon_profile,
+                    'candidate_horizons': horizon_profile['candidate_horizons'],
+                    'global_horizon_grid': global_horizon_grid or horizon_profile['candidate_horizons'],
+                    'horizon_family_mode': horizon_family_mode,
+                }
+            )
         if return_metadata:
             return datasets, metadata
         return datasets

@@ -224,6 +224,24 @@ LOSS_WEIGHT_PRESETS = {
         'signal_calibration': 0.24,
         'horizon_margin': 0.22,
     },
+    'iter15_event_first': {
+        'main': 1.0,
+        'aux': 0.28,
+        'rank': 0.18,
+        'breakout_event_gap': 0.22,
+        'reversion_event_gap': 0.28,
+        'breakout_hard_negative': 0.12,
+        'reversion_hard_negative': 0.18,
+        'direction_consistency': 0.0,
+        'continuation_suppression': 0.0,
+        'horizon_event': 0.38,
+        'horizon_aux': 0.22,
+        'horizon_align': 0.20,
+        'horizon_hard_negative': 0.20,
+        'horizon_entropy': 0.04,
+        'signal_calibration': 0.12,
+        'horizon_margin': 0.12,
+    },
     'shortT_discovery_guarded_v3': {
         'main': 1.0,
         'aux': 0.32,
@@ -315,6 +333,21 @@ LOSS_CURRICULUM_PRESETS = {
         ),
         'scale_constraint_weight': True,
     },
+    'iter15_event_first': {
+        'warmup_fraction': 0.25,
+        'start_factor': 0.70,
+        'keys': (
+            'breakout_event_gap',
+            'reversion_event_gap',
+            'breakout_hard_negative',
+            'reversion_hard_negative',
+            'horizon_event',
+            'horizon_hard_negative',
+            'horizon_margin',
+            'signal_calibration',
+        ),
+        'scale_constraint_weight': True,
+    },
     'shortT_discovery_guarded_v3': {
         'stage_keys': (
             'breakout_hard_negative',
@@ -372,6 +405,14 @@ CONSTRAINT_PROFILE_PRESETS = {
         'bull_margin': 0.12,
         'reversion_event_margin': 0.15,
         'continuation_margin': 0.08,
+    },
+    'iter15_event_first': {
+        'enabled': False,
+        'weight': 0.0,
+        'bear_margin': 0.0,
+        'bull_margin': 0.0,
+        'reversion_event_margin': 0.0,
+        'continuation_margin': 0.0,
     },
 }
 
@@ -529,7 +570,106 @@ class PhysicsLoss(nn.Module):
         )
         return breakout_margin + reversion_margin
 
+    def _compute_iter15_horizon_terms(self, pred, debug_info, horizon_payload):
+        event_prob = debug_info.get('event_prob_by_horizon')
+        quality = debug_info.get('quality_by_horizon')
+        event_score = debug_info.get('event_score_by_horizon')
+        horizon_logits = debug_info.get('horizon_logits')
+        horizon_weights = debug_info.get('horizon_weights')
+        if any(item is None for item in (event_prob, quality, event_score, horizon_weights)):
+            return pred.new_zeros(pred.size(0), 1), pred.new_tensor(0.0), {}
+
+        targets_by_horizon = horizon_payload.get('targets_by_horizon')
+        aux_by_horizon = horizon_payload.get('aux_by_horizon')
+        event_flags_by_horizon = horizon_payload.get('event_flags_by_horizon')
+        hard_negative_by_horizon = horizon_payload.get('hard_negative_by_horizon')
+        timing_target = horizon_payload.get('timing_target_by_horizon')
+        if timing_target is None:
+            timing_target = horizon_payload.get('q_horizon')
+        valid_horizon_mask = horizon_payload.get('valid_horizon_mask')
+        if any(
+            item is None
+            for item in (
+                targets_by_horizon,
+                aux_by_horizon,
+                event_flags_by_horizon,
+                hard_negative_by_horizon,
+                timing_target,
+                valid_horizon_mask,
+            )
+        ):
+            return pred.new_zeros(pred.size(0), 1), pred.new_tensor(0.0), {}
+
+        valid_mask = self._to_task_horizon_mask(valid_horizon_mask, event_prob)
+        targets_by_horizon = targets_by_horizon.to(device=event_prob.device, dtype=event_prob.dtype)
+        aux_by_horizon = aux_by_horizon.to(device=event_prob.device, dtype=event_prob.dtype)
+        event_flags_by_horizon = event_flags_by_horizon.to(device=event_prob.device, dtype=event_prob.dtype)
+        hard_negative_by_horizon = hard_negative_by_horizon.to(device=event_prob.device, dtype=event_prob.dtype)
+        timing_target = timing_target.to(device=event_prob.device, dtype=event_prob.dtype) * valid_mask
+        timing_target = timing_target / timing_target.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        selector_focus = (0.25 + 0.75 * timing_target + 0.35 * event_flags_by_horizon + 0.20 * hard_negative_by_horizon) * valid_mask
+        selector_denom = selector_focus.sum(dim=(1, 2), keepdim=False).unsqueeze(1).clamp_min(1e-6)
+
+        event_loss = self.horizon_event_loss_fn(event_prob, event_flags_by_horizon)
+        event_loss = (event_loss * selector_focus).sum(dim=(1, 2), keepdim=False).unsqueeze(1) / selector_denom
+
+        quality_loss = self.horizon_aux_loss_fn(quality, aux_by_horizon)
+        quality_loss = (quality_loss * selector_focus).sum(dim=(1, 2), keepdim=False).unsqueeze(1) / selector_denom
+
+        score_loss = self.main_loss_fn(event_score, targets_by_horizon)
+        score_loss = (score_loss * selector_focus).sum(dim=(1, 2), keepdim=False).unsqueeze(1) / selector_denom
+
+        hard_negative_penalty = (
+            (event_prob * hard_negative_by_horizon * valid_mask).sum(dim=(1, 2), keepdim=False).unsqueeze(1) /
+            valid_mask.sum(dim=(1, 2), keepdim=False).unsqueeze(1).clamp_min(1e-6)
+        )
+
+        if self.family_mode == 'single_cycle':
+            horizon_align_per_sample = pred.new_zeros(pred.size(0), 1)
+            horizon_align_scalar = pred.new_tensor(0.0)
+        else:
+            horizon_align_per_sample, horizon_align_scalar = self._horizon_alignment_loss(
+                horizon_logits=horizon_logits,
+                q_horizon=timing_target,
+                valid_mask=valid_mask,
+            )
+
+        entropy_per_task = (-horizon_weights.clamp_min(1e-8).log() * horizon_weights).sum(dim=-1)
+        entropy_loss = entropy_per_task.mean(dim=1, keepdim=True)
+        pred_freq = (event_prob * valid_mask).sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1e-6)
+        target_freq = (event_flags_by_horizon * valid_mask).sum(dim=-1) / valid_mask.sum(dim=-1).clamp_min(1e-6)
+        calibration_loss = self._signal_band_penalty(pred_freq, target_freq).mean(dim=1, keepdim=True)
+
+        horizon_per_sample = (
+            self.weights.get('horizon_event', 0.0) * (0.60 * event_loss + 0.40 * score_loss) +
+            self.weights.get('horizon_aux', 0.0) * quality_loss +
+            self.weights.get('horizon_align', 0.0) * horizon_align_per_sample +
+            self.weights.get('horizon_hard_negative', 0.0) * hard_negative_penalty +
+            self.weights.get('horizon_entropy', 0.0) * entropy_loss +
+            self.weights.get('signal_calibration', 0.0) * calibration_loss
+        )
+        horizon_margin = self._horizon_event_margin(
+            event_logits=event_prob,
+            event_flags=event_flags_by_horizon,
+            hard_negative=hard_negative_by_horizon,
+            aux_targets=aux_by_horizon,
+            valid_mask=valid_mask,
+        )
+        horizon_rank = self.weights.get('horizon_margin', 0.0) * horizon_margin
+        return horizon_per_sample, horizon_rank, {
+            'horizon_event': event_loss.mean().item(),
+            'horizon_aux': quality_loss.mean().item(),
+            'horizon_align': horizon_align_scalar.item(),
+            'horizon_hard_negative': hard_negative_penalty.mean().item(),
+            'horizon_entropy': entropy_loss.mean().item(),
+            'signal_calibration': calibration_loss.mean().item(),
+            'horizon_margin': horizon_margin.item(),
+        }
+
     def _compute_horizon_terms(self, pred, aux_pred, debug_info, horizon_payload):
+        if self.profile == 'iter15_event_first' and debug_info.get('event_prob_by_horizon') is not None:
+            return self._compute_iter15_horizon_terms(pred, debug_info, horizon_payload)
         event_logits = debug_info.get('event_logits_by_horizon')
         aux_logits = debug_info.get('aux_logits_by_horizon')
         horizon_logits = debug_info.get('horizon_logits')
@@ -624,6 +764,128 @@ class PhysicsLoss(nn.Module):
             'horizon_margin': horizon_margin.item(),
         }
 
+    def _forward_iter15_event_first(
+        self,
+        pred,
+        aux_pred,
+        target,
+        aux_target,
+        event_flags,
+        debug_info=None,
+        horizon_payload=None,
+    ):
+        if aux_pred.shape != aux_target.shape:
+            aux_target = aux_target.view_as(aux_pred)
+
+        breakout_event = self._get_flag(event_flags, 'breakout_event')
+        reversion_event = self._get_flag(event_flags, 'reversion_event')
+        breakout_hard_negative = self._get_flag(event_flags, 'breakout_hard_negative')
+        reversion_hard_negative = self._get_flag(event_flags, 'reversion_hard_negative')
+
+        breakout_prob = debug_info.get('breakout_event_prob') if debug_info is not None else None
+        reversion_prob = debug_info.get('reversion_event_prob') if debug_info is not None else None
+        if breakout_prob is None:
+            breakout_prob = torch.sigmoid(pred[:, 0])
+        if reversion_prob is None:
+            reversion_prob = torch.sigmoid(pred[:, 1])
+
+        breakout_event_target = breakout_event.float()
+        reversion_event_target = reversion_event.float()
+        with torch.amp.autocast(device_type=pred.device.type, enabled=False):
+            breakout_prob_clamped = breakout_prob.float().clamp(1e-4, 1.0 - 1e-4)
+            reversion_prob_clamped = reversion_prob.float().clamp(1e-4, 1.0 - 1e-4)
+            breakout_main_weight = 1.0 + 0.35 * torch.clamp(aux_target[:, 0].float(), min=0.0, max=3.0) + 0.25 * breakout_event_target
+            reversion_main_weight = 1.0 + 0.45 * torch.clamp(aux_target[:, 1].float(), min=0.0, max=3.0) + 0.30 * reversion_event_target
+            main_loss = (
+                F.binary_cross_entropy(
+                    breakout_prob_clamped,
+                    breakout_event_target,
+                    reduction='none',
+                ) * breakout_main_weight +
+                F.binary_cross_entropy(
+                    reversion_prob_clamped,
+                    reversion_event_target,
+                    reduction='none',
+                ) * reversion_main_weight
+            ).unsqueeze(1)
+        aux_selector = torch.stack(
+            [
+                0.25 + 0.75 * breakout_event_target + 0.10 * breakout_hard_negative.float(),
+                0.25 + 0.85 * reversion_event_target + 0.08 * reversion_hard_negative.float(),
+            ],
+            dim=1,
+        )
+        aux_loss = (self.aux_loss_fn(aux_pred, aux_target) * aux_selector).mean(dim=1, keepdim=True)
+
+        breakout_event_gap_loss = self._event_margin_loss(
+            breakout_prob,
+            breakout_event > 0.5,
+            breakout_hard_negative > 0.5,
+            aux_target[:, 0],
+            margin=0.10,
+            scale=0.14,
+        )
+        reversion_event_gap_loss = self._event_margin_loss(
+            reversion_prob,
+            reversion_event > 0.5,
+            reversion_hard_negative > 0.5,
+            aux_target[:, 1],
+            margin=0.12,
+            scale=0.18,
+        )
+        breakout_hard_negative_loss = (breakout_prob * breakout_hard_negative).mean()
+        reversion_hard_negative_loss = (reversion_prob * reversion_hard_negative).mean()
+
+        horizon_per_sample = pred.new_zeros(pred.size(0), 1)
+        horizon_rank = pred.new_tensor(0.0)
+        horizon_logs = {}
+        if horizon_payload is not None and debug_info is not None:
+            horizon_per_sample, horizon_rank, horizon_logs = self._compute_horizon_terms(
+                pred=pred,
+                aux_pred=aux_pred,
+                debug_info=debug_info,
+                horizon_payload=horizon_payload,
+            )
+
+        signal_calibration_breakout = self._signal_band_penalty(
+            breakout_prob.mean().unsqueeze(0),
+            breakout_event.mean().unsqueeze(0),
+        ).squeeze(0)
+        signal_calibration_reversion = self._signal_band_penalty(
+            reversion_prob.mean().unsqueeze(0),
+            reversion_event.mean().unsqueeze(0),
+        ).squeeze(0)
+        signal_calibration = 0.5 * (signal_calibration_breakout + signal_calibration_reversion)
+
+        structured_loss = (
+            self.weights.get('breakout_event_gap', 0.0) * breakout_event_gap_loss +
+            self.weights.get('reversion_event_gap', 0.0) * reversion_event_gap_loss +
+            self.weights.get('breakout_hard_negative', 0.0) * breakout_hard_negative_loss +
+            self.weights.get('reversion_hard_negative', 0.0) * reversion_hard_negative_loss +
+            self.weights.get('signal_calibration', 0.0) * signal_calibration
+        )
+        per_sample_loss = (
+            self.weights.get('main', 1.0) * main_loss +
+            self.weights.get('aux', 0.35) * aux_loss +
+            horizon_per_sample +
+            structured_loss
+        )
+        rank_loss = horizon_rank
+        logs = {
+            'main': main_loss.mean().item(),
+            'aux': aux_loss.mean().item(),
+            'rank': rank_loss.item(),
+            'event_gap_loss': (breakout_event_gap_loss + reversion_event_gap_loss).item(),
+            'breakout_hard_negative': breakout_hard_negative_loss.item(),
+            'reversion_hard_negative': reversion_hard_negative_loss.item(),
+            'direction_consistency': 0.0,
+            'continuation_suppression': 0.0,
+            'constraint_penalty': 0.0,
+            'signal_calibration_structured': signal_calibration.item(),
+        }
+        logs.update(horizon_logs)
+        return per_sample_loss, rank_loss, logs
+
     def forward(
         self,
         pred,
@@ -636,6 +898,16 @@ class PhysicsLoss(nn.Module):
         debug_info=None,
         horizon_payload=None,
     ):
+        if self.profile == 'iter15_event_first':
+            return self._forward_iter15_event_first(
+                pred=pred,
+                aux_pred=aux_pred,
+                target=target,
+                aux_target=aux_target,
+                event_flags=event_flags,
+                debug_info=debug_info,
+                horizon_payload=horizon_payload,
+            )
         if aux_pred.shape != aux_target.shape:
             aux_target = aux_target.view_as(aux_pred)
 

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 
-DEFAULT_ASSETS = "BTCUSD,ETHUSD,ESUSD,SPXUSD,EURUSD,UDXUSD,WTIUSD,XAUUSD"
+DEFAULT_ASSETS = "BTCUSD,ETHUSD,ESUSD,SPXUSD,UDXUSD,WTIUSD,XAUUSD"
 DEFAULT_TIMEFRAMES = "5m,15m,60m,240m"
 DEFAULT_SCORE_TIMEFRAMES = "5m,15m,60m,240m"
 DEFAULT_AUX_TIMEFRAMES = ""
@@ -28,14 +28,14 @@ ITER14_SMOKE_CAPS = {
 }
 SMOKE_PRESET = {
     "run_label": "smoke",
-    "epochs_total": 20,
+    "epochs_total": 2,
     "chunk_size": 2,
     "batch_size": 256,
-    "arch_version": "iter14_regression",
-    "dataset_profile": "iter14_ev_regression",
-    "loss_profile": "iter14_ev_regression",
-    "constraint_profile": "iter14_ev_regression",
-    "score_profile": "iter14_precision_first",
+    "arch_version": "iter15_event_first",
+    "dataset_profile": "iter15_event_first",
+    "loss_profile": "iter15_event_first",
+    "constraint_profile": "iter15_event_first",
+    "score_profile": "iter15_event_first",
     "score_timeframes": "5m,15m,60m,240m",
     "aux_timeframes": "",
     "split_scheme": "split_by_month",
@@ -71,18 +71,19 @@ SMOKE_PRESET = {
     "gate_floor_breakout": 0.0,
     "gate_floor_reversion": 0.0,
     "gate_anneal_fraction": 0.60,
-    "horizon_search_spec": "6,10,14,20",
+    "horizon_search_spec": "3,5,8,13,20",
+    "horizon_family_mode": "adaptive_resonance",
 }
 FORMAL_PRESET = {
     "run_label": "formal",
     "epochs_total": 20,
     "chunk_size": 20,
     "batch_size": 256,
-    "arch_version": "iter14_regression",
-    "dataset_profile": "iter14_ev_regression",
-    "loss_profile": "iter14_ev_regression",
-    "constraint_profile": "iter14_ev_regression",
-    "score_profile": "iter14_precision_first",
+    "arch_version": "iter15_event_first",
+    "dataset_profile": "iter15_event_first",
+    "loss_profile": "iter15_event_first",
+    "constraint_profile": "iter15_event_first",
+    "score_profile": "iter15_event_first",
     "score_timeframes": DEFAULT_SCORE_TIMEFRAMES,
     "aux_timeframes": DEFAULT_AUX_TIMEFRAMES,
     "split_scheme": DEFAULT_SPLIT_SCHEME,
@@ -118,7 +119,8 @@ FORMAL_PRESET = {
     "gate_floor_breakout": 0.0,
     "gate_floor_reversion": 0.0,
     "gate_anneal_fraction": 0.60,
-    "horizon_search_spec": "6,10,14,20",
+    "horizon_search_spec": "3,5,8,13,20",
+    "horizon_family_mode": "adaptive_resonance",
 }
 PHASE_PRESETS = {
     "smoke": SMOKE_PRESET,
@@ -139,7 +141,9 @@ def extract_zip(zip_path: Path, out_dir: Path) -> None:
 
 def run_train(train_py: Path, argv: list[str]) -> None:
     cmd = [sys.executable, "-u", str(train_py)] + argv
+    print(f"[runner] launching train subprocess: {' '.join(cmd)}", flush=True)
     proc = subprocess.run(cmd, stdout=sys.stdout, stderr=sys.stderr, check=False)
+    print(f"[runner] train subprocess exited with code {proc.returncode}", flush=True)
     if proc.returncode != 0:
         raise SystemExit(proc.returncode)
 
@@ -175,7 +179,7 @@ def resolve_training_ready_dir(data_dir: Path, training_subdir: Optional[str]) -
 def resolve_project_dataset_cache_dir(data_dir: Path, dataset_cache_dir: Optional[str]) -> Path:
     if dataset_cache_dir:
         return Path(dataset_cache_dir).resolve()
-    return (data_dir / "dataset_cache" / "iter14_ev_regression_v1").resolve()
+    return (data_dir / "dataset_cache" / "iter15_event_first_v1").resolve()
 
 
 def format_timeframe_caps(value: Optional[str | dict[str, int]]) -> Optional[str]:
@@ -266,6 +270,11 @@ def resolve_effective_config(args: argparse.Namespace) -> dict:
             preset["reversion_precision_floor"],
         ),
         "resume_mode": coalesce(args.resume_mode, preset["resume_mode"]),
+        "horizon_search_spec": coalesce(
+            getattr(args, "horizon_search_spec", None),
+            preset["horizon_search_spec"],
+        ),
+        "horizon_family_mode": coalesce(args.horizon_family_mode, preset["horizon_family_mode"]),
         "dataset_cache_dir": args.dataset_cache_dir,
         "skip_dataset_cache_prewarm": bool(args.skip_dataset_cache_prewarm),
         "prewarm_only": bool(args.prewarm_only),
@@ -352,6 +361,8 @@ def main() -> None:
     parser.add_argument("--deterministic", action="store_true", default=None)
     parser.add_argument("--non_deterministic", dest="deterministic", action="store_false")
     parser.add_argument("--resume_mode", choices=["auto", "always", "never"], default=None)
+    parser.add_argument("--horizon_search_spec", type=str, default=None)
+    parser.add_argument("--horizon_family_mode", type=str, default=None)
     parser.add_argument("--dataset_cache_dir", type=str, default=None)
     parser.add_argument("--skip_dataset_cache_prewarm", action="store_true", default=False)
     parser.add_argument("--prewarm_only", action="store_true", default=False)
@@ -361,7 +372,7 @@ def main() -> None:
     config = resolve_effective_config(args)
     data_dir = Path(args.data_dir).resolve()
     run_root = Path(args.run_root).resolve()
-    run_id = args.run_id or datetime.now().strftime(f"%Y%m%d_iter14_multiasset_{config['run_label']}_%H%M%S")
+    run_id = args.run_id or datetime.now().strftime(f"%Y%m%d_iter15_multiasset_{config['run_label']}_%H%M%S")
     save_dir = run_root / run_id
     save_dir.mkdir(parents=True, exist_ok=True)
     dataset_cache_dir = resolve_project_dataset_cache_dir(data_dir, config["dataset_cache_dir"])
@@ -373,9 +384,18 @@ def main() -> None:
         extract_zip(Path(args.data_zip).resolve(), training_ready_dir)
 
     resume_path = save_dir / "khaos_kan_resume.pth"
-    chunk_ends = [min(config["chunk_size"], config["epochs_total"])] if config["prewarm_only"] else build_chunk_ends(config["epochs_total"], config["chunk_size"])
+    resume_mode = str(config["resume_mode"] or "auto").strip().lower()
+    if config["prewarm_only"]:
+        chunk_ends = [min(config["chunk_size"], config["epochs_total"])]
+    elif resume_mode in {"never", "off", "false"}:
+        chunk_ends = [config["epochs_total"]]
+    else:
+        chunk_ends = build_chunk_ends(config["epochs_total"], config["chunk_size"])
     first_chunk_end = chunk_ends[0]
-    for chunk_end in chunk_ends:
+    print(f"[runner] run_id={run_id}", flush=True)
+    print(f"[runner] save_dir={save_dir}", flush=True)
+    print(f"[runner] chunk plan={chunk_ends} resume_mode={resume_mode}", flush=True)
+    for chunk_index, chunk_end in enumerate(chunk_ends, start=1):
         argv = [
             "--data_dir",
             str(data_dir),
@@ -462,35 +482,41 @@ def main() -> None:
         add_optional_arg(argv, "--gate_floor_reversion", config.get("gate_floor_reversion"))
         add_optional_arg(argv, "--gate_anneal_fraction", config.get("gate_anneal_fraction"))
         add_optional_arg(argv, "--horizon_search_spec", config.get("horizon_search_spec"))
+        add_optional_arg(argv, "--horizon_family_mode", config.get("horizon_family_mode"))
         if not config["deterministic"]:
             argv.append("--non_deterministic")
+        if config.get("run_label") == "smoke":
+            argv.extend(["--max_files", "4"])
         if config["skip_dataset_cache_prewarm"]:
             argv.append("--skip_dataset_cache_prewarm")
         if config["prewarm_only"]:
             argv.append("--prewarm_dataset_cache_only")
         if config["fast_full"]:
             argv.append("--fast_full")
-        if not config["prewarm_only"] and should_resume_chunk(config["resume_mode"], chunk_end, first_chunk_end, resume_path):
-            argv.append("--resume")
-        run_train(train_py, argv)
-
-    report_title = None
-    if not config["prewarm_only"]:
-        report_title = f"iter14 multi-asset {config['run_label']} report"
-        subprocess.run(
-            [
-                sys.executable,
-                str(report_py),
-                "--run_dir",
-                str(save_dir),
-                "--out",
-                str(save_dir / "iter14_report.md"),
-                "--title",
-                report_title,
-            ],
-            check=False,
+        resume_this_chunk = (
+            not config["prewarm_only"]
+            and should_resume_chunk(config["resume_mode"], chunk_end, first_chunk_end, resume_path)
         )
+        if resume_this_chunk:
+            argv.append("--resume")
+        print(
+            f"[runner] starting chunk {chunk_index}/{len(chunk_ends)} "
+            f"target_epochs={chunk_end} resume={resume_this_chunk}",
+            flush=True,
+        )
+        run_train(train_py, argv)
+        print(
+            f"[runner] finished chunk {chunk_index}/{len(chunk_ends)} "
+            f"target_epochs={chunk_end}",
+            flush=True,
+        )
+
     manifest = dict(config)
+    report_title = None
+    report_path = None
+    if not config["prewarm_only"]:
+        report_title = f"iter15 multi-asset {config['run_label']} report"
+        report_path = str(save_dir / "iter15_report.md")
     manifest.update(
         {
             "run_id": run_id,
@@ -500,6 +526,7 @@ def main() -> None:
             "training_ready_dir": str(training_ready_dir),
             "dataset_cache_dir": str(dataset_cache_dir),
             "report_title": report_title,
+            "report_path": report_path,
             "split_scheme": config["split_scheme"],
             "split_labels": config["split_labels"],
             "resume_mode": config["resume_mode"],
@@ -510,7 +537,29 @@ def main() -> None:
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
-    print(str(save_dir))
+    if report_path:
+        print(f"[runner] generating report: {report_path}", flush=True)
+        report_proc = subprocess.run(
+            [
+                sys.executable,
+                "-u",
+                str(report_py),
+                "--run_dir",
+                str(save_dir),
+                "--out",
+                report_path,
+                "--title",
+                report_title,
+            ],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            check=False,
+        )
+        if report_proc.returncode != 0:
+            print(f"[report] generator exited with code {report_proc.returncode}: {report_path}", flush=True)
+        else:
+            print(f"[runner] report generated: {report_path}", flush=True)
+    print(str(save_dir), flush=True)
 
 
 if __name__ == "__main__":
